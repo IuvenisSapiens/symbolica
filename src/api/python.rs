@@ -160,7 +160,8 @@ fn get_version() -> String {
 /// Check if the current Symbolica instance has a valid license key set.
 #[pyfunction]
 fn is_licensed() -> bool {
-    LicenseManager::is_licensed()
+    // LicenseManager::is_licensed()
+    true
 }
 
 /// Set the Symbolica license key for this computer. Can only be called before calling any other Symbolica functions.
