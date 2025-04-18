@@ -13,21 +13,21 @@ use ahash::HashMap;
 
 use crate::{
     poly::{
+        GrevLexOrder, LexOrder, PositiveExponent, Variable,
         factor::Factorize,
         gcd::PolynomialGCD,
         groebner::{Echelonize, GroebnerBasis},
         polynomial::{MultivariatePolynomial, PolynomialRing},
         univariate::UnivariatePolynomial,
-        GrevLexOrder, LexOrder, PositiveExponent, Variable,
     },
     printer::{PrintOptions, PrintState},
 };
 
 use super::{
+    Derivable, EuclideanDomain, Field, InternalOrdering, Ring, SelfRing, UpgradeToField,
     finite_field::{FiniteField, FiniteFieldCore, FiniteFieldWorkspace, ToFiniteField},
     integer::{Integer, IntegerRing, Z},
     rational::RationalField,
-    Derivable, EuclideanDomain, Field, InternalOrdering, Ring, SelfRing, UpgradeToField,
 };
 
 /// A rational polynomial field.
@@ -248,7 +248,7 @@ impl<R: Ring, E: PositiveExponent> SelfRing for RationalPolynomial<R, E> {
                 state.in_exp = false;
             }
 
-            if opts.latex {
+            if opts.mode.is_latex() {
                 if state.in_sum {
                     f.write_char('+')?;
                 }
@@ -762,8 +762,8 @@ where
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E> + PolynomialGCD<E>, E: PositiveExponent>
-    Add<&'a RationalPolynomial<R, E>> for &'b RationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E> + PolynomialGCD<E>, E: PositiveExponent>
+    Add<&'a RationalPolynomial<R, E>> for &RationalPolynomial<R, E>
 where
     RationalPolynomial<R, E>: FromNumeratorAndDenominator<R, R, E>,
 {
@@ -825,8 +825,8 @@ where
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
-    Sub<&'a RationalPolynomial<R, E>> for &'b RationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
+    Sub<&'a RationalPolynomial<R, E>> for &RationalPolynomial<R, E>
 where
     RationalPolynomial<R, E>: FromNumeratorAndDenominator<R, R, E>,
 {
@@ -847,8 +847,8 @@ impl<R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent> Neg for Rationa
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
-    Mul<&'a RationalPolynomial<R, E>> for &'b RationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
+    Mul<&'a RationalPolynomial<R, E>> for &RationalPolynomial<R, E>
 where
     RationalPolynomial<R, E>: FromNumeratorAndDenominator<R, R, E>,
 {
@@ -891,8 +891,8 @@ where
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
-    Div<&'a RationalPolynomial<R, E>> for &'b RationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
+    Div<&'a RationalPolynomial<R, E>> for &RationalPolynomial<R, E>
 where
     RationalPolynomial<R, E>: FromNumeratorAndDenominator<R, R, E>,
 {
@@ -1059,9 +1059,7 @@ where
             std::cmp::Reverse((0..f.nvars()).filter(|v| f.contains(*v)).count())
         });
 
-        let mut vars = (0..fs.len())
-            .map(|i| Variable::Temporary(i))
-            .collect::<Vec<_>>();
+        let mut vars = (0..fs.len()).map(Variable::Temporary).collect::<Vec<_>>();
         for v in self.numerator.get_vars_ref() {
             vars.push(v.clone());
         }
@@ -1422,7 +1420,7 @@ mod test {
 
     use crate::{
         atom::AtomCore,
-        domains::{integer::Z, rational::Q, rational_polynomial::RationalPolynomial, Ring},
+        domains::{Ring, integer::Z, rational::Q, rational_polynomial::RationalPolynomial},
         parse, symbol,
     };
 
@@ -1446,9 +1444,11 @@ mod test {
 
         assert_eq!(
             r,
-            vec![parse!("-1/(4+16*v1+24*v1^2+16*v1^3+4*v1^4)")
-                .unwrap()
-                .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())]
+            vec![
+                parse!("-1/(4+16*v1+24*v1^2+16*v1^3+4*v1^4)")
+                    .unwrap()
+                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+            ]
         );
         assert_eq!(l, vec![]);
     }
@@ -1466,9 +1466,11 @@ mod test {
         let (r, l) = p.integrate(0);
         assert_eq!(
             r,
-            vec![parse!("(10*v1*v2+10*v1^2+5*v1^2*v2+2*v1^5)/(10+10*v2)")
-                .unwrap()
-                .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())]
+            vec![
+                parse!("(10*v1*v2+10*v1^2+5*v1^2*v2+2*v1^5)/(10+10*v2)")
+                    .unwrap()
+                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+            ]
         );
         assert_eq!(l, vec![]);
     }
@@ -1489,9 +1491,11 @@ mod test {
 
         assert_eq!(
             r,
-            vec![parse!("(8*v1+4*v1*v2+v1^4)/(4+4*v2)")
-                .unwrap()
-                .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())]
+            vec![
+                parse!("(8*v1+4*v1*v2+v1^4)/(4+4*v2)")
+                    .unwrap()
+                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+            ]
         );
         assert_eq!(
             l,
@@ -1563,7 +1567,7 @@ mod test {
         // root sum in the answer, rename the temporary variable
         // TODO: add rename function
         let mut v = l[0].0.get_variables().as_ref().clone();
-        *v.last_mut().unwrap() = new_var.clone().into();
+        *v.last_mut().unwrap() = new_var.into();
         let new_map = Arc::new(v);
 
         l[0].0.numerator.variables = new_map.clone();
@@ -1631,9 +1635,11 @@ mod test {
 
         assert_eq!(
             r,
-            vec![parse!("(12*v1+2*v1*v2+v1^2)/2")
-                .unwrap()
-                .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())]
+            vec![
+                parse!("(12*v1+2*v1*v2+v1^2)/2")
+                    .unwrap()
+                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+            ]
         );
         assert_eq!(
             l,

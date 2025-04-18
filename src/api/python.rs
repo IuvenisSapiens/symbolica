@@ -4,12 +4,14 @@ use std::{
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter},
     ops::{Deref, Neg},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use ahash::HashMap;
 use brotli::CompressorWriter;
 use pyo3::{
+    Bound, FromPyObject, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyErr, PyObject, PyRef,
+    PyResult, PyTypeInfo, Python,
     exceptions::{self, PyIndexError},
     pybacked::PyBackedStr,
     pyclass::CompareOp,
@@ -19,8 +21,7 @@ use pyo3::{
         IntoPyDict, PyAnyMethods, PyBytes, PyComplex, PyComplexMethods, PyDict, PyInt, PyModule,
         PyTuple, PyTupleMethods, PyType, PyTypeMethods,
     },
-    wrap_pyfunction, Bound, FromPyObject, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyErr,
-    PyObject, PyRef, PyResult, PyTypeInfo, Python,
+    wrap_pyfunction,
 };
 use pyo3::{pyclass, types::PyModuleMethods};
 use rug::Complete;
@@ -32,22 +33,23 @@ use smartstring::{LazyCompact, SmartString};
 use pyo3::pymodule;
 
 use crate::{
+    LicenseManager,
     atom::{
         Atom, AtomCore, AtomType, AtomView, DefaultNamespace, FunctionAttribute, ListIterator,
         Symbol,
     },
     coefficient::CoefficientView,
     domains::{
+        Ring, SelfRing,
         algebraic_number::AlgebraicExtension,
         atom::AtomField,
-        finite_field::{is_prime_u64, GaloisField, PrimeIteratorU64, ToFiniteField, Zp, Z2},
-        float::{Complex, Float, RealNumberLike, F64},
+        finite_field::{GaloisField, PrimeIteratorU64, ToFiniteField, Z2, Zp, is_prime_u64},
+        float::{Complex, F64, Float, RealNumberLike},
         integer::{FromFiniteField, Integer, IntegerRelationError, IntegerRing, Z},
-        rational::{Rational, RationalField, Q},
+        rational::{Q, Rational, RationalField},
         rational_polynomial::{
             FromNumeratorAndDenominator, RationalPolynomial, RationalPolynomialField,
         },
-        Ring, SelfRing,
     },
     evaluate::{
         CompileOptions, CompiledEvaluator, EvaluationFn, ExpressionEvaluator, FunctionMap,
@@ -63,15 +65,14 @@ use crate::{
     parse,
     parser::Token,
     poly::{
-        factor::Factorize, groebner::GroebnerBasis, polynomial::MultivariatePolynomial,
-        series::Series, GrevLexOrder, LexOrder, Variable, INLINED_EXPONENTS,
+        GrevLexOrder, INLINED_EXPONENTS, LexOrder, Variable, factor::Factorize,
+        groebner::GroebnerBasis, polynomial::MultivariatePolynomial, series::Series,
     },
-    printer::{AtomPrinter, PrintOptions, PrintState},
+    printer::{AtomPrinter, PrintMode, PrintOptions, PrintState},
     state::{RecycledAtom, State, Workspace},
     streaming::{TermStreamer, TermStreamerConfig},
     tensors::matrix::Matrix,
-    transformer::{StatsOptions, Transformer, TransformerError},
-    LicenseManager,
+    transformer::{StatsOptions, Transformer, TransformerError, TransformerState},
 };
 
 const DEFAULT_PRINT_OPTIONS: PrintOptions = PrintOptions {
@@ -89,9 +90,43 @@ const LATEX_PRINT_OPTIONS: PrintOptions = PrintOptions {
     ..PrintOptions::latex()
 };
 
+/// Specifies the print mode.
+#[derive(Clone, Copy)]
+#[pyclass(name = "PrintMode", module = "symbolica", eq, eq_int)]
+#[derive(PartialEq, Eq, Hash)]
+pub enum PythonPrintMode {
+    Symbolica,
+    Latex,
+    Mathematica,
+    Sympy,
+}
+
+impl From<PrintMode> for PythonPrintMode {
+    fn from(mode: PrintMode) -> Self {
+        match mode {
+            PrintMode::Symbolica => PythonPrintMode::Symbolica,
+            PrintMode::Latex => PythonPrintMode::Latex,
+            PrintMode::Mathematica => PythonPrintMode::Mathematica,
+            PrintMode::Sympy => PythonPrintMode::Sympy,
+        }
+    }
+}
+
+impl From<PythonPrintMode> for PrintMode {
+    fn from(mode: PythonPrintMode) -> Self {
+        match mode {
+            PythonPrintMode::Symbolica => PrintMode::Symbolica,
+            PythonPrintMode::Latex => PrintMode::Latex,
+            PythonPrintMode::Mathematica => PrintMode::Mathematica,
+            PythonPrintMode::Sympy => PrintMode::Sympy,
+        }
+    }
+}
+
 impl<'py> IntoPyDict<'py> for PrintOptions {
     fn into_py_dict(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
+        dict.set_item("mode", PythonPrintMode::from(self.mode))?;
         dict.set_item("terms_on_new_line", self.terms_on_new_line)?;
         dict.set_item("color_top_level_sum", self.color_top_level_sum)?;
         dict.set_item("color_builtin_symbols", self.color_builtin_symbols)?;
@@ -118,14 +153,14 @@ impl<'py> IntoPyDict<'py> for PrintOptions {
             self.square_brackets_for_function,
         )?;
         dict.set_item("num_exp_as_superscript", self.num_exp_as_superscript)?;
-        dict.set_item("latex", self.latex)?;
         dict.set_item("precision", self.precision)?;
         dict.set_item("pretty_matrix", self.pretty_matrix)?;
         dict.set_item("hide_namespace", self.hide_namespace)?;
         dict.set_item("hide_all_namespaces", self.hide_all_namespaces)?;
         dict.set_item("color_namespace", self.color_namespace)?;
         dict.set_item("max_terms", self.max_terms)?;
-        Ok(dict.into())
+        dict.set_item("custom_print_mode", self.custom_print_mode.map(|x| x.1))?;
+        Ok(dict)
     }
 }
 
@@ -145,6 +180,7 @@ pub fn create_symbolica_module<'a, 'b>(
     m.add_class::<PythonSample>()?;
     m.add_class::<PythonAtomType>()?;
     m.add_class::<PythonAtomTree>()?;
+    m.add_class::<PythonPrintMode>()?;
     m.add_class::<PythonReplacement>()?;
     m.add_class::<PythonExpressionEvaluator>()?;
     m.add_class::<PythonCompiledExpressionEvaluator>()?;
@@ -481,9 +517,11 @@ impl PythonTransformer {
     /// --------
     /// >>> x = Expression.symbol('x')
     /// >>> e = Transformer().expand()((1+x)**2)
+    #[pyo3(signature = (expr, stats_to_file = None))]
     pub fn __call__(
         &self,
         expr: ConvertibleToExpression,
+        stats_to_file: Option<String>,
         py: Python,
     ) -> PyResult<PythonExpression> {
         let e = expr.to_expression();
@@ -497,9 +535,24 @@ impl PythonTransformer {
 
             let mut out = Atom::new();
 
+            let state = if let Some(stats_to_file) = stats_to_file {
+                let file = File::create(stats_to_file).map_err(|e| {
+                    exceptions::PyIOError::new_err(format!(
+                        "Could not create file for transformer statistics: {}",
+                        e
+                    ))
+                })?;
+                TransformerState {
+                    stats_export: Some(Arc::new(Mutex::new(BufWriter::new(file)))),
+                    ..Default::default()
+                }
+            } else {
+                TransformerState::default()
+            };
+
             py.allow_threads(|| {
                 Workspace::get_local()
-                    .with(|ws| Transformer::execute_chain(e.as_view(), &t.1, ws, &mut out))
+                    .with(|ws| Transformer::execute_chain(e.as_view(), &t.1, ws, &state, &mut out))
                     .map_err(|e| match e {
                         TransformerError::Interrupt => {
                             exceptions::PyKeyboardInterrupt::new_err("Interrupted by user")
@@ -579,7 +632,7 @@ impl PythonTransformer {
         level_is_tree_depth: Option<bool>,
         allow_new_wildcards_on_rhs: Option<bool>,
     ) -> PyResult<PythonCondition> {
-        let conditions = cond.map(|r| r.0).unwrap_or(Condition::default());
+        let conditions = cond.map(|r| r.0).unwrap_or_default();
         let settings = MatchSettings {
             level_range: level_range.unwrap_or((0, None)),
             level_is_tree_depth: level_is_tree_depth.unwrap_or(false),
@@ -615,17 +668,17 @@ impl PythonTransformer {
         if let Some(var) = var {
             let e = var.to_expression();
             if matches!(e.expr, Atom::Var(_) | Atom::Fun(_)) {
-                return append_transformer!(
+                append_transformer!(
                     self,
                     Transformer::Expand(Some(e.expr), via_poly.unwrap_or(false))
-                );
+                )
             } else {
-                return Err(exceptions::PyValueError::new_err(
+                Err(exceptions::PyValueError::new_err(
                     "Expansion must be done wrt an indeterminate",
-                ));
+                ))
             }
         } else {
-            return append_transformer!(self, Transformer::Expand(None, via_poly.unwrap_or(false)));
+            append_transformer!(self, Transformer::Expand(None, via_poly.unwrap_or(false)))
         }
     }
 
@@ -646,7 +699,7 @@ impl PythonTransformer {
     /// (3*x+3*y)*(4*x+5*y)
     /// ```
     pub fn expand_num(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::ExpandNum);
+        append_transformer!(self, Transformer::ExpandNum)
     }
 
     /// Create a transformer that computes the product of a list of arguments.
@@ -659,7 +712,7 @@ impl PythonTransformer {
     /// >>> e = f(2,3).replace(f(x__), x__.transform().prod())
     /// >>> print(e)
     pub fn prod(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::Product);
+        append_transformer!(self, Transformer::Product)
     }
 
     /// Create a transformer that computes the sum of a list of arguments.
@@ -672,7 +725,7 @@ impl PythonTransformer {
     /// >>> e = f(2,3).replace(f(x__), x__.transform().sum())
     /// >>> print(e)
     pub fn sum(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::Sum);
+        append_transformer!(self, Transformer::Sum)
     }
 
     /// Create a transformer that returns the number of arguments.
@@ -691,7 +744,7 @@ impl PythonTransformer {
     /// >>> print(e)
     #[pyo3(signature = (only_for_arg_fun = false))]
     pub fn nargs(&self, only_for_arg_fun: bool) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::ArgCount(only_for_arg_fun));
+        append_transformer!(self, Transformer::ArgCount(only_for_arg_fun))
     }
 
     /// Create a transformer that linearizes a function, optionally extracting `symbols`
@@ -720,14 +773,14 @@ impl PythonTransformer {
             }
         }
 
-        return append_transformer!(
+        append_transformer!(
             self,
             Transformer::Linearize(if c_symbols.is_empty() {
                 None
             } else {
                 Some(c_symbols)
             })
-        );
+        )
     }
 
     /// Create a transformer that sorts a list of arguments.
@@ -740,7 +793,7 @@ impl PythonTransformer {
     /// >>> e = f(3,2,1).replace(f(x__), x__.transform().sort())
     /// >>> print(e)
     pub fn sort(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::Sort);
+        append_transformer!(self, Transformer::Sort)
     }
 
     /// Create a transformer that cycle-symmetrizes a function.
@@ -755,7 +808,7 @@ impl PythonTransformer {
     ///
     /// Yields `f(1,2,3,1,2,4)`.
     pub fn cycle_symmetrize(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::CycleSymmetrize);
+        append_transformer!(self, Transformer::CycleSymmetrize)
     }
 
     /// Create a transformer that removes elements from a list if they occur
@@ -771,7 +824,7 @@ impl PythonTransformer {
     ///
     /// Yields `f(1,2)`.
     pub fn deduplicate(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::Deduplicate);
+        append_transformer!(self, Transformer::Deduplicate)
     }
 
     /// Create a transformer that extracts a rational polynomial from a coefficient.
@@ -782,7 +835,7 @@ impl PythonTransformer {
     /// >>> e = Function.COEFF((x^2+1)/y^2).transform().from_coeff()
     /// >>> print(e)
     pub fn from_coeff(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::FromNumber);
+        append_transformer!(self, Transformer::FromNumber)
     }
 
     /// Create a transformer that split a sum or product into a list of arguments.
@@ -795,7 +848,7 @@ impl PythonTransformer {
     /// >>> e = (x + 1).replace(x__, f(x__.transform().split()))
     /// >>> print(e)
     pub fn split(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::Split);
+        append_transformer!(self, Transformer::Split)
     }
 
     /// Create a transformer that partitions a list of arguments into named bins of a given length,
@@ -843,14 +896,14 @@ impl PythonTransformer {
                 _ => {
                     return Err(exceptions::PyValueError::new_err(
                         "Derivative must be taken wrt a variable",
-                    ))
+                    ));
                 }
             };
 
             conv_bins.push((id, len));
         }
 
-        return append_transformer!(self, Transformer::Partition(conv_bins, fill_last, repeat));
+        append_transformer!(self, Transformer::Partition(conv_bins, fill_last, repeat))
     }
 
     /// Create a transformer that generates all permutations of a list of arguments.
@@ -880,11 +933,11 @@ impl PythonTransformer {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
-        return append_transformer!(self, Transformer::Permutations(id));
+        append_transformer!(self, Transformer::Permutations(id))
     }
 
     /// Create a transformer that apply a function `f`.
@@ -897,7 +950,7 @@ impl PythonTransformer {
     /// >>> e = f(2).replace(f(x_), x_.transform().map(lambda r: r**2))
     /// >>> print(e)
     pub fn map(&self, f: PyObject) -> PyResult<PythonTransformer> {
-        let transformer = Transformer::Map(Box::new(move |expr, out| {
+        let transformer = Transformer::Map(Box::new(move |expr, _state, out| {
             let expr = PythonExpression {
                 expr: expr.to_owned(),
             };
@@ -925,7 +978,7 @@ impl PythonTransformer {
             }
         }));
 
-        return append_transformer!(self, transformer);
+        append_transformer!(self, transformer)
     }
 
     /// Map a chain of transformers over the terms of the expression, optionally using multiple cores.
@@ -978,7 +1031,7 @@ impl PythonTransformer {
             ))
         };
 
-        return append_transformer!(self, Transformer::MapTerms(rep_chain, pool));
+        append_transformer!(self, Transformer::MapTerms(rep_chain, pool))
     }
 
     /// Create a transformer that applies a transformer chain to every argument of the `arg()` function.
@@ -1012,7 +1065,7 @@ impl PythonTransformer {
             rep_chain.extend_from_slice(&t.1);
         }
 
-        return append_transformer!(self, Transformer::ForEach(rep_chain));
+        append_transformer!(self, Transformer::ForEach(rep_chain))
     }
 
     /// Create a transformer that checks for a Python interrupt,
@@ -1026,12 +1079,12 @@ impl PythonTransformer {
     /// >>> f(10).transform().repeat(Transformer().replace(
     /// >>> f(x_), f(x_+1)).check_interrupt()).execute()
     pub fn check_interrupt(&self) -> PyResult<PythonTransformer> {
-        let transformer = Transformer::Map(Box::new(move |expr, out| {
+        let transformer = Transformer::Map(Box::new(move |expr, _state, out| {
             out.set_from_view(&expr);
             Python::with_gil(|py| py.check_signals()).map_err(|_| TransformerError::Interrupt)
         }));
 
-        return append_transformer!(self, transformer);
+        append_transformer!(self, transformer)
     }
 
     /// Create a transformer that keeps executing the transformer chain until the input equals the output.
@@ -1068,7 +1121,7 @@ impl PythonTransformer {
             rep_chain.extend_from_slice(&t.1);
         }
 
-        return append_transformer!(self, Transformer::Repeat(rep_chain));
+        append_transformer!(self, Transformer::Repeat(rep_chain))
     }
 
     /// Evaluate the condition and apply the `if_block` if the condition is true, otherwise apply the `else_block`.
@@ -1111,7 +1164,7 @@ impl PythonTransformer {
             ));
         }
 
-        return append_transformer!(self, Transformer::IfElse(condition.condition, t1.1, t2.1));
+        append_transformer!(self, Transformer::IfElse(condition.condition, t1.1, t2.1))
     }
 
     /// Execute the `condition` transformer. If the result of the `condition` transformer is different from the input expression,
@@ -1165,7 +1218,7 @@ impl PythonTransformer {
             ));
         }
 
-        return append_transformer!(self, Transformer::IfChanged(t0.1, t1.1, t2.1));
+        append_transformer!(self, Transformer::IfChanged(t0.1, t1.1, t2.1))
     }
 
     /// Break the current chain and all higher-level chains containing `if` transformers.
@@ -1181,7 +1234,7 @@ impl PythonTransformer {
     /// >>> ))
     /// >>> print(t(x))
     pub fn break_chain(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::BreakChain);
+        append_transformer!(self, Transformer::BreakChain)
     }
 
     /// Chain several transformers. `chain(A,B,C)` is the same as `A.B.C`,
@@ -1241,6 +1294,7 @@ impl PythonTransformer {
     pub fn execute(&self, py: Python) -> PyResult<PythonExpression> {
         let mut out = Atom::default();
 
+        // TODO: pass a transformer state?
         py.allow_threads(|| {
             Workspace::get_local()
                 .with(|workspace| {
@@ -1286,13 +1340,13 @@ impl PythonTransformer {
 
         let a = Arc::new(var_map);
 
-        return append_transformer!(
+        append_transformer!(
             self,
-            Transformer::Map(Box::new(move |i, o| {
+            Transformer::Map(Box::new(move |i, _state, o| {
                 *o = i.set_coefficient_ring(&a);
                 Ok(())
             }))
-        );
+        )
     }
 
     /// Create a transformer that collects terms involving the same power of `x`,
@@ -1339,7 +1393,7 @@ impl PythonTransformer {
         for a in x {
             if let Ok(r) = a.extract::<PythonExpression>() {
                 if matches!(r.expr, Atom::Var(_) | Atom::Fun(_)) {
-                    xs.push(r.expr.into());
+                    xs.push(r.expr);
                 } else {
                     return Err(exceptions::PyValueError::new_err(
                         "Collect must be done wrt a variable or function",
@@ -1388,7 +1442,7 @@ impl PythonTransformer {
             vec![]
         };
 
-        return append_transformer!(self, Transformer::Collect(xs, key_map, coeff_map));
+        append_transformer!(self, Transformer::Collect(xs, key_map, coeff_map))
     }
 
     /// Create a transformer that collects terms involving the same power of variables or functions with the name `x`.
@@ -1463,7 +1517,7 @@ impl PythonTransformer {
             vec![]
         };
 
-        return append_transformer!(self, Transformer::CollectSymbol(x, key_map, coeff_map));
+        append_transformer!(self, Transformer::CollectSymbol(x, key_map, coeff_map))
     }
 
     /// Create a transformer that collects common factors from (nested) sums.
@@ -1481,7 +1535,7 @@ impl PythonTransformer {
     /// v1^2*(1+v1+v2+v2*(1+v1))
     /// ```
     pub fn collect_factors(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::CollectFactors);
+        append_transformer!(self, Transformer::CollectFactors)
     }
 
     /// Create a transformer that collects numerical factors by removing the numerical content from additions.
@@ -1504,26 +1558,26 @@ impl PythonTransformer {
     /// -6*(x-2*y)*(x+y)
     /// ```
     pub fn collect_num(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(self, Transformer::CollectNum);
+        append_transformer!(self, Transformer::CollectNum)
     }
 
     /// Create a transformer that collects terms involving the literal occurrence of `x`.
     pub fn coefficient(&self, x: ConvertibleToExpression) -> PyResult<PythonTransformer> {
         let a = x.to_expression().expr;
-        return append_transformer!(
+        append_transformer!(
             self,
-            Transformer::Map(Box::new(move |i, o| {
+            Transformer::Map(Box::new(move |i, _state, o| {
                 *o = i.coefficient(a.as_view());
                 Ok(())
             }))
-        );
+        )
     }
 
     /// Create a transformer that computes the partial fraction decomposition in `x`.
     pub fn apart(&self, x: PythonExpression) -> PyResult<PythonTransformer> {
-        return append_transformer!(
+        append_transformer!(
             self,
-            Transformer::Map(Box::new(move |i, o| {
+            Transformer::Map(Box::new(move |i, _state, o| {
                 let poly = i.to_rational_polynomial::<_, _, u32>(&Q, &Z, None);
 
                 let x = poly
@@ -1553,42 +1607,42 @@ impl PythonTransformer {
 
                 Ok(())
             }))
-        );
+        )
     }
 
     /// Create a transformer that writes the expression over a common denominator.
     pub fn together(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(
+        append_transformer!(
             self,
-            Transformer::Map(Box::new(|i, o| {
+            Transformer::Map(Box::new(|i, _state, o| {
                 let poly = i.to_rational_polynomial::<_, _, u32>(&Q, &Z, None);
                 *o = poly.to_expression();
                 Ok(())
             }))
-        );
+        )
     }
 
     /// Create a transformer that cancels common factors between numerators and denominators.
     /// Any non-canceling parts of the expression will not be rewritten.
     pub fn cancel(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(
+        append_transformer!(
             self,
-            Transformer::Map(Box::new(|i, o| {
+            Transformer::Map(Box::new(|i, _state, o| {
                 *o = i.cancel();
                 Ok(())
             }))
-        );
+        )
     }
 
     /// Create a transformer that factors the expression over the rationals.
     pub fn factor(&self) -> PyResult<PythonTransformer> {
-        return append_transformer!(
+        append_transformer!(
             self,
-            Transformer::Map(Box::new(|i, o| {
+            Transformer::Map(Box::new(|i, _state, o| {
                 *o = i.factor();
                 Ok(())
             }))
-        );
+        )
     }
 
     /// Create a transformer that derives `self` w.r.t the variable `x`.
@@ -1607,11 +1661,11 @@ impl PythonTransformer {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
-        return append_transformer!(self, Transformer::Derivative(id));
+        append_transformer!(self, Transformer::Derivative(id))
     }
 
     /// Create a transformer that series expands in `x` around `expansion_point` to depth `depth`.
@@ -1632,7 +1686,7 @@ impl PythonTransformer {
             ));
         };
 
-        return append_transformer!(
+        append_transformer!(
             self,
             Transformer::Series(
                 id,
@@ -1640,7 +1694,7 @@ impl PythonTransformer {
                 (depth, depth_denom).into(),
                 depth_is_absolute
             )
-        );
+        )
     }
 
     /// Create a transformer that replaces all patterns matching the left-hand side `self` by the right-hand side `rhs`.
@@ -1732,12 +1786,12 @@ impl PythonTransformer {
         &self,
         replacements: Vec<PythonReplacement>,
     ) -> PyResult<PythonTransformer> {
-        return append_transformer!(
+        append_transformer!(
             self,
             Transformer::ReplaceAllMultiple(
                 replacements.into_iter().map(|r| r.replacement).collect()
             )
-        );
+        )
     }
 
     /// Create a transformer that prints the expression.
@@ -1746,7 +1800,8 @@ impl PythonTransformer {
     /// --------
     /// >>> Expression.parse('f(10)').transform().print(terms_on_new_line = True).execute()
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -1757,13 +1812,14 @@ impl PythonTransformer {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn print(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -1775,12 +1831,12 @@ impl PythonTransformer {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<PythonTransformer> {
-        return append_transformer!(
+        append_transformer!(
             self,
             Transformer::Print(PrintOptions {
                 terms_on_new_line,
@@ -1794,15 +1850,16 @@ impl PythonTransformer {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },)
-        );
+        )
     }
 
     /// Print statistics of a transformer, tagging it with `tag`.
@@ -1840,7 +1897,7 @@ impl PythonTransformer {
             ));
         };
 
-        return append_transformer!(
+        append_transformer!(
             self,
             Transformer::Stats(
                 StatsOptions {
@@ -1850,7 +1907,7 @@ impl PythonTransformer {
                 },
                 t.1.clone()
             )
-        );
+        )
     }
 
     /// Add this transformer to `other`, returning the result.
@@ -2106,7 +2163,7 @@ impl PythonCondition {
         Ok(self
             .condition
             .evaluate(&None)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?
+            .map_err(exceptions::PyValueError::new_err)?
             == ConditionResult::True)
     }
 
@@ -2135,7 +2192,7 @@ impl PythonCondition {
             .clone()
             .try_into()
             .map(|e| PythonPatternRestriction { condition: e })
-            .map_err(|e| exceptions::PyValueError::new_err(e))
+            .map_err(exceptions::PyValueError::new_err)
     }
 }
 
@@ -2190,22 +2247,22 @@ impl TryFrom<Relation> for PatternRestriction {
     fn try_from(value: Relation) -> Result<Self, &'static str> {
         match value {
             Relation::Eq(atom, atom1) => {
-                return req_cmp_rel!(atom, atom1, true, is_eq);
+                req_cmp_rel!(atom, atom1, true, is_eq)
             }
             Relation::Ne(atom, atom1) => {
-                return req_cmp_rel!(atom, atom1, true, is_ne);
+                req_cmp_rel!(atom, atom1, true, is_ne)
             }
             Relation::Gt(atom, atom1) => {
-                return req_cmp_rel!(atom, atom1, true, is_gt);
+                req_cmp_rel!(atom, atom1, true, is_gt)
             }
             Relation::Ge(atom, atom1) => {
-                return req_cmp_rel!(atom, atom1, true, is_ge);
+                req_cmp_rel!(atom, atom1, true, is_ge)
             }
             Relation::Lt(atom, atom1) => {
-                return req_cmp_rel!(atom, atom1, true, is_lt);
+                req_cmp_rel!(atom, atom1, true, is_lt)
             }
             Relation::Le(atom, atom1) => {
-                return req_cmp_rel!(atom, atom1, true, is_le);
+                req_cmp_rel!(atom, atom1, true, is_le)
             }
             Relation::Contains(atom, atom1) => {
                 if let Pattern::Wildcard(name) = atom {
@@ -2294,7 +2351,7 @@ impl<'a> FromPyObject<'a> for ConvertibleToPatternRestriction {
             Ok(ConvertibleToPatternRestriction(
                 a.condition
                     .try_into()
-                    .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                    .map_err(exceptions::PyValueError::new_err)?,
             ))
         } else {
             Err(exceptions::PyTypeError::new_err(
@@ -2314,7 +2371,7 @@ impl<'a> FromPyObject<'a> for ConvertibleToExpression {
             let a = format!("{}", num);
             let i = Integer::from(rug::Integer::parse(&a).unwrap().complete());
             Ok(ConvertibleToExpression(Atom::new_num(i).into()))
-        } else if let Ok(_) = ob.extract::<PyBackedStr>() {
+        } else if ob.extract::<PyBackedStr>().is_ok() {
             // disallow direct string conversion
             Err(exceptions::PyTypeError::new_err(
                 "Cannot convert to expression",
@@ -2448,13 +2505,13 @@ impl<'a> FromPyObject<'a> for PythonMultiPrecisionFloat {
                 .count();
 
             Ok(Float::parse(
-                &*a,
+                &a,
                 Some((digits as f64 * std::f64::consts::LOG2_10).ceil() as u32),
             )
             .map_err(|_| exceptions::PyValueError::new_err("Not a floating point number"))?
             .into())
         } else if let Ok(a) = ob.extract::<PyBackedStr>() {
-            Ok(Float::parse(&*a, None)
+            Ok(Float::parse(&a, None)
                 .map_err(|_| exceptions::PyValueError::new_err("Not a floating point number"))?
                 .into())
         } else if let Ok(a) = ob.extract::<f64>() {
@@ -2494,8 +2551,8 @@ impl<'a> FromPyObject<'a> for Complex<Float> {
             Ok(Complex::new(a.0, zero))
         } else if let Ok(a) = ob.downcast::<PyComplex>() {
             Ok(Complex::new(
-                Float::with_val(53, a.real()).into(),
-                Float::with_val(53, a.imag()).into(),
+                Float::with_val(53, a.real()),
+                Float::with_val(53, a.imag()),
             ))
         } else {
             Err(exceptions::PyValueError::new_err(
@@ -2702,7 +2759,7 @@ impl PythonExpression {
 
         let namespace = DefaultNamespace {
             namespace: "python".into(),
-            data: "".into(),
+            data: "",
             file: "".into(),
             line: 0,
         };
@@ -2717,7 +2774,7 @@ impl PythonExpression {
             if names.len() == 1 {
                 let name = names.get_item(0).unwrap().extract::<PyBackedStr>()?;
 
-                let id = Symbol::new(namespace.attach_namespace(name_check(&*name)?))
+                let id = Symbol::new(namespace.attach_namespace(name_check(&name)?))
                     .build()
                     .unwrap();
                 let r = PythonExpression::from(Atom::new_var(id));
@@ -2726,7 +2783,7 @@ impl PythonExpression {
                 let mut result = vec![];
                 for a in names {
                     let name = a.extract::<PyBackedStr>()?;
-                    let id = Symbol::new(namespace.attach_namespace(name_check(&*name)?))
+                    let id = Symbol::new(namespace.attach_namespace(name_check(&name)?))
                         .build()
                         .unwrap();
 
@@ -2768,13 +2825,13 @@ impl PythonExpression {
 
         if names.len() == 1 {
             let name = names.get_item(0).unwrap().extract::<PyBackedStr>()?;
-            let name = namespace.attach_namespace(name_check(&*name)?);
+            let name = namespace.attach_namespace(name_check(&name)?);
 
             let mut symbol = Symbol::new(name).with_attributes(opts);
 
             if let Some(f) = custom_normalization {
                 if let Pattern::Transformer(t) = f.expr {
-                    if !t.0.is_none() {
+                    if t.0.is_some() {
                         Err(exceptions::PyValueError::new_err(
                             "Transformer must be unbound",
                         ))?;
@@ -2784,7 +2841,13 @@ impl PythonExpression {
                         move |input: AtomView<'_>, out: &mut Atom| {
                             Workspace::get_local()
                                 .with(|ws| {
-                                    Transformer::execute_chain(input, &t.1, ws, out).map_err(|e| e)
+                                    Transformer::execute_chain(
+                                        input,
+                                        &t.1,
+                                        ws,
+                                        &TransformerState::default(),
+                                        out,
+                                    )
                                 })
                                 .unwrap();
                             true
@@ -2823,12 +2886,12 @@ impl PythonExpression {
             let mut result = vec![];
             for a in names {
                 let name = a.extract::<PyBackedStr>()?;
-                let name = namespace.attach_namespace(name_check(&*name)?);
+                let name = namespace.attach_namespace(name_check(&name)?);
                 let mut symbol = Symbol::new(name).with_attributes(opts.clone());
 
                 if let Some(f) = &custom_normalization {
                     if let Pattern::Transformer(t) = &f.expr {
-                        if !t.0.is_none() {
+                        if t.0.is_some() {
                             Err(exceptions::PyValueError::new_err(
                                 "Transformer must be unbound",
                             ))?;
@@ -2839,8 +2902,13 @@ impl PythonExpression {
                             move |input: AtomView<'_>, out: &mut Atom| {
                                 Workspace::get_local()
                                     .with(|ws| {
-                                        Transformer::execute_chain(input, &t, ws, out)
-                                            .map_err(|e| e)
+                                        Transformer::execute_chain(
+                                            input,
+                                            &t,
+                                            ws,
+                                            &TransformerState::default(),
+                                            out,
+                                        )
                                     })
                                     .unwrap();
                                 true
@@ -2896,7 +2964,7 @@ impl PythonExpression {
         } else if let Ok(f) = num.extract::<PythonMultiPrecisionFloat>(py) {
             if let Some(relative_error) = relative_error {
                 let mut r: Rational = f.0.into();
-                r = r.round(&relative_error.into()).into();
+                r = r.round(&relative_error.into());
                 Ok(Atom::new_num(r).into())
             } else {
                 Ok(Atom::new_num(f.0).into())
@@ -3069,7 +3137,8 @@ impl PythonExpression {
     /// >>> a = Expression.parse('128378127123 z^(2/3)*w^2/x/y + y^4 + z^34 + x^(x+2)+3/5+f(x,x^2)')
     /// >>> print(a.format(number_thousands_separator='_', multiplication_operator=' '))
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -3080,13 +3149,14 @@ impl PythonExpression {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = Some(100))
+            max_terms = Some(100),
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -3098,10 +3168,10 @@ impl PythonExpression {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(format!(
             "{}",
@@ -3119,13 +3189,14 @@ impl PythonExpression {
                     double_star_for_exponentiation,
                     square_brackets_for_function,
                     num_exp_as_superscript,
-                    latex,
+                    mode: mode.into(),
                     precision,
                     pretty_matrix: false,
                     hide_all_namespaces: !show_namespaces,
                     color_namespace: true,
                     hide_namespace: Some("python"),
                     max_terms,
+                    custom_print_mode: custom_print_mode.map(|x| ("default", x)),
                 },
             )
         ))
@@ -3396,7 +3467,7 @@ impl PythonExpression {
             _ => {
                 return Err(exceptions::PyTypeError::new_err(
                     "Only symbols can be called as functions",
-                ))
+                ));
             }
         };
 
@@ -3475,7 +3546,7 @@ impl PythonExpression {
         if idx.unsigned_abs() < slice.len() {
             Ok(if idx < 0 {
                 slice
-                    .get(slice.len() - idx.abs() as usize)
+                    .get(slice.len() - idx.unsigned_abs())
                     .to_owned()
                     .into()
             } else {
@@ -3740,7 +3811,7 @@ impl PythonExpression {
         other: ConvertibleToExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_cmp!(self, other, cmp_any_atom, is_lt);
+        req_cmp!(self, other, cmp_any_atom, is_lt)
     }
 
     /// Create a pattern restriction that passes when the wildcard is greater than a number `num`.
@@ -3763,7 +3834,7 @@ impl PythonExpression {
         other: ConvertibleToExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_cmp!(self, other, cmp_any_atom, is_gt);
+        req_cmp!(self, other, cmp_any_atom, is_gt)
     }
 
     /// Create a pattern restriction that passes when the wildcard is smaller than or equal to a number `num`.
@@ -3786,7 +3857,7 @@ impl PythonExpression {
         other: ConvertibleToExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_cmp!(self, other, cmp_any_atom, is_le);
+        req_cmp!(self, other, cmp_any_atom, is_le)
     }
 
     /// Create a pattern restriction that passes when the wildcard is greater than or equal to a number `num`.
@@ -3809,7 +3880,7 @@ impl PythonExpression {
         other: ConvertibleToExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_cmp!(self, other, cmp_any_atom, is_ge);
+        req_cmp!(self, other, cmp_any_atom, is_ge)
     }
 
     /// Create a new pattern restriction that calls the function `filter_fn` with the matched
@@ -3879,7 +3950,7 @@ impl PythonExpression {
         other: PythonExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_wc_cmp!(self, other, cmp_any_atom, is_lt);
+        req_wc_cmp!(self, other, cmp_any_atom, is_lt)
     }
 
     /// Create a pattern restriction that passes when the wildcard is greater than another wildcard.
@@ -3902,7 +3973,7 @@ impl PythonExpression {
         other: PythonExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_wc_cmp!(self, other, cmp_any_atom, is_gt);
+        req_wc_cmp!(self, other, cmp_any_atom, is_gt)
     }
 
     /// Create a pattern restriction that passes when the wildcard is less than or equal to another wildcard.
@@ -3925,7 +3996,7 @@ impl PythonExpression {
         other: PythonExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_wc_cmp!(self, other, cmp_any_atom, is_le);
+        req_wc_cmp!(self, other, cmp_any_atom, is_le)
     }
 
     /// Create a pattern restriction that passes when the wildcard is greater than or equal to another wildcard.
@@ -3948,7 +4019,7 @@ impl PythonExpression {
         other: PythonExpression,
         cmp_any_atom: bool,
     ) -> PyResult<PythonPatternRestriction> {
-        return req_wc_cmp!(self, other, cmp_any_atom, is_ge);
+        req_wc_cmp!(self, other, cmp_any_atom, is_ge)
     }
 
     /// Create a new pattern restriction that calls the function `cmp_fn` with another the matched
@@ -4047,12 +4118,13 @@ impl PythonExpression {
     /// >>> e = (1+x)**2
     /// >>> r = e.map(Transformer().expand().replace(x, 6))
     /// >>> print(r)
-    #[pyo3(signature = (op, n_cores = None))]
+    #[pyo3(signature = (op, n_cores = None, stats_to_file = None))]
     pub fn map(
         &self,
         op: PythonTransformer,
         py: Python,
         n_cores: Option<usize>,
+        stats_to_file: Option<String>,
     ) -> PyResult<PythonExpression> {
         let t = match &op.expr {
             Pattern::Transformer(t) => {
@@ -4071,6 +4143,21 @@ impl PythonExpression {
             }
         };
 
+        let state = if let Some(stats_to_file) = stats_to_file {
+            let file = File::create(stats_to_file).map_err(|e| {
+                exceptions::PyIOError::new_err(format!(
+                    "Could not create file for transformer statistics: {}",
+                    e
+                ))
+            })?;
+            TransformerState {
+                stats_export: Some(Arc::new(Mutex::new(BufWriter::new(file)))),
+                ..Default::default()
+            }
+        } else {
+            TransformerState::default()
+        };
+
         // release the GIL as Python functions may be called from
         // within the term mapper
         let r = py.allow_threads(move || {
@@ -4078,10 +4165,12 @@ impl PythonExpression {
                 |x| {
                     let mut out = Atom::default();
                     Workspace::get_local().with(|ws| {
-                        Transformer::execute_chain(x, &t, ws, &mut out).unwrap_or_else(|e| {
-                            // TODO: capture and abort the parallel run
-                            panic!("Transformer failed during parallel execution: {:?}", e)
-                        });
+                        Transformer::execute_chain(x, t, ws, &state, &mut out).unwrap_or_else(
+                            |e| {
+                                // TODO: capture and abort the parallel run
+                                panic!("Transformer failed during parallel execution: {:?}", e)
+                            },
+                        );
                     });
                     out
                 },
@@ -4140,9 +4229,9 @@ impl PythonExpression {
                     Ok(b.into())
                 }
             } else {
-                return Err(exceptions::PyValueError::new_err(
+                Err(exceptions::PyValueError::new_err(
                     "Expansion must be done wrt an indeterminate",
-                ));
+                ))
             }
         } else if via_poly.unwrap_or(false) {
             let b = self.expr.as_view().expand_via_poly::<i16>(None);
@@ -4525,7 +4614,7 @@ impl PythonExpression {
             depth_is_absolute,
         ) {
             Ok(s) => Ok(PythonSeries { series: s }),
-            Err(e) => Err(exceptions::PyValueError::new_err(format!("{}", e))),
+            Err(e) => Err(exceptions::PyValueError::new_err(e.to_string())),
         }
     }
 
@@ -4549,9 +4638,9 @@ impl PythonExpression {
             if let Some(r) = x.expr.get_symbol() {
                 Ok(self.expr.apart(r).into())
             } else {
-                return Err(exceptions::PyValueError::new_err(
+                Err(exceptions::PyValueError::new_err(
                     "Partial fraction decomposition must be done wrt a symbol",
-                ));
+                ))
             }
         } else {
             Ok(self.apart_multivariate().into())
@@ -4720,25 +4809,23 @@ impl PythonExpression {
                 }
                 .into_py_any(py)
             }
-        } else {
-            if let Some(p) = poly {
-                if !p.is_irreducible() || !p.lcoeff().is_one() {
-                    return Err(exceptions::PyValueError::new_err(
-                        "Minimal polynomial must be irreducible and monic",
-                    ));
-                }
-
-                let f = AlgebraicExtension::new(p);
-                PythonNumberFieldPolynomial {
-                    poly: self.expr.to_polynomial(&Q, var_map).to_number_field(&f),
-                }
-                .into_py_any(py)
-            } else {
-                PythonPolynomial {
-                    poly: self.expr.to_polynomial(&Q, var_map),
-                }
-                .into_py_any(py)
+        } else if let Some(p) = poly {
+            if !p.is_irreducible() || !p.lcoeff().is_one() {
+                return Err(exceptions::PyValueError::new_err(
+                    "Minimal polynomial must be irreducible and monic",
+                ));
             }
+
+            let f = AlgebraicExtension::new(p);
+            PythonNumberFieldPolynomial {
+                poly: self.expr.to_polynomial(&Q, var_map).to_number_field(&f),
+            }
+            .into_py_any(py)
+        } else {
+            PythonPolynomial {
+                poly: self.expr.to_polynomial(&Q, var_map),
+            }
+            .into_py_any(py)
         }
     }
 
@@ -4804,7 +4891,7 @@ impl PythonExpression {
         level_is_tree_depth: Option<bool>,
         allow_new_wildcards_on_rhs: Option<bool>,
     ) -> PyResult<PythonMatchIterator> {
-        let conditions = cond.map(|r| r.0).unwrap_or(Condition::default());
+        let conditions = cond.map(|r| r.0).unwrap_or_default();
         let settings = MatchSettings {
             level_range: level_range.unwrap_or((0, None)),
             level_is_tree_depth: level_is_tree_depth.unwrap_or(false),
@@ -4842,7 +4929,7 @@ impl PythonExpression {
         level_is_tree_depth: Option<bool>,
         allow_new_wildcards_on_rhs: Option<bool>,
     ) -> PyResult<PythonCondition> {
-        let conditions = cond.map(|r| r.0).unwrap_or(Condition::default());
+        let conditions = cond.map(|r| r.0).unwrap_or_default();
         let settings = MatchSettings {
             level_range: level_range.unwrap_or((0, None)),
             level_is_tree_depth: level_is_tree_depth.unwrap_or(false),
@@ -4893,7 +4980,7 @@ impl PythonExpression {
         level_is_tree_depth: Option<bool>,
         allow_new_wildcards_on_rhs: Option<bool>,
     ) -> PyResult<PythonReplaceIterator> {
-        let conditions = cond.map(|r| r.0.clone()).unwrap_or(Condition::default());
+        let conditions = cond.map(|r| r.0.clone()).unwrap_or_default();
         let settings = MatchSettings {
             level_range: level_range.unwrap_or((0, None)),
             level_is_tree_depth: level_is_tree_depth.unwrap_or(false),
@@ -5014,7 +5101,7 @@ impl PythonExpression {
 
         let mut out = RecycledAtom::new();
         let mut out2 = RecycledAtom::new();
-        while expr_ref.replace_into(&pattern, rhs, cond.as_ref(), Some(&settings), &mut out) {
+        while expr_ref.replace_into(pattern, rhs, cond.as_ref(), Some(&settings), &mut out) {
             if !repeat.unwrap_or(false) {
                 break;
             }
@@ -5196,7 +5283,7 @@ impl PythonExpression {
         let mut vars = vec![];
         for v in variables {
             match v.expr.as_view() {
-                AtomView::Var(v) => vars.push(v.get_symbol().into()),
+                AtomView::Var(v) => vars.push(v.get_symbol()),
                 e => {
                     Err(exceptions::PyValueError::new_err(format!(
                         "Expected variable instead of {}",
@@ -5479,9 +5566,7 @@ impl PythonExpression {
             if let Ok(r) = v.expr.clone().try_into() {
                 fn_map.add_constant(k.expr, r);
             } else {
-                Err(exceptions::PyValueError::new_err(format!(
-                        "Constants must be rationals. If this is not possible, pass the value as a parameter",
-                    )))?
+                Err(exceptions::PyValueError::new_err("Constants must be rationals. If this is not possible, pass the value as a parameter".to_string()))?
             }
         }
 
@@ -5573,9 +5658,7 @@ impl PythonExpression {
             if let Ok(r) = v.expr.clone().try_into() {
                 fn_map.add_constant(k.expr, r);
             } else {
-                Err(exceptions::PyValueError::new_err(format!(
-                    "Constants must be rationals. If this is not possible, pass the value as a parameter",
-                )))?
+                Err(exceptions::PyValueError::new_err("Constants must be rationals. If this is not possible, pass the value as a parameter".to_string()))?
             }
         }
 
@@ -5764,8 +5847,7 @@ impl PythonSeries {
                 series: &self.series + &rhs.series,
             }),
             SeriesOrExpression::Expression(rhs) => Ok(Self {
-                series: (&self.series + &rhs.expr)
-                    .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                series: (&self.series + &rhs.expr).map_err(exceptions::PyValueError::new_err)?,
             }),
         }
     }
@@ -5773,7 +5855,7 @@ impl PythonSeries {
     /// Add this series to `rhs`, returning the result.
     pub fn __radd__(&self, rhs: &PythonExpression) -> PyResult<Self> {
         Ok(Self {
-            series: (&self.series + &rhs.expr).map_err(|e| exceptions::PyValueError::new_err(e))?,
+            series: (&self.series + &rhs.expr).map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5783,15 +5865,14 @@ impl PythonSeries {
                 series: &self.series - &rhs.series,
             }),
             SeriesOrExpression::Expression(rhs) => Ok(Self {
-                series: (&self.series - &rhs.expr)
-                    .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                series: (&self.series - &rhs.expr).map_err(exceptions::PyValueError::new_err)?,
             }),
         }
     }
 
     pub fn __rsub__(&self, lhs: &PythonExpression) -> PyResult<Self> {
         Ok(Self {
-            series: (&lhs.expr - &self.series).map_err(|e| exceptions::PyValueError::new_err(e))?,
+            series: (&lhs.expr - &self.series).map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5801,15 +5882,14 @@ impl PythonSeries {
                 series: &self.series * &rhs.series,
             }),
             SeriesOrExpression::Expression(rhs) => Ok(Self {
-                series: (&self.series * &rhs.expr)
-                    .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                series: (&self.series * &rhs.expr).map_err(exceptions::PyValueError::new_err)?,
             }),
         }
     }
 
     pub fn __rmul__(&self, lhs: &PythonExpression) -> PyResult<Self> {
         Ok(Self {
-            series: (&self.series * &lhs.expr).map_err(|e| exceptions::PyValueError::new_err(e))?,
+            series: (&self.series * &lhs.expr).map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5819,15 +5899,14 @@ impl PythonSeries {
                 series: &self.series / &rhs.series,
             }),
             SeriesOrExpression::Expression(rhs) => Ok(Self {
-                series: (&self.series / &rhs.expr)
-                    .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                series: (&self.series / &rhs.expr).map_err(exceptions::PyValueError::new_err)?,
             }),
         }
     }
 
     pub fn __rtruediv__(&self, lhs: &PythonExpression) -> PyResult<Self> {
         Ok(Self {
-            series: (&lhs.expr / &self.series).map_err(|e| exceptions::PyValueError::new_err(e))?,
+            series: (&lhs.expr / &self.series).map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5842,7 +5921,7 @@ impl PythonSeries {
             series: self
                 .series
                 .rpow((rhs, 1).into())
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5881,7 +5960,8 @@ impl PythonSeries {
     /// >>> a = Expression.parse('128378127123 z^(2/3)*w^2/x/y + y^4 + z^34 + x^(x+2)+3/5+f(x,x^2)')
     /// >>> print(a.format(number_thousands_separator='_', multiplication_operator=' '))
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -5892,13 +5972,14 @@ impl PythonSeries {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -5910,14 +5991,14 @@ impl PythonSeries {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
-        Ok(format!(
-            "{}",
-            self.series.format_string(
+        Ok(self
+            .series
+            .format_string(
                 &PrintOptions {
                     terms_on_new_line,
                     color_top_level_sum,
@@ -5930,17 +6011,18 @@ impl PythonSeries {
                     double_star_for_exponentiation,
                     square_brackets_for_function,
                     num_exp_as_superscript,
-                    latex,
+                    mode: mode.into(),
                     precision,
                     pretty_matrix: false,
                     hide_all_namespaces: !show_namespaces,
                     color_namespace: true,
                     hide_namespace: Some("python"),
                     max_terms,
+                    custom_print_mode: custom_print_mode.map(|x| ("default", x)),
                 },
-                PrintState::new()
+                PrintState::new(),
             )
-        ))
+            .to_string())
     }
 
     pub fn sin(&self) -> PyResult<Self> {
@@ -5948,7 +6030,7 @@ impl PythonSeries {
             series: self
                 .series
                 .sin()
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5957,7 +6039,7 @@ impl PythonSeries {
             series: self
                 .series
                 .cos()
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5966,7 +6048,7 @@ impl PythonSeries {
             series: self
                 .series
                 .exp()
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5975,7 +6057,7 @@ impl PythonSeries {
             series: self
                 .series
                 .log()
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5984,7 +6066,7 @@ impl PythonSeries {
             series: self
                 .series
                 .rpow((num, den).into())
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -5993,7 +6075,7 @@ impl PythonSeries {
             series: self
                 .series
                 .pow(&pow.series)
-                .map_err(|e| exceptions::PyValueError::new_err(e))?,
+                .map_err(exceptions::PyValueError::new_err)?,
         })
     }
 
@@ -6015,7 +6097,6 @@ impl PythonSeries {
         if let Integer::Natural(n) = r.numerator_ref() {
             if let Integer::Natural(d) = r.denominator_ref() {
                 return Ok((*n, *d));
-            } else {
             }
         }
 
@@ -6028,7 +6109,6 @@ impl PythonSeries {
         if let Integer::Natural(n) = r.numerator_ref() {
             if let Integer::Natural(d) = r.denominator_ref() {
                 return Ok((*n, *d));
-            } else {
             }
         }
 
@@ -6041,7 +6121,6 @@ impl PythonSeries {
         if let Integer::Natural(n) = r.numerator_ref() {
             if let Integer::Natural(d) = r.denominator_ref() {
                 return Ok((*n, *d));
-            } else {
             }
         }
 
@@ -6137,7 +6216,7 @@ impl PythonTermStreamer {
         let writer = CompressorWriter::new(BufWriter::new(f), 4096, compression_level, 22);
         self.stream
             .export(writer)
-            .map_err(|e| exceptions::PyIOError::new_err(e))
+            .map_err(exceptions::PyIOError::new_err)
     }
 
     /// Get the total number of bytes of the stream.
@@ -6171,7 +6250,13 @@ impl PythonTermStreamer {
     }
 
     /// Map the transformations to every term in the stream.
-    pub fn map(&mut self, op: PythonTransformer, py: Python) -> PyResult<Self> {
+    #[pyo3(signature = (op, stats_to_file=None))]
+    pub fn map(
+        &mut self,
+        op: PythonTransformer,
+        stats_to_file: Option<String>,
+        py: Python,
+    ) -> PyResult<Self> {
         let t = match &op.expr {
             Pattern::Transformer(t) => {
                 if t.0.is_some() {
@@ -6187,6 +6272,21 @@ impl PythonTermStreamer {
                     "Operation must of a transformer".to_string(),
                 ));
             }
+        };
+
+        let state = if let Some(stats_to_file) = stats_to_file {
+            let file = File::create(stats_to_file).map_err(|e| {
+                exceptions::PyIOError::new_err(format!(
+                    "Could not create file for transformer statistics: {}",
+                    e
+                ))
+            })?;
+            TransformerState {
+                stats_export: Some(Arc::new(Mutex::new(BufWriter::new(file)))),
+                ..Default::default()
+            }
+        } else {
+            TransformerState::default()
         };
 
         // release the GIL as Python functions may be called from
@@ -6196,10 +6296,11 @@ impl PythonTermStreamer {
             let m = self.stream.map(|x| {
                 let mut out = Atom::default();
                 Workspace::get_local().with(|ws| {
-                    Transformer::execute_chain(x.as_view(), &t, ws, &mut out).unwrap_or_else(|e| {
-                        // TODO: capture and abort the parallel run
-                        panic!("Transformer failed during parallel execution: {:?}", e)
-                    });
+                    Transformer::execute_chain(x.as_view(), t, ws, &state, &mut out)
+                        .unwrap_or_else(|e| {
+                            // TODO: capture and abort the parallel run
+                            panic!("Transformer failed during parallel execution: {:?}", e)
+                        });
                 });
                 out
             });
@@ -6209,7 +6310,12 @@ impl PythonTermStreamer {
     }
 
     /// Map the transformations to every term in the stream using a single thread.
-    pub fn map_single_thread(&mut self, op: PythonTransformer) -> PyResult<Self> {
+    #[pyo3(signature = (op, stats_to_file=None))]
+    pub fn map_single_thread(
+        &mut self,
+        op: PythonTransformer,
+        stats_to_file: Option<String>,
+    ) -> PyResult<Self> {
         let t = match &op.expr {
             Pattern::Transformer(t) => {
                 if t.0.is_some() {
@@ -6227,11 +6333,26 @@ impl PythonTermStreamer {
             }
         };
 
+        let state = if let Some(stats_to_file) = stats_to_file {
+            let file = File::create(stats_to_file).map_err(|e| {
+                exceptions::PyIOError::new_err(format!(
+                    "Could not create file for transformer statistics: {}",
+                    e
+                ))
+            })?;
+            TransformerState {
+                stats_export: Some(Arc::new(Mutex::new(BufWriter::new(file)))),
+                ..Default::default()
+            }
+        } else {
+            TransformerState::default()
+        };
+
         // map every term in the expression
         let s = self.stream.map_single_thread(|x| {
             let mut out = Atom::default();
             Workspace::get_local().with(|ws| {
-                Transformer::execute_chain(x.as_view(), &t, ws, &mut out)
+                Transformer::execute_chain(x.as_view(), t, ws, &state, &mut out)
                     .unwrap_or_else(|e| panic!("Transformer failed during execution: {:?}", e));
             });
             out
@@ -6370,18 +6491,18 @@ impl PythonPolynomial {
                 }
 
                 Err(exceptions::PyTypeError::new_err(format!(
-                "Inequalities between polynomials that are not numbers are not allowed in {} {} {}",
-                self.__str__()?,
-                match op {
-                    CompareOp::Eq => "==",
-                    CompareOp::Ge => ">=",
-                    CompareOp::Gt => ">",
-                    CompareOp::Le => "<=",
-                    CompareOp::Lt => "<",
-                    CompareOp::Ne => "!=",
-                },
-                other.__str__()?,
-            )))
+                    "Inequalities between polynomials that are not numbers are not allowed in {} {} {}",
+                    self.__str__()?,
+                    match op {
+                        CompareOp::Eq => "==",
+                        CompareOp::Ge => ">=",
+                        CompareOp::Gt => ">",
+                        CompareOp::Le => "<=",
+                        CompareOp::Lt => "<",
+                        CompareOp::Ne => "!=",
+                    },
+                    other.__str__()?,
+                )))
             }
         }
     }
@@ -6400,7 +6521,8 @@ impl PythonPolynomial {
     /// >>> p = FiniteFieldPolynomial.parse("3*x^2+2*x+7*x^3", ['x'], 11)
     /// >>> print(p.format(symmetric_representation_for_finite_field=True))
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -6411,13 +6533,14 @@ impl PythonPolynomial {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -6429,10 +6552,10 @@ impl PythonPolynomial {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(self.poly.format_string(
             &PrintOptions {
@@ -6447,13 +6570,14 @@ impl PythonPolynomial {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::new(),
         ))
@@ -6509,9 +6633,9 @@ impl PythonPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -6525,9 +6649,9 @@ impl PythonPolynomial {
     /// Add two polynomials `self and `rhs`, returning the result.
     pub fn __add__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: &self.poly + &rhs.poly,
@@ -6543,9 +6667,9 @@ impl PythonPolynomial {
     /// Multiply two polynomials `self and `rhs`, returning the result.
     pub fn __mul__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: &self.poly * &rhs.poly,
@@ -6556,9 +6680,9 @@ impl PythonPolynomial {
     /// Divide the polynomial `self` by `rhs` if possible, returning the result.
     pub fn __truediv__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         let (q, r) = self.poly.quot_rem(&rhs.poly, false);
@@ -6623,16 +6747,16 @@ impl PythonPolynomial {
         self.poly = self
             .poly
             .rearrange_with_growth(&vars)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?;
+            .map_err(exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
     /// Divide `self` by `rhs`, returning the quotient and remainder.
     pub fn quot_rem(&self, rhs: Self) -> PyResult<(Self, Self)> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         if rhs.poly.is_zero() {
@@ -6653,9 +6777,9 @@ impl PythonPolynomial {
     /// Compute the remainder `self % rhs.
     pub fn __mod__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         if rhs.poly.is_zero() {
@@ -6670,9 +6794,9 @@ impl PythonPolynomial {
     /// Compute the greatest common divisor (GCD) of two polynomials.
     pub fn gcd(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: self.poly.gcd(&rhs.poly),
@@ -6692,15 +6816,15 @@ impl PythonPolynomial {
     /// yields `(1, 1/67-7/402*x, 47/134+7/402*x)`.
     pub fn extended_gcd(&self, rhs: Self) -> PyResult<(Self, Self, Self)> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         }
 
         if self.poly.variables.len() > 1 || self.poly.variables != rhs.poly.variables {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials are not univariate in the same variable"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials are not univariate in the same variable".to_string(),
+            ));
         }
 
         let (g, s, t) = self.poly.eea_univariate(&rhs.poly);
@@ -6980,15 +7104,13 @@ impl PythonPolynomial {
 
         let namespace = DefaultNamespace {
             namespace: default_namespace.to_string().into(),
-            data: "".into(),
+            data: "",
             file: "".into(),
             line: 0,
         };
 
         for v in vars {
-            let id = Symbol::new(namespace.attach_namespace(&*v))
-                .build()
-                .unwrap();
+            let id = Symbol::new(namespace.attach_namespace(&v)).build().unwrap();
             var_map.push(id.into());
             var_name_map.push((*v).into());
         }
@@ -7208,15 +7330,15 @@ impl PythonPolynomial {
         values: Vec<PythonPolynomial>,
     ) -> PyResult<Self> {
         if values.is_empty() {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Values must be provided"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Values must be provided".to_string(),
+            ));
         }
 
         if sample_points.len() != values.len() {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Sample points and values must have the same length"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Sample points and values must have the same length".to_string(),
+            ));
         }
 
         let var = x.expr.into();
@@ -7228,14 +7350,14 @@ impl PythonPolynomial {
                     match x.get_coeff_view() {
                         CoefficientView::Natural(r, d) => Ok(Rational::from_unchecked(r, d)),
                         CoefficientView::Large(r) => Ok(r.to_rat()),
-                        _ => Err(exceptions::PyValueError::new_err(format!(
-                            "Sample points must be rational numbers"
-                        ))),
+                        _ => Err(exceptions::PyValueError::new_err(
+                            "Sample points must be rational numbers".to_string(),
+                        )),
                     }
                 } else {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Sample points must be rational numbers"
-                    )))?
+                    Err(exceptions::PyValueError::new_err(
+                        "Sample points must be rational numbers".to_string(),
+                    ))?
                 }
             })
             .collect::<Result<_, _>>()?;
@@ -7306,7 +7428,8 @@ impl PythonFiniteFieldPolynomial {
     /// >>> p = FiniteFieldPolynomial.parse("3*x^2+2*x+7*x^3", ['x'], 11)
     /// >>> print(p.format(symmetric_representation_for_finite_field=True))
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -7317,13 +7440,14 @@ impl PythonFiniteFieldPolynomial {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -7335,10 +7459,10 @@ impl PythonFiniteFieldPolynomial {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(self.poly.format_string(
             &PrintOptions {
@@ -7353,13 +7477,14 @@ impl PythonFiniteFieldPolynomial {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::new(),
         ))
@@ -7415,9 +7540,9 @@ impl PythonFiniteFieldPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -7431,9 +7556,9 @@ impl PythonFiniteFieldPolynomial {
     /// Add two polynomials `self and `rhs`, returning the result.
     pub fn __add__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: &self.poly + &rhs.poly,
@@ -7449,9 +7574,9 @@ impl PythonFiniteFieldPolynomial {
     /// Multiply two polynomials `self and `rhs`, returning the result.
     pub fn __mul__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: &self.poly * &rhs.poly,
@@ -7462,9 +7587,9 @@ impl PythonFiniteFieldPolynomial {
     /// Divide the polynomial `self` by `rhs` if possible, returning the result.
     pub fn __truediv__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         let (q, r) = self.poly.quot_rem(&rhs.poly, false);
@@ -7529,16 +7654,16 @@ impl PythonFiniteFieldPolynomial {
         self.poly = self
             .poly
             .rearrange_with_growth(&vars)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?;
+            .map_err(exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
     /// Divide `self` by `rhs`, returning the quotient and remainder.
     pub fn quot_rem(&self, rhs: Self) -> PyResult<(Self, Self)> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         if rhs.poly.is_zero() {
@@ -7559,9 +7684,9 @@ impl PythonFiniteFieldPolynomial {
     /// Compute the remainder `self % rhs.
     pub fn __mod__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         if rhs.poly.is_zero() {
@@ -7576,9 +7701,9 @@ impl PythonFiniteFieldPolynomial {
     /// Compute the greatest common divisor (GCD) of two polynomials.
     pub fn gcd(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: self.poly.gcd(&rhs.poly),
@@ -7598,15 +7723,15 @@ impl PythonFiniteFieldPolynomial {
     /// yields `(1, 3+4*x, 3+x)`.
     pub fn extended_gcd(&self, rhs: Self) -> PyResult<(Self, Self, Self)> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         }
 
         if self.poly.variables.len() > 1 || self.poly.variables != rhs.poly.variables {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials are not univariate in the same variable"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials are not univariate in the same variable".to_string(),
+            ));
         }
 
         let (g, s, t) = self.poly.eea_univariate(&rhs.poly);
@@ -7787,7 +7912,7 @@ impl PythonFiniteFieldPolynomial {
                         (
                             t.exponents.iter().map(|x| *x as usize).collect(),
                             Self {
-                                poly: self.poly.constant(t.coefficient.clone()),
+                                poly: self.poly.constant(*t.coefficient),
                             },
                         )
                     })
@@ -7826,7 +7951,7 @@ impl PythonFiniteFieldPolynomial {
                     (
                         t.exponents.iter().map(|x| *x as usize).collect(),
                         Self {
-                            poly: self.poly.constant(t.coefficient.clone()),
+                            poly: self.poly.constant(*t.coefficient),
                         },
                     )
                 })
@@ -7850,7 +7975,7 @@ impl PythonFiniteFieldPolynomial {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
@@ -7996,15 +8121,13 @@ impl PythonFiniteFieldPolynomial {
 
         let namespace = DefaultNamespace {
             namespace: default_namespace.to_string().into(),
-            data: "".into(),
+            data: "",
             file: "".into(),
             line: 0,
         };
 
         for v in vars {
-            let id = Symbol::new(namespace.attach_namespace(&*v))
-                .build()
-                .unwrap();
+            let id = Symbol::new(namespace.attach_namespace(&v)).build().unwrap();
             var_map.push(id.into());
             var_name_map.push((*v).into());
         }
@@ -8021,7 +8144,7 @@ impl PythonFiniteFieldPolynomial {
     pub fn to_expression(&self) -> PyResult<PythonExpression> {
         let p = self
             .poly
-            .map_coeff(|x| self.poly.ring.to_symmetric_integer(x).into(), Z);
+            .map_coeff(|x| self.poly.ring.to_symmetric_integer(x), Z);
 
         Ok(p.to_expression().into())
     }
@@ -8071,7 +8194,8 @@ impl PythonPrimeTwoPolynomial {
     /// >>> p = FiniteFieldPolynomial.parse("3*x^2+2*x+7*x^3", ['x'], 11)
     /// >>> print(p.format(symmetric_representation_for_finite_field=True))
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -8082,13 +8206,14 @@ impl PythonPrimeTwoPolynomial {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -8100,10 +8225,10 @@ impl PythonPrimeTwoPolynomial {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(self.poly.format_string(
             &PrintOptions {
@@ -8118,13 +8243,14 @@ impl PythonPrimeTwoPolynomial {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::new(),
         ))
@@ -8180,9 +8306,9 @@ impl PythonPrimeTwoPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -8276,7 +8402,7 @@ impl PythonPrimeTwoPolynomial {
         self.poly = self
             .poly
             .rearrange_with_growth(&vars)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?;
+            .map_err(exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
@@ -8475,7 +8601,7 @@ impl PythonPrimeTwoPolynomial {
                         (
                             t.exponents.iter().map(|x| *x as usize).collect(),
                             Self {
-                                poly: self.poly.constant(t.coefficient.clone()),
+                                poly: self.poly.constant(*t.coefficient),
                             },
                         )
                     })
@@ -8514,7 +8640,7 @@ impl PythonPrimeTwoPolynomial {
                     (
                         t.exponents.iter().map(|x| *x as usize).collect(),
                         Self {
-                            poly: self.poly.constant(t.coefficient.clone()),
+                            poly: self.poly.constant(*t.coefficient),
                         },
                     )
                 })
@@ -8538,7 +8664,7 @@ impl PythonPrimeTwoPolynomial {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
@@ -8709,7 +8835,8 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// >>> p = FiniteFieldPolynomial.parse("3*x^2+2*x+7*x^3", ['x'], 11)
     /// >>> print(p.format(symmetric_representation_for_finite_field=True))
     #[pyo3(signature =
-    (terms_on_new_line = false,
+    (mode = PythonPrintMode::Symbolica,
+        terms_on_new_line = false,
         color_top_level_sum = true,
         color_builtin_symbols = true,
         print_finite_field = true,
@@ -8720,13 +8847,14 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
         double_star_for_exponentiation = false,
         square_brackets_for_function = false,
         num_exp_as_superscript = true,
-        latex = false,
         precision = None,
         show_namespaces = false,
-            max_terms = None)
+        max_terms = None,
+        custom_print_mode = None)
     )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -8738,10 +8866,10 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(self.poly.format_string(
             &PrintOptions {
@@ -8756,13 +8884,14 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::new(),
         ))
@@ -8822,9 +8951,9 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -8838,9 +8967,9 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// Add two polynomials `self and `rhs`, returning the result.
     pub fn __add__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: &self.poly + &rhs.poly,
@@ -8856,9 +8985,9 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// Multiply two polynomials `self and `rhs`, returning the result.
     pub fn __mul__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: &self.poly * &rhs.poly,
@@ -8869,9 +8998,9 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// Divide the polynomial `self` by `rhs` if possible, returning the result.
     pub fn __truediv__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         let (q, r) = self.poly.quot_rem(&rhs.poly, false);
@@ -8936,16 +9065,16 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
         self.poly = self
             .poly
             .rearrange_with_growth(&vars)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?;
+            .map_err(exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
     /// Divide `self` by `rhs`, returning the quotient and remainder.
     pub fn quot_rem(&self, rhs: Self) -> PyResult<(Self, Self)> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         if rhs.poly.is_zero() {
@@ -8966,9 +9095,9 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// Compute the remainder `self % rhs.
     pub fn __mod__(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         };
 
         if rhs.poly.is_zero() {
@@ -8983,9 +9112,9 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// Compute the greatest common divisor (GCD) of two polynomials.
     pub fn gcd(&self, rhs: Self) -> PyResult<Self> {
         if self.poly.ring != rhs.poly.ring {
-            Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )))
+            Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ))
         } else {
             Ok(Self {
                 poly: self.poly.gcd(&rhs.poly),
@@ -9005,15 +9134,15 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
     /// yields `(1, 3+4*x, 3+x)`.
     pub fn extended_gcd(&self, rhs: Self) -> PyResult<(Self, Self, Self)> {
         if self.poly.ring != rhs.poly.ring {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials have different rings"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials have different rings".to_string(),
+            ));
         }
 
         if self.poly.variables.len() > 1 || self.poly.variables != rhs.poly.variables {
-            return Err(exceptions::PyValueError::new_err(format!(
-                "Polynomials are not univariate in the same variable"
-            )));
+            return Err(exceptions::PyValueError::new_err(
+                "Polynomials are not univariate in the same variable".to_string(),
+            ));
         }
 
         let (g, s, t) = self.poly.eea_univariate(&rhs.poly);
@@ -9243,7 +9372,7 @@ impl PythonGaloisFieldPrimeTwoPolynomial {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
@@ -9418,7 +9547,8 @@ impl PythonGaloisFieldPolynomial {
     /// >>> p = FiniteFieldPolynomial.parse("3*x^2+2*x+7*x^3", ['x'], 11)
     /// >>> print(p.format(symmetric_representation_for_finite_field=True))
     #[pyo3(signature =
-        (terms_on_new_line = false,
+        (mode = PythonPrintMode::Symbolica,
+            terms_on_new_line = false,
             color_top_level_sum = true,
             color_builtin_symbols = true,
             print_finite_field = true,
@@ -9429,13 +9559,14 @@ impl PythonGaloisFieldPolynomial {
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -9447,10 +9578,10 @@ impl PythonGaloisFieldPolynomial {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(self.poly.format_string(
             &PrintOptions {
@@ -9465,13 +9596,14 @@ impl PythonGaloisFieldPolynomial {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::new(),
         ))
@@ -9527,9 +9659,9 @@ impl PythonGaloisFieldPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -9623,7 +9755,7 @@ impl PythonGaloisFieldPolynomial {
         self.poly = self
             .poly
             .rearrange_with_growth(&vars)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?;
+            .map_err(exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
@@ -9885,7 +10017,7 @@ impl PythonGaloisFieldPolynomial {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
@@ -10008,7 +10140,7 @@ impl PythonGaloisFieldPolynomial {
             .poly
             .to_expression_with_coeff_map(|_, element, out| {
                 let p = element.poly.map_coeff(
-                    |c| Integer::from_finite_field(&element.poly.ring, c.clone()),
+                    |c| Integer::from_finite_field(&element.poly.ring, *c),
                     IntegerRing::new(),
                 );
                 p.to_expression_into(out);
@@ -10061,7 +10193,8 @@ impl PythonNumberFieldPolynomial {
     /// >>> p = FiniteFieldPolynomial.parse("3*x^2+2*x+7*x^3", ['x'], 11)
     /// >>> print(p.format(symmetric_representation_for_finite_field=True))
     #[pyo3(signature =
-    (terms_on_new_line = false,
+    (mode = PythonPrintMode::Symbolica,
+        terms_on_new_line = false,
         color_top_level_sum = true,
         color_builtin_symbols = true,
         print_finite_field = true,
@@ -10072,13 +10205,14 @@ impl PythonNumberFieldPolynomial {
         double_star_for_exponentiation = false,
         square_brackets_for_function = false,
         num_exp_as_superscript = true,
-        latex = false,
         precision = None,
-            show_namespaces = false,
-            max_terms = None)
+        show_namespaces = false,
+        max_terms = None,
+        custom_print_mode = None)
     )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         terms_on_new_line: bool,
         color_top_level_sum: bool,
         color_builtin_symbols: bool,
@@ -10090,10 +10224,10 @@ impl PythonNumberFieldPolynomial {
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> PyResult<String> {
         Ok(self.poly.format_string(
             &PrintOptions {
@@ -10108,13 +10242,14 @@ impl PythonNumberFieldPolynomial {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix: false,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::new(),
         ))
@@ -10170,9 +10305,9 @@ impl PythonNumberFieldPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -10266,7 +10401,7 @@ impl PythonNumberFieldPolynomial {
         self.poly = self
             .poly
             .rearrange_with_growth(&vars)
-            .map_err(|e| exceptions::PyValueError::new_err(e))?;
+            .map_err(exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
@@ -10528,7 +10663,7 @@ impl PythonNumberFieldPolynomial {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Derivative must be taken wrt a variable",
-                ))
+                ));
             }
         };
 
@@ -10739,9 +10874,9 @@ impl PythonRationalPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -10911,7 +11046,7 @@ impl PythonRationalPolynomial {
                 _ => {
                     return Err(exceptions::PyValueError::new_err(
                         "Invalid variable specified.",
-                    ))
+                    ));
                 }
             };
 
@@ -11000,15 +11135,13 @@ impl PythonRationalPolynomial {
 
         let namespace = DefaultNamespace {
             namespace: default_namespace.to_string().into(),
-            data: "".into(),
+            data: "",
             file: "".into(),
             line: 0,
         };
 
         for v in vars {
-            let id = Symbol::new(namespace.attach_namespace(&*v))
-                .build()
-                .unwrap();
+            let id = Symbol::new(namespace.attach_namespace(&v)).build().unwrap();
             var_map.push(id.into());
             var_name_map.push((*v).into());
         }
@@ -11082,9 +11215,9 @@ impl PythonFiniteFieldRationalPolynomial {
                     var_list.push(Atom::new_var(*x).into());
                 }
                 Variable::Temporary(_) => {
-                    Err(exceptions::PyValueError::new_err(format!(
-                        "Temporary variable in polynomial",
-                    )))?;
+                    Err(exceptions::PyValueError::new_err(
+                        "Temporary variable in polynomial".to_string(),
+                    ))?;
                 }
                 Variable::Function(_, a) | Variable::Other(a) => {
                     var_list.push(a.as_ref().clone().into());
@@ -11251,7 +11384,7 @@ impl PythonFiniteFieldRationalPolynomial {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Invalid variable specified.",
-                ))
+                ));
             }
         };
 
@@ -11304,15 +11437,13 @@ impl PythonFiniteFieldRationalPolynomial {
 
         let namespace = DefaultNamespace {
             namespace: default_namespace.to_string().into(),
-            data: "".into(),
+            data: "",
             file: "".into(),
             line: 0,
         };
 
         for v in vars {
-            let id = Symbol::new(namespace.attach_namespace(&*v))
-                .build()
-                .unwrap();
+            let id = Symbol::new(namespace.attach_namespace(&v)).build().unwrap();
             var_map.push(id.into());
             var_name_map.push((*v).into());
         }
@@ -11417,7 +11548,7 @@ impl PythonExpressionEvaluator {
                 Instruction::Add(o, s) | Instruction::Mul(o, s) => {
                     v.push(PyTuple::new(
                         py,
-                        &[
+                        [
                             if matches!(i, Instruction::Add(_, _)) {
                                 "add"
                             } else {
@@ -11425,9 +11556,9 @@ impl PythonExpressionEvaluator {
                             }
                             .into_pyobject(py)?
                             .as_any(),
-                            slot_to_object(&o).into_pyobject(py)?.as_any(),
+                            slot_to_object(o).into_pyobject(py)?.as_any(),
                             s.iter()
-                                .map(|x| slot_to_object(x))
+                                .map(slot_to_object)
                                 .collect::<Vec<_>>()
                                 .into_pyobject(py)?
                                 .as_any(),
@@ -11437,10 +11568,10 @@ impl PythonExpressionEvaluator {
                 Instruction::Pow(o, b, e) => {
                     v.push(PyTuple::new(
                         py,
-                        &[
+                        [
                             "pow".into_pyobject(py)?.as_any(),
-                            slot_to_object(&o).into_pyobject(py)?.as_any(),
-                            slot_to_object(&b).into_pyobject(py)?.as_any(),
+                            slot_to_object(o).into_pyobject(py)?.as_any(),
+                            slot_to_object(b).into_pyobject(py)?.as_any(),
                             e.into_pyobject(py)?.as_any(),
                         ],
                     )?);
@@ -11448,24 +11579,24 @@ impl PythonExpressionEvaluator {
                 Instruction::Powf(o, b, e) => {
                     v.push(PyTuple::new(
                         py,
-                        &[
+                        [
                             "powf".into_pyobject(py)?.as_any(),
-                            slot_to_object(&o).into_pyobject(py)?.as_any(),
-                            slot_to_object(&b).into_pyobject(py)?.as_any(),
-                            slot_to_object(&e).into_pyobject(py)?.as_any(),
+                            slot_to_object(o).into_pyobject(py)?.as_any(),
+                            slot_to_object(b).into_pyobject(py)?.as_any(),
+                            slot_to_object(e).into_pyobject(py)?.as_any(),
                         ],
                     )?);
                 }
                 Instruction::Fun(o, f, s) => {
                     v.push(PyTuple::new(
                         py,
-                        &[
+                        [
                             "fun".into_pyobject(py)?.as_any(),
-                            slot_to_object(&o).into_pyobject(py)?.as_any(),
+                            slot_to_object(o).into_pyobject(py)?.as_any(),
                             PythonExpression::from(Atom::new_var(f.get_symbol()))
                                 .into_pyobject(py)?
                                 .as_any(),
-                            slot_to_object(&s).into_pyobject(py)?.as_any(),
+                            slot_to_object(s).into_pyobject(py)?.as_any(),
                         ],
                     )?);
                 }
@@ -11579,7 +11710,7 @@ impl PythonExpressionEvaluator {
             _ => {
                 return Err(exceptions::PyValueError::new_err(
                     "Invalid inline assembly type specified.",
-                ))
+                ));
             }
         };
 
@@ -12045,8 +12176,7 @@ impl PythonMatrix {
                 let expr = PythonRationalPolynomial { poly: x.clone() };
 
                 Python::with_gil(|py| {
-                    Ok(f.call1(py, (expr,))
-                        .map_err(|e| e)?
+                    Ok(f.call1(py, (expr,))?
                         .extract::<ConvertibleToRationalPolynomial>(py)?
                         .to_rational_polynomial()?
                         .poly
@@ -12085,29 +12215,31 @@ impl PythonMatrix {
 
     /// Convert the matrix into a human-readable string, with tunable settings.
     #[pyo3(signature =
-        (pretty_matrix = true,
+        (mode = PythonPrintMode::Symbolica,
+            pretty_matrix = true,
             number_thousands_separator = None,
             multiplication_operator = '*',
             double_star_for_exponentiation = false,
             square_brackets_for_function = false,
             num_exp_as_superscript = true,
-            latex = false,
             precision = None,
             show_namespaces = false,
-            max_terms = None)
+            max_terms = None,
+            custom_print_mode = None)
         )]
     pub fn format(
         &self,
+        mode: PythonPrintMode,
         pretty_matrix: bool,
         number_thousands_separator: Option<char>,
         multiplication_operator: char,
         double_star_for_exponentiation: bool,
         square_brackets_for_function: bool,
         num_exp_as_superscript: bool,
-        latex: bool,
         precision: Option<usize>,
         show_namespaces: bool,
         max_terms: Option<usize>,
+        custom_print_mode: Option<usize>,
     ) -> String {
         self.matrix.format_string(
             &PrintOptions {
@@ -12122,13 +12254,14 @@ impl PythonMatrix {
                 double_star_for_exponentiation,
                 square_brackets_for_function,
                 num_exp_as_superscript,
-                latex,
+                mode: mode.into(),
                 precision,
                 pretty_matrix,
                 hide_all_namespaces: !show_namespaces,
                 color_namespace: true,
                 hide_namespace: Some("python"),
                 max_terms,
+                custom_print_mode: custom_print_mode.map(|x| ("default", x)),
             },
             PrintState::default(),
         )
@@ -12148,9 +12281,9 @@ impl PythonMatrix {
         match op {
             CompareOp::Eq => Ok(self.matrix == other.matrix),
             CompareOp::Ne => Ok(self.matrix != other.matrix),
-            _ => Err(exceptions::PyTypeError::new_err(format!(
-                "Inequalities between matrices are not supported",
-            ))),
+            _ => Err(exceptions::PyTypeError::new_err(
+                "Inequalities between matrices are not supported".to_string(),
+            )),
         }
     }
 
@@ -12522,7 +12655,7 @@ impl PythonNumericalIntegrator {
     fn merge(&mut self, other: &PythonNumericalIntegrator) -> PyResult<()> {
         self.grid
             .merge(&other.grid)
-            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e))
+            .map_err(pyo3::exceptions::PyAssertionError::new_err)
     }
 
     /// Update the grid using the `discrete_learning_rate` and `continuous_learning_rate`.
@@ -12693,9 +12826,9 @@ impl PythonGraph {
         match op {
             CompareOp::Eq => Ok(self.graph == other.graph),
             CompareOp::Ne => Ok(self.graph != other.graph),
-            _ => Err(exceptions::PyTypeError::new_err(format!(
-                "Inequalities between graphs are not allowed",
-            ))),
+            _ => Err(exceptions::PyTypeError::new_err(
+                "Inequalities between graphs are not allowed".to_string(),
+            )),
         }
     }
 
@@ -12832,7 +12965,7 @@ impl PythonGraph {
                 directed,
                 data.map(|x| x.to_expression().expr).unwrap_or_default(),
             )
-            .map_err(|e| exceptions::PyValueError::new_err(e))
+            .map_err(exceptions::PyValueError::new_err)
     }
 
     /// Set the data of the node at index `index`, returning the old data.
@@ -12843,7 +12976,7 @@ impl PythonGraph {
     ) -> PyResult<PythonExpression> {
         if index.unsigned_abs() < self.graph.nodes().len() {
             let n = if index < 0 {
-                self.graph.nodes().len() - index.abs() as usize
+                self.graph.nodes().len() - index.unsigned_abs()
             } else {
                 index as usize
             };
@@ -12865,7 +12998,7 @@ impl PythonGraph {
     ) -> PyResult<PythonExpression> {
         if index.unsigned_abs() < self.graph.edges().len() {
             let e = if index < 0 {
-                self.graph.edges().len() - index.abs() as usize
+                self.graph.edges().len() - index.unsigned_abs()
             } else {
                 index as usize
             };
@@ -12883,11 +13016,11 @@ impl PythonGraph {
     pub fn set_directed(&mut self, index: isize, directed: bool) -> PyResult<bool> {
         if index.unsigned_abs() < self.graph.edges().len() {
             let e = if index < 0 {
-                self.graph.edges().len() - index.abs() as usize
+                self.graph.edges().len() - index.unsigned_abs()
             } else {
                 index as usize
             };
-            Ok(self.graph.set_directed(e, directed).into())
+            Ok(self.graph.set_directed(e, directed))
         } else {
             Err(PyIndexError::new_err(format!(
                 "Index {} out of bounds: the graph only has {} edges.",
@@ -12922,7 +13055,7 @@ impl PythonGraph {
         if idx.unsigned_abs() < self.graph.nodes().len() {
             let n = if idx < 0 {
                 self.graph
-                    .node(self.graph.nodes().len() - idx.abs() as usize)
+                    .node(self.graph.nodes().len() - idx.unsigned_abs())
             } else {
                 self.graph.node(idx as usize)
             };
@@ -12950,7 +13083,7 @@ impl PythonGraph {
         if idx.unsigned_abs() < self.graph.edges().len() {
             let e = if idx < 0 {
                 self.graph
-                    .edge(self.graph.edges().len() - idx.abs() as usize)
+                    .edge(self.graph.edges().len() - idx.unsigned_abs())
             } else {
                 self.graph.edge(idx as usize)
             };

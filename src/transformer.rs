@@ -2,10 +2,14 @@
 //!
 //! Used primarily in the Python API.
 
-use std::{ops::ControlFlow, sync::Arc, time::Instant};
+use std::{
+    ops::ControlFlow,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use crate::{
-    atom::{representation::FunView, Atom, AtomView, Fun, Symbol},
+    atom::{Atom, AtomView, Fun, Symbol, representation::FunView},
     coefficient::{Coefficient, CoefficientView},
     combinatorics::{partitions, unique_permutations},
     domains::rational::Rational,
@@ -23,12 +27,16 @@ use rayon::ThreadPool;
 
 /// A function that maps an atom(view) to another atom.
 pub trait Map:
-    Fn(AtomView, &mut Atom) -> Result<(), TransformerError> + DynClone + Send + Sync
+    Fn(AtomView, &TransformerState, &mut Atom) -> Result<(), TransformerError> + DynClone + Send + Sync
 {
 }
 dyn_clone::clone_trait_object!(Map);
-impl<T: Clone + Send + Sync + Fn(AtomView<'_>, &mut Atom) -> Result<(), TransformerError>> Map
-    for T
+impl<
+    T: Clone
+        + Send
+        + Sync
+        + Fn(AtomView<'_>, &TransformerState, &mut Atom) -> Result<(), TransformerError>,
+> Map for T
 {
 }
 
@@ -39,6 +47,11 @@ pub struct StatsOptions {
     pub tag: String,
     pub color_medium_change_threshold: Option<f64>,
     pub color_large_change_threshold: Option<f64>,
+}
+
+#[derive(Clone, Default)]
+pub struct TransformerState {
+    pub stats_export: Option<Arc<Mutex<dyn std::io::Write + Send>>>,
 }
 
 impl StatsOptions {
@@ -62,7 +75,57 @@ impl StatsOptions {
         format!("{}", count)
     }
 
-    pub fn print(&self, input: AtomView, output: AtomView, dt: std::time::Duration) {
+    fn get_thread_id() -> String {
+        let mut s = format!("{:?}", std::thread::current().id()); // prints ThreadID(num)
+        s.pop();
+        s.drain(0..9);
+        s
+    }
+
+    pub fn print_json(
+        &self,
+        input: AtomView,
+        output: AtomView,
+        t: std::time::Duration,
+        dt: std::time::Duration,
+        out: &mut dyn std::io::Write,
+    ) {
+        let in_nterms = if let AtomView::Add(a) = input {
+            a.get_nargs()
+        } else {
+            1
+        };
+        let in_size = input.get_byte_size();
+
+        let out_nterms = if let AtomView::Add(a) = output {
+            a.get_nargs()
+        } else {
+            1
+        };
+        let out_size = output.get_byte_size();
+
+        writeln!(
+            out,
+            r#"{{"event": "stats", "tag": "{}", "process_id": {}, "thread_id": {}, "in_terms": {}, "in_size": {}, "out_terms": {}, "out_size": {}, "start_timestamp": {}, "duration": {}}}"#,
+            self.tag,
+            std::process::id(),
+            Self::get_thread_id(),
+            in_nterms,
+            in_size,
+            out_nterms,
+            out_size,
+            t.as_secs_f64(),
+            dt.as_secs_f64()
+        ).unwrap();
+    }
+
+    pub fn print(
+        &self,
+        input: AtomView,
+        output: AtomView,
+        _t: std::time::Duration,
+        dt: std::time::Duration,
+    ) {
         let in_nterms = if let AtomView::Add(a) = input {
             a.get_nargs()
         } else {
@@ -81,10 +144,11 @@ impl StatsOptions {
         let out_nterms_s = self.format_count(out_nterms);
 
         println!(
-            "Stats for {}:
+            "Stats for {}[{}]:
 \tIn  │ {:>width$} │ {:>8} │
 \tOut │ {:>width$} │ {:>8} │ ⧗ {:#.2?}",
             self.tag.bold(),
+            Self::get_thread_id(),
             in_nterms_s,
             self.format_size(in_size),
             if out_nterms as f64 / in_nterms as f64
@@ -423,9 +487,18 @@ impl Transformer {
 
     /// Apply the transformer to `input`.
     pub fn execute(&self, input: AtomView<'_>) -> Result<Atom, TransformerError> {
+        self.execute_with_state(input, &TransformerState::default())
+    }
+
+    /// Apply the transformer to `input`.
+    pub fn execute_with_state(
+        &self,
+        input: AtomView<'_>,
+        state: &TransformerState,
+    ) -> Result<Atom, TransformerError> {
         let mut a = Atom::new();
         Workspace::get_local().with(|ws| {
-            Transformer::execute_chain(input, std::slice::from_ref(self), ws, &mut a).map_err(|e| e)
+            Transformer::execute_chain(input, std::slice::from_ref(self), ws, state, &mut a)
         })?;
         Ok(a)
     }
@@ -435,9 +508,10 @@ impl Transformer {
         &self,
         input: AtomView<'_>,
         workspace: &Workspace,
+        state: &TransformerState,
         out: &mut Atom,
     ) -> Result<ControlFlow<()>, TransformerError> {
-        Transformer::execute_chain(input, std::slice::from_ref(self), workspace, out)
+        Transformer::execute_chain(input, std::slice::from_ref(self), workspace, state, out)
     }
 
     /// Apply a chain of transformers to `input`.
@@ -445,6 +519,7 @@ impl Transformer {
         input: AtomView<'_>,
         chain: &[Transformer],
         workspace: &Workspace,
+        state: &TransformerState,
         out: &mut Atom,
     ) -> Result<ControlFlow<()>, TransformerError> {
         out.set_from_view(&input);
@@ -457,27 +532,31 @@ impl Transformer {
                 Transformer::IfElse(cond, t1, t2) => {
                     if cond
                         .evaluate(&Some(cur_input))
-                        .map_err(|e| TransformerError::ValueError(e))?
+                        .map_err(TransformerError::ValueError)?
                         .is_true()
                     {
-                        if Transformer::execute_chain(cur_input, t1, workspace, out)?.is_break() {
+                        if Transformer::execute_chain(cur_input, t1, workspace, state, out)?
+                            .is_break()
+                        {
                             return Ok(ControlFlow::Break(()));
                         }
-                    } else if Transformer::execute_chain(cur_input, t2, workspace, out)?.is_break()
+                    } else if Transformer::execute_chain(cur_input, t2, workspace, state, out)?
+                        .is_break()
                     {
                         return Ok(ControlFlow::Break(()));
                     }
                 }
                 Transformer::IfChanged(cond, t1, t2) => {
-                    Transformer::execute_chain(cur_input, cond, workspace, out)?;
+                    Transformer::execute_chain(cur_input, cond, workspace, state, out)?;
                     std::mem::swap(out, &mut tmp);
 
                     if tmp.as_view() != out.as_view() {
-                        if Transformer::execute_chain(tmp.as_view(), t1, workspace, out)?.is_break()
+                        if Transformer::execute_chain(tmp.as_view(), t1, workspace, state, out)?
+                            .is_break()
                         {
                             return Ok(ControlFlow::Break(()));
                         }
-                    } else if Transformer::execute_chain(tmp.as_view(), t2, workspace, out)?
+                    } else if Transformer::execute_chain(tmp.as_view(), t2, workspace, state, out)?
                         .is_break()
                     {
                         return Ok(ControlFlow::Break(()));
@@ -488,7 +567,7 @@ impl Transformer {
                     return Ok(ControlFlow::Break(()));
                 }
                 Transformer::Map(f) => {
-                    f(cur_input, out)?;
+                    f(cur_input, state, out)?;
                 }
                 Transformer::MapTerms(t, p) => {
                     if let Some(p) = p {
@@ -496,7 +575,7 @@ impl Transformer {
                             |arg| {
                                 Workspace::get_local().with(|ws| {
                                     let mut a = Atom::new();
-                                    Self::execute_chain(arg, t, ws, &mut a).unwrap();
+                                    Self::execute_chain(arg, t, ws, state, &mut a).unwrap();
                                     a
                                 })
                             },
@@ -506,7 +585,7 @@ impl Transformer {
                         *out = cur_input.map_terms_single_core(|arg| {
                             Workspace::get_local().with(|ws| {
                                 let mut a = Atom::new();
-                                Self::execute_chain(arg, t, ws, &mut a).unwrap();
+                                Self::execute_chain(arg, t, ws, state, &mut a).unwrap();
                                 a
                             })
                         })
@@ -520,7 +599,7 @@ impl Transformer {
 
                             let mut a = workspace.new_atom();
                             for arg in f {
-                                Self::execute_chain(arg, t, workspace, &mut a)?;
+                                Self::execute_chain(arg, t, workspace, state, &mut a)?;
                                 ff.add_arg(a.as_view());
                             }
 
@@ -529,7 +608,7 @@ impl Transformer {
                         }
                     }
 
-                    Self::execute_chain(cur_input, t, workspace, out)?;
+                    Self::execute_chain(cur_input, t, workspace, state, out)?;
                 }
                 Transformer::Expand(s, via_poly) => {
                     if *via_poly {
@@ -556,18 +635,22 @@ impl Transformer {
                             None
                         } else {
                             let key_map = key_map.clone();
+                            let state = state.clone();
                             Some(Box::new(move |i, o| {
-                                Workspace::get_local()
-                                    .with(|ws| Self::execute_chain(i, &key_map, ws, o).unwrap());
+                                Workspace::get_local().with(|ws| {
+                                    Self::execute_chain(i, &key_map, ws, &state, o).unwrap()
+                                });
                             }))
                         },
                         if coeff_map.is_empty() {
                             None
                         } else {
                             let coeff_map = coeff_map.clone();
+                            let state = state.clone();
                             Some(Box::new(move |i, o| {
-                                Workspace::get_local()
-                                    .with(|ws| Self::execute_chain(i, &coeff_map, ws, o).unwrap());
+                                Workspace::get_local().with(|ws| {
+                                    Self::execute_chain(i, &coeff_map, ws, &state, o).unwrap()
+                                });
                             }))
                         },
                         out,
@@ -579,18 +662,22 @@ impl Transformer {
                             None
                         } else {
                             let key_map = key_map.clone();
+                            let state = state.clone();
                             Some(Box::new(move |i, o| {
-                                Workspace::get_local()
-                                    .with(|ws| Self::execute_chain(i, &key_map, ws, o).unwrap());
+                                Workspace::get_local().with(|ws| {
+                                    Self::execute_chain(i, &key_map, ws, &state, o).unwrap()
+                                });
                             }))
                         },
                         if coeff_map.is_empty() {
                             None
                         } else {
                             let coeff_map = coeff_map.clone();
+                            let state = state.clone();
                             Some(Box::new(move |i, o| {
-                                Workspace::get_local()
-                                    .with(|ws| Self::execute_chain(i, &coeff_map, ws, o).unwrap());
+                                Workspace::get_local().with(|ws| {
+                                    Self::execute_chain(i, &coeff_map, ws, &state, o).unwrap()
+                                });
                             }))
                         },
                     );
@@ -624,7 +711,7 @@ impl Transformer {
                     );
                 }
                 Transformer::ReplaceAllMultiple(replacements) => {
-                    cur_input.replace_multiple_into(&replacements, out);
+                    cur_input.replace_multiple_into(replacements, out);
                 }
                 Transformer::Product => {
                     if let AtomView::Fun(f) = cur_input {
@@ -870,7 +957,7 @@ impl Transformer {
                     std::mem::swap(out, &mut tmp);
                 }
                 Transformer::Repeat(r) => loop {
-                    Self::execute_chain(tmp.as_view(), r, workspace, out)?;
+                    Self::execute_chain(tmp.as_view(), r, workspace, state, out)?;
 
                     if tmp.as_view() == out.as_view() {
                         break;
@@ -883,10 +970,20 @@ impl Transformer {
                     std::mem::swap(out, &mut tmp);
                 }
                 Transformer::Stats(o, r) => {
+                    let start_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(0));
+
                     let t = Instant::now();
-                    Self::execute_chain(cur_input, r, workspace, out)?;
+                    Self::execute_chain(cur_input, r, workspace, state, out)?;
                     let dt = t.elapsed();
-                    o.print(cur_input, out.as_view(), dt);
+
+                    if let Some(stats_export) = &state.stats_export {
+                        let mut stats_lock = stats_export.lock().unwrap();
+                        o.print_json(cur_input, out.as_view(), start_time, dt, &mut *stats_lock);
+                    } else {
+                        o.print(cur_input, out.as_view(), start_time, dt);
+                    }
                 }
                 Transformer::FromNumber => {
                     if let AtomView::Num(n) = cur_input {
@@ -917,7 +1014,7 @@ mod test {
         printer::PrintOptions,
         state::Workspace,
         symbol,
-        transformer::StatsOptions,
+        transformer::{StatsOptions, TransformerState},
     };
 
     use super::Transformer;
@@ -935,6 +1032,7 @@ mod test {
                     Transformer::Derivative(symbol!("v1")),
                 ],
                 ws,
+                &TransformerState::default(),
                 &mut out,
             )
             .unwrap()
@@ -954,6 +1052,7 @@ mod test {
                 p.as_view(),
                 &[Transformer::Split, Transformer::ArgCount(true)],
                 ws,
+                &TransformerState::default(),
                 &mut out,
             )
             .unwrap()
@@ -976,6 +1075,7 @@ mod test {
                     Transformer::Series(symbol!("v1"), Atom::new_num(1), 3.into(), true),
                 ],
                 ws,
+                &TransformerState::default(),
                 &mut out,
             )
             .unwrap()
@@ -1002,7 +1102,7 @@ mod test {
                     ),
                     Transformer::Sort,
                     Transformer::Deduplicate,
-                    Transformer::Map(Box::new(|x, out| {
+                    Transformer::Map(Box::new(|x, _state, out| {
                         let mut f = FunctionBuilder::new(symbol!("f1"));
                         f = f.add_arg(x);
                         *out = f.finish();
@@ -1010,6 +1110,7 @@ mod test {
                     })),
                 ],
                 ws,
+                &TransformerState::default(),
                 &mut out,
             )
             .unwrap()
@@ -1050,6 +1151,7 @@ mod test {
                     ])],
                 )])],
                 ws,
+                &TransformerState::default(),
                 &mut out,
             )
             .unwrap()

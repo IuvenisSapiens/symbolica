@@ -186,21 +186,19 @@ impl DefaultNamespace<'_> {
             s.file = self.file.clone();
             s.line = self.line;
             s
+        } else if State::BUILTIN_SYMBOL_NAMES.contains(&s) {
+            NamespacedSymbol {
+                symbol: format!("symbolica::{}", s).into(),
+                namespace: "symbolica".into(),
+                file: "".into(),
+                line: 0,
+            }
         } else {
-            if State::BUILTIN_SYMBOL_NAMES.contains(&s) {
-                NamespacedSymbol {
-                    symbol: format!("symbolica::{}", s).into(),
-                    namespace: "symbolica".into(),
-                    file: "".into(),
-                    line: 0,
-                }
-            } else {
-                NamespacedSymbol {
-                    symbol: format!("{}::{}", self.namespace, s).into(),
-                    namespace: self.namespace.clone(),
-                    file: self.file.clone(),
-                    line: self.line,
-                }
+            NamespacedSymbol {
+                symbol: format!("{}::{}", self.namespace, s).into(),
+                namespace: self.namespace.clone(),
+                file: self.file.clone(),
+                line: self.line,
             }
         }
     }
@@ -208,41 +206,38 @@ impl DefaultNamespace<'_> {
 
 #[macro_export]
 macro_rules! wrap_input {
-    ($e:expr) => {{
-        let ns = $crate::namespace!();
+    ($e:expr) => {
         $crate::atom::DefaultNamespace {
             data: $e.as_ref(),
-            namespace: ns.into(),
+            namespace: $crate::namespace!().into(),
             file: file!().into(),
             line: line!() as usize,
         }
-    }};
+    };
 }
 
 #[macro_export]
 macro_rules! with_default_namespace {
-    ($e:expr, $namespace: expr) => {{
+    ($e:expr, $namespace: expr) => {
         $crate::atom::DefaultNamespace {
             data: $e.as_ref(),
             namespace: $namespace.into(),
             file: file!().into(),
             line: line!() as usize,
         }
-    }};
+    };
 }
 
 /// Get the current namespace, based on the location of the macro invocation.
 #[macro_export]
 macro_rules! namespace {
-    () => {{
-        env!("CARGO_CRATE_NAME")
-    }};
+    () => {{ env!("CARGO_CRATE_NAME") }};
 }
 
 /// Hide the current namespace when printing an atom.
 #[macro_export]
 macro_rules! hide_namespace {
-    ($e:expr) => {{
+    ($e:expr) => {
         $crate::atom::AtomCore::printer(
             &$e,
             $crate::printer::PrintOptions {
@@ -250,7 +245,7 @@ macro_rules! hide_namespace {
                 ..$crate::printer::PrintOptions::new()
             },
         )
-    }};
+    };
 }
 
 /// A function that is called after normalization of the arguments.
@@ -401,7 +396,7 @@ impl SymbolBuilder {
     /// use symbolica::{atom::Symbol, wrap_symbol};
     ///
     /// let f = Symbol::new(wrap_symbol!("mu")).with_print_function(|view, opt| {
-    ///     if !opt.latex {
+    ///     if !opt.mode.is_latex() {
     ///       None
     ///     } else {
     ///        Some("\\mu".to_string())
@@ -624,7 +619,14 @@ impl Symbol {
         let data = State::get_symbol_data(*self);
         let (namespace, name) = (&data.namespace, &data.name[data.namespace.len() + 2..]);
 
-        if opts.latex {
+        if let Some(custom_print) = &data.custom_print {
+            if let Some(s) = custom_print(InlineVar::new(*self).as_view(), opts) {
+                f.write_str(&s)?;
+                return Ok(());
+            }
+        }
+
+        if opts.mode.is_latex() {
             match *self {
                 Atom::E => f.write_char('e'),
                 Atom::PI => f.write_str("\\pi"),
@@ -760,6 +762,13 @@ impl From<Symbol> for Atom {
     }
 }
 
+impl From<AtomView<'_>> for Atom {
+    /// Convert an `AtomView` to an atom. This will allocate memory.
+    fn from(view: AtomView) -> Atom {
+        view.to_owned()
+    }
+}
+
 impl<'a> From<NumView<'a>> for AtomView<'a> {
     fn from(n: NumView<'a>) -> AtomView<'a> {
         AtomView::Num(n)
@@ -797,7 +806,7 @@ pub enum AtomOrView<'a> {
     View(AtomView<'a>),
 }
 
-impl<'a> std::fmt::Display for AtomOrView<'a> {
+impl std::fmt::Display for AtomOrView<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AtomOrView::Atom(a) => a.fmt(f),
@@ -806,7 +815,7 @@ impl<'a> std::fmt::Display for AtomOrView<'a> {
     }
 }
 
-impl<'a> PartialEq for AtomOrView<'a> {
+impl PartialEq for AtomOrView<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -819,13 +828,13 @@ impl<'a> PartialEq for AtomOrView<'a> {
 
 impl Eq for AtomOrView<'_> {}
 
-impl<'a> PartialOrd for AtomOrView<'a> {
+impl PartialOrd for AtomOrView<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for AtomOrView<'a> {
+impl Ord for AtomOrView<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (AtomOrView::Atom(a1), AtomOrView::Atom(a2)) => a1.as_view().cmp(&a2.as_view()),
@@ -901,7 +910,7 @@ impl<'a> AtomOrView<'a> {
     }
 }
 
-impl<'a> AtomView<'a> {
+impl AtomView<'_> {
     pub fn to_owned(&self) -> Atom {
         let mut a = Atom::default();
         a.set_from_view(self);
@@ -913,7 +922,7 @@ impl<'a> AtomView<'a> {
     }
 
     /// Print the view using the portable [`PrintOptions::file()`] options.
-    pub fn to_string(&self) -> String {
+    pub fn to_plain_string(&self) -> String {
         format!("{}", self.printer(PrintOptions::file()))
     }
 
@@ -928,10 +937,14 @@ impl<'a> AtomView<'a> {
 
     /// Print statistics about the operation `op`, such as its duration and term growth.
     pub fn with_stats<F: Fn(AtomView) -> Atom>(&self, op: F, o: &StatsOptions) -> Atom {
+        let start_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::from_secs(0));
+
         let t = std::time::Instant::now();
         let out = op(*self);
         let dt = t.elapsed();
-        o.print(*self, out.as_view(), dt);
+        o.print(*self, out.as_view(), start_time, dt);
         out
     }
 
@@ -1283,7 +1296,7 @@ impl Atom {
     /// assert!(x != x_2);
     /// ```
     pub fn parse(input: DefaultNamespace) -> Result<Atom, String> {
-        Workspace::get_local().with(|ws| Token::parse(&input.data)?.to_atom(&input, ws))
+        Workspace::get_local().with(|ws| Token::parse(input.data)?.to_atom(&input, ws))
     }
 
     #[inline]
@@ -1316,7 +1329,7 @@ impl Atom {
     }
 
     /// Print the atom using the portable [`PrintOptions::file()`] options.
-    pub fn to_string(&self) -> String {
+    pub fn to_plain_string(&self) -> String {
         format!("{}", self.printer(PrintOptions::file()))
     }
 
@@ -1540,13 +1553,13 @@ impl FunctionArgument for &mut Atom {
     }
 }
 
-impl<'a> FunctionArgument for AtomView<'a> {
+impl FunctionArgument for AtomView<'_> {
     fn add_arg_to_function_builder(&self, f: FunctionBuilder) -> FunctionBuilder {
         f.add_arg(*self)
     }
 }
 
-impl<'a> FunctionArgument for &AtomView<'a> {
+impl FunctionArgument for &AtomView<'_> {
     fn add_arg_to_function_builder(&self, f: FunctionBuilder) -> FunctionBuilder {
         f.add_arg(**self)
     }
@@ -1559,9 +1572,9 @@ impl FunctionArgument for Symbol {
     }
 }
 
-impl<'a, T: Into<Coefficient> + Clone> FunctionArgument for T {
+impl<T: Into<Coefficient> + Clone> FunctionArgument for T {
     fn add_arg_to_function_builder(&self, f: FunctionBuilder) -> FunctionBuilder {
-        f.add_arg(&Atom::new_num(self.clone()))
+        f.add_arg(Atom::new_num(self.clone()))
     }
 }
 
@@ -1648,7 +1661,7 @@ macro_rules! function {
 /// use symbolica::atom::{AtomCore, AtomView};
 /// use symbolica::printer::PrintState;
 /// let _ = symbol!("mu";;;|a, opt| {
-///     if !opt.latex {
+///     if !opt.mode.is_latex() {
 ///         return None; // use default printer
 ///     }
 ///
@@ -1740,12 +1753,10 @@ macro_rules! symbol {
 /// ```
 #[macro_export]
 macro_rules! parse {
-    ($s: expr) => {{
+    ($s: expr) => {
         $crate::atom::Atom::parse($crate::wrap_input!($s))
-    }};
-    ($s: expr, $ns: expr) => {{
-        $crate::atom::Atom::parse($crate::with_default_namespace!($s, $ns))
-    }};
+    };
+    ($s: expr, $ns: expr) => {{ $crate::atom::Atom::parse($crate::with_default_namespace!($s, $ns)) }};
 }
 
 /// Parse an atom from literal code. Use [parse!](crate::parse) to parse from a string.
@@ -1766,12 +1777,8 @@ macro_rules! parse {
 /// ```
 #[macro_export]
 macro_rules! parse_lit {
-    ($s: expr) => {{
-        $crate::atom::Atom::parse($crate::wrap_input!(stringify!($s)))
-    }};
-    ($s: expr, $ns: expr) => {{
-        $crate::atom::Atom::parse($crate::with_default_namespace!(stringify!($s), $ns))
-    }};
+    ($s: expr) => {{ $crate::atom::Atom::parse($crate::wrap_input!(stringify!($s))) }};
+    ($s: expr, $ns: expr) => {{ $crate::atom::Atom::parse($crate::with_default_namespace!(stringify!($s), $ns)) }};
 }
 
 impl Atom {
@@ -1813,7 +1820,7 @@ impl Atom {
     }
 
     /// Add the atoms in `args`.
-    pub fn add_many<'a, T: AtomCore + Copy>(args: &[T]) -> Atom {
+    pub fn add_many<T: AtomCore + Copy>(args: &[T]) -> Atom {
         let mut out = Atom::new();
         Workspace::get_local().with(|ws| {
             let mut t = ws.new_atom();
@@ -1828,7 +1835,7 @@ impl Atom {
     }
 
     /// Multiply the atoms in `args`.
-    pub fn mul_many<'a, T: AtomCore + Copy>(args: &[T]) -> Atom {
+    pub fn mul_many<T: AtomCore + Copy>(args: &[T]) -> Atom {
         let mut out = Atom::new();
         Workspace::get_local().with(|ws| {
             let mut t = ws.new_atom();
@@ -2013,7 +2020,7 @@ impl std::ops::Div<&Atom> for Atom {
     }
 }
 
-impl<'a> std::ops::Add<AtomView<'a>> for Atom {
+impl std::ops::Add<AtomView<'_>> for Atom {
     type Output = Atom;
 
     fn add(mut self, rhs: AtomView) -> Atom {

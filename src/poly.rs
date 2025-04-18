@@ -18,7 +18,7 @@ use std::ops::{Add as OpAdd, AddAssign, DerefMut, Div, Mul as OpMul, Neg, Rem, S
 use std::sync::Arc;
 
 use ahash::HashMap;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use smartstring::{LazyCompact, SmartString};
 
 use crate::atom::{Atom, AtomCore, AtomView, Symbol};
@@ -27,7 +27,7 @@ use crate::domains::atom::AtomField;
 use crate::domains::factorized_rational_polynomial::{
     FactorizedRationalPolynomial, FromNumeratorAndFactorizedDenominator,
 };
-use crate::domains::integer::{gcd_signed, gcd_unsigned, Integer};
+use crate::domains::integer::{Integer, gcd_signed, gcd_unsigned};
 use crate::domains::rational_polynomial::{FromNumeratorAndDenominator, RationalPolynomial};
 use crate::domains::{EuclideanDomain, Ring, SelfRing};
 use crate::parser::{Operator, Token};
@@ -691,14 +691,6 @@ impl Variable {
         }
     }
 
-    pub fn to_string(&self) -> String {
-        match self {
-            Variable::Symbol(v) => v.get_stripped_name().to_string(),
-            Variable::Temporary(t) => format!("_TMP_{}", *t),
-            Variable::Function(_, a) | Variable::Other(a) => format!("{}", a),
-        }
-    }
-
     fn format_string(&self, opts: &PrintOptions, state: PrintState) -> String {
         match self {
             Variable::Symbol(v) => v.get_stripped_name().to_string(),
@@ -746,7 +738,7 @@ impl Variable {
     }
 }
 
-impl<'a> AtomView<'a> {
+impl AtomView<'_> {
     /// Convert an expanded expression to a polynomial.
     fn to_polynomial_expanded<R: Ring + ConvertToRing, E: Exponent>(
         &self,

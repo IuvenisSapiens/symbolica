@@ -7,25 +7,25 @@ use std::{
 };
 
 use ahash::{AHasher, HashMap, HashSet, HashSetExt};
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 
 use crate::{
     atom::{Atom, AtomView, KeyLookup},
-    domains::{float::Real, Ring},
+    domains::{Ring, float::Real},
     evaluate::EvaluationFn,
 };
 use crate::{
     atom::{AtomCore, Symbol},
     coefficient::CoefficientView,
     domains::{
-        float::NumericalFloatLike,
-        rational::{Rational, RationalField, Q},
         EuclideanDomain,
+        float::NumericalFloatLike,
+        rational::{Q, Rational, RationalField},
     },
     state::Workspace,
 };
 
-use super::{polynomial::MultivariatePolynomial, PositiveExponent};
+use super::{PositiveExponent, polynomial::MultivariatePolynomial};
 
 /// A borrowed version of a Horner node, suitable as a key in a
 /// hashmap. It uses precomputed hashes for the complete node
@@ -43,7 +43,7 @@ where
     pub hash: (u64, u64, u64),
 }
 
-impl<'a, R: Ring> PartialEq for BorrowedHornerNode<'a, R>
+impl<R: Ring> PartialEq for BorrowedHornerNode<'_, R>
 where
     R::Element: Hash + Eq,
 {
@@ -56,9 +56,9 @@ where
     }
 }
 
-impl<'a, R: Ring> Eq for BorrowedHornerNode<'a, R> where R::Element: Hash + Eq {}
+impl<R: Ring> Eq for BorrowedHornerNode<'_, R> where R::Element: Hash + Eq {}
 
-impl<'a> Hash for BorrowedHornerNode<'a, RationalField> {
+impl Hash for BorrowedHornerNode<'_, RationalField> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let hash = if self.content.is_some() {
             if self.rest.is_some() {
@@ -486,20 +486,12 @@ impl<E: PositiveExponent> MultivariatePolynomial<RationalField, E> {
 
         let children = (
             if let HornerScheme::Leaf(_, r) = &content {
-                if r.is_one() {
-                    None
-                } else {
-                    Some(content)
-                }
+                if r.is_one() { None } else { Some(content) }
             } else {
                 Some(content)
             },
             if let HornerScheme::Leaf(_, r) = &rest {
-                if r.is_zero() {
-                    None
-                } else {
-                    Some(rest)
-                }
+                if r.is_zero() { None } else { Some(rest) }
             } else {
                 Some(rest)
             },
@@ -598,14 +590,14 @@ impl HornerScheme<RationalField> {
         }
 
         let mut best_scheme = scheme.clone();
-        let mut rng = thread_rng();
+        let mut rng = rng();
 
         let mut new_best = Vec::with_capacity(polys.len());
 
         // TODO: for few variables, test all permutations
         for i in 0..num_tries {
-            let a = rng.gen_range(0..polys[0].nvars());
-            let b = rng.gen_range(0..polys[0].nvars());
+            let a = rng.random_range(0..polys[0].nvars());
+            let b = rng.random_range(0..polys[0].nvars());
             scheme.swap(a, b);
 
             let mut new_oc = 0;
@@ -1178,7 +1170,7 @@ impl InstructionList {
                                 a.push(idx1);
                             }
 
-                            a.extend(std::iter::repeat(insert_index).take(pairs));
+                            a.extend(std::iter::repeat_n(insert_index, pairs));
                             a.sort();
                         }
                     } else {
@@ -1200,14 +1192,14 @@ impl InstructionList {
 
                             // add back removed indices in cases such as idx1*idx2*idx2
                             if idx1_count > pair_count {
-                                a.extend(std::iter::repeat(idx1).take(idx1_count - pair_count));
+                                a.extend(std::iter::repeat_n(idx1, idx1_count - pair_count));
                             }
                             if idx2_count > pair_count {
-                                a.extend(std::iter::repeat(idx2).take(idx2_count - pair_count));
+                                a.extend(std::iter::repeat_n(idx2, idx2_count - pair_count));
                             }
 
                             // TODO: Z2=Z1 can be detected here with a.is_empty() && pair_count == 1
-                            a.extend(std::iter::repeat(insert_index).take(pair_count));
+                            a.extend(std::iter::repeat_n(insert_index, pair_count));
                             a.sort();
                         }
                     }
@@ -1637,7 +1629,7 @@ pub struct InstructionSetPrinter<'a> {
     pub name: String, // function name
 }
 
-impl<'a> std::fmt::Display for InstructionSetPrinter<'a> {
+impl std::fmt::Display for InstructionSetPrinter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let has_only_one_return_value = self
             .instr
@@ -1673,7 +1665,7 @@ impl<'a> std::fmt::Display for InstructionSetPrinter<'a> {
                         if !seen_arrays.contains(x) {
                             seen_arrays.push(*x);
 
-                            Some(format!("T* {}", super::Variable::Symbol(*x).to_string()))
+                            Some(format!("T* {}", super::Variable::Symbol(*x)))
                         } else {
                             None
                         }
@@ -1681,10 +1673,10 @@ impl<'a> std::fmt::Display for InstructionSetPrinter<'a> {
                         if [Atom::E, Atom::I, Atom::PI].contains(i) {
                             None
                         } else {
-                            Some(format!("T {}", x.to_string()))
+                            Some(format!("T {}", x))
                         }
                     } else {
-                        Some(format!("T {}", x.to_string()))
+                        Some(format!("T {}", x))
                     })
                     .collect::<Vec<_>>()
                     .join(","),
@@ -1926,10 +1918,10 @@ auto 𝑖 = 1i;\n",
             "void evaluate({}, T* {}_res) {{\n",
             self.input
                 .iter()
-                .map(|x| format!("T* {}", x.to_string()))
+                .map(|x| format!("T* {}", x))
                 .collect::<Vec<_>>()
                 .join(", "),
-            last.to_string()
+            last
         ))?;
 
         for (id, out_len, _, args) in &self.operations {

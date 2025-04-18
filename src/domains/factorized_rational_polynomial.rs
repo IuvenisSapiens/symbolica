@@ -11,17 +11,17 @@ use std::{
 
 use crate::{
     poly::{
-        factor::Factorize, gcd::PolynomialGCD, polynomial::MultivariatePolynomial,
-        PositiveExponent, Variable,
+        PositiveExponent, Variable, factor::Factorize, gcd::PolynomialGCD,
+        polynomial::MultivariatePolynomial,
     },
     printer::{PrintOptions, PrintState},
 };
 
 use super::{
+    EuclideanDomain, Field, InternalOrdering, Ring, SelfRing,
     finite_field::{FiniteField, FiniteFieldCore, FiniteFieldWorkspace, ToFiniteField},
     integer::{Integer, IntegerRing, Z},
     rational::RationalField,
-    EuclideanDomain, Field, InternalOrdering, Ring, SelfRing,
 };
 
 /// A rational polynomial field with a factorized denominator.
@@ -276,7 +276,7 @@ impl<R: Ring, E: PositiveExponent> SelfRing for FactorizedRationalPolynomial<R, 
             state.in_exp = false;
         }
 
-        if opts.latex {
+        if opts.mode.is_latex() {
             if has_numer_coeff {
                 state.suppress_one = true;
                 state.in_product = true;
@@ -860,11 +860,7 @@ where
             None
         } else {
             let (q, r) = self.quot_rem(a, b);
-            if r.is_zero() {
-                Some(q)
-            } else {
-                None
-            }
+            if r.is_zero() { Some(q) } else { None }
         }
     }
 
@@ -926,8 +922,8 @@ where
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E> + PolynomialGCD<E>, E: PositiveExponent>
-    Add<&'a FactorizedRationalPolynomial<R, E>> for &'b FactorizedRationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E> + PolynomialGCD<E>, E: PositiveExponent>
+    Add<&'a FactorizedRationalPolynomial<R, E>> for &FactorizedRationalPolynomial<R, E>
 where
     FactorizedRationalPolynomial<R, E>: FromNumeratorAndFactorizedDenominator<R, R, E>,
 {
@@ -1045,8 +1041,8 @@ where
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
-    Sub<&'a FactorizedRationalPolynomial<R, E>> for &'b FactorizedRationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
+    Sub<&'a FactorizedRationalPolynomial<R, E>> for &FactorizedRationalPolynomial<R, E>
 where
     FactorizedRationalPolynomial<R, E>: FromNumeratorAndFactorizedDenominator<R, R, E>,
 {
@@ -1073,8 +1069,8 @@ where
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
-    Mul<&'a FactorizedRationalPolynomial<R, E>> for &'b FactorizedRationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
+    Mul<&'a FactorizedRationalPolynomial<R, E>> for &FactorizedRationalPolynomial<R, E>
 {
     type Output = FactorizedRationalPolynomial<R, E>;
 
@@ -1166,8 +1162,8 @@ impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
     }
 }
 
-impl<'a, 'b, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
-    Div<&'a FactorizedRationalPolynomial<R, E>> for &'b FactorizedRationalPolynomial<R, E>
+impl<'a, R: EuclideanDomain + PolynomialGCD<E>, E: PositiveExponent>
+    Div<&'a FactorizedRationalPolynomial<R, E>> for &FactorizedRationalPolynomial<R, E>
 where
     FactorizedRationalPolynomial<R, E>: FromNumeratorAndFactorizedDenominator<R, R, E>,
     MultivariatePolynomial<R, E>: Factorize,
