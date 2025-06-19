@@ -12,7 +12,7 @@ use std::{
 };
 
 use ahash::{AHasher, HashMap};
-use rand::{Rng, rng};
+use rand::Rng;
 
 use self_cell::self_cell;
 
@@ -22,13 +22,16 @@ use crate::{
     coefficient::CoefficientView,
     combinatorics::unique_permutations,
     domains::{
+        InternalOrdering,
         float::{
-            Complex, ErrorPropagatingFloat, NumericalFloatLike, Real, RealNumberLike, SingleFloat,
+            Complex, ConstructibleFloat, ErrorPropagatingFloat, F64, Float, NumericalFloatLike,
+            Real, RealNumberLike, SingleFloat,
         },
         integer::Integer,
         rational::Rational,
     },
     id::ConditionResult,
+    numerical_integration::MonteCarloRng,
     state::State,
 };
 
@@ -62,7 +65,7 @@ impl<A, T> EvaluationFn<A, T> {
     trait_decode(trait = crate::state::HasStateMap)
 )]
 #[derive(Clone, Debug)]
-pub struct FunctionMap<T = Rational> {
+pub struct FunctionMap<T = Complex<Rational>> {
     map: HashMap<Atom, ConstOrExpr<T>>,
     tagged_fn_map: HashMap<(Symbol, Vec<Atom>), ConstOrExpr<T>>,
     tag: HashMap<Symbol, usize>,
@@ -204,7 +207,7 @@ pub struct OptimizationSettings {
     pub horner_iterations: usize,
     pub n_cores: usize,
     pub cpe_iterations: Option<usize>,
-    pub hot_start: Option<Vec<Expression<Rational>>>,
+    pub hot_start: Option<Vec<Expression<Complex<Rational>>>>,
     pub verbose: bool,
 }
 
@@ -282,7 +285,7 @@ impl BuiltinSymbol {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expression<T> {
     Const(T),
     Parameter(usize),
@@ -294,6 +297,51 @@ pub enum Expression<T> {
     ReadArg(usize), // read nth function argument
     BuiltinFun(BuiltinSymbol, Box<Expression<T>>),
     SubExpression(usize),
+}
+
+impl<T: InternalOrdering + Eq> PartialOrd for Expression<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: InternalOrdering + Eq> Ord for Expression<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Expression::Const(a), Expression::Const(b)) => a.internal_cmp(b),
+            (Expression::Parameter(a), Expression::Parameter(b)) => a.cmp(b),
+            (Expression::Eval(a, arg1), Expression::Eval(b, arg2)) => {
+                a.cmp(b).then_with(|| arg1.cmp(arg2))
+            }
+            (Expression::Add(a), Expression::Add(b)) => a.cmp(b),
+            (Expression::Mul(a), Expression::Mul(b)) => a.cmp(b),
+            (Expression::Pow(a), Expression::Pow(b)) => a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)),
+            (Expression::Powf(a), Expression::Powf(b)) => a.cmp(b),
+            (Expression::ReadArg(a), Expression::ReadArg(b)) => a.cmp(b),
+            (Expression::BuiltinFun(a, arg1), Expression::BuiltinFun(b, arg2)) => {
+                a.cmp(b).then_with(|| arg1.cmp(arg2))
+            }
+            (Expression::SubExpression(a), Expression::SubExpression(b)) => a.cmp(b),
+            (Expression::Const(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::Const(_)) => std::cmp::Ordering::Greater,
+            (Expression::Parameter(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::Parameter(_)) => std::cmp::Ordering::Greater,
+            (Expression::Eval(_, _), _) => std::cmp::Ordering::Less,
+            (_, Expression::Eval(_, _)) => std::cmp::Ordering::Greater,
+            (Expression::Add(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::Add(_)) => std::cmp::Ordering::Greater,
+            (Expression::Mul(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::Mul(_)) => std::cmp::Ordering::Greater,
+            (Expression::Pow(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::Pow(_)) => std::cmp::Ordering::Greater,
+            (Expression::Powf(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::Powf(_)) => std::cmp::Ordering::Greater,
+            (Expression::ReadArg(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::ReadArg(_)) => std::cmp::Ordering::Greater,
+            (Expression::BuiltinFun(_, _), _) => std::cmp::Ordering::Less,
+            (_, Expression::BuiltinFun(_, _)) => std::cmp::Ordering::Greater,
+        }
+    }
 }
 
 type ExpressionHash = u64;
@@ -359,16 +407,16 @@ impl<T: Clone> HashedExpression<T> {
     }
 }
 
-impl<T: Ord> PartialOrd for HashedExpression<T> {
+impl<T: Eq + InternalOrdering> PartialOrd for HashedExpression<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T: Ord> Ord for HashedExpression<T> {
+impl<T: Eq + InternalOrdering> Ord for HashedExpression<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (HashedExpression::Const(_, a), HashedExpression::Const(_, b)) => a.cmp(b),
+            (HashedExpression::Const(_, a), HashedExpression::Const(_, b)) => a.internal_cmp(b),
             (HashedExpression::Parameter(_, a), HashedExpression::Parameter(_, b)) => a.cmp(b),
             (HashedExpression::Eval(_, a, b), HashedExpression::Eval(_, c, d)) => {
                 a.cmp(c).then_with(|| b.cmp(d))
@@ -412,7 +460,7 @@ impl<T: Eq + Hash> Hash for HashedExpression<T> {
     }
 }
 
-impl<T: Eq + Hash + Clone + Ord> HashedExpression<T> {
+impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
     fn find_subexpression<'a>(
         &'a self,
         subexp: &mut HashMap<&'a HashedExpression<T>, usize>,
@@ -682,7 +730,7 @@ impl<T: std::hash::Hash + Clone> Expression<T> {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 
 pub struct ExpressionEvaluator<T> {
     stack: Vec<T>,
@@ -690,6 +738,12 @@ pub struct ExpressionEvaluator<T> {
     reserved_indices: usize,
     instructions: Vec<Instr>,
     result_indices: Vec<usize>,
+}
+
+impl<T: SingleFloat> ExpressionEvaluator<Complex<T>> {
+    pub fn is_real(&self) -> bool {
+        self.stack.iter().all(|x| x.is_real())
+    }
 }
 
 impl<T: Real> ExpressionEvaluator<T> {
@@ -798,7 +852,7 @@ impl<T: Default> ExpressionEvaluator<T> {
         });
 
         // sort in other direction since we pop
-        to_remove.sort_by_key(|x| x.1.len());
+        to_remove.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.cmp(b)));
 
         let total_remove = to_remove.len();
 
@@ -1253,7 +1307,73 @@ impl<T> ExpressionEvaluator<T> {
     }
 }
 
-impl<T: std::fmt::Display> ExpressionEvaluator<T> {
+/// A number that can be exported to C++ code.
+pub trait ExportNumber {
+    /// Export the number as a string.
+    fn export(&self) -> String;
+    /// Export the number wrapped in a C++ type `T`.
+    fn export_wrapped(&self) -> String {
+        format!("T({})", self.export())
+    }
+    /// Check if the number is real.
+    fn is_real(&self) -> bool;
+}
+
+impl ExportNumber for f64 {
+    fn export(&self) -> String {
+        self.to_string()
+    }
+
+    fn is_real(&self) -> bool {
+        true
+    }
+}
+
+impl ExportNumber for F64 {
+    fn export(&self) -> String {
+        self.to_string()
+    }
+
+    fn is_real(&self) -> bool {
+        true
+    }
+}
+
+impl ExportNumber for Float {
+    fn export(&self) -> String {
+        self.to_string()
+    }
+
+    fn is_real(&self) -> bool {
+        true
+    }
+}
+
+impl ExportNumber for Rational {
+    fn export(&self) -> String {
+        self.to_string()
+    }
+
+    fn is_real(&self) -> bool {
+        true
+    }
+}
+
+impl<T: ExportNumber + SingleFloat> ExportNumber for Complex<T> {
+    fn export(&self) -> String {
+        if self.im.is_zero() {
+            self.re.export()
+        } else {
+            format!("{}, {}", self.re.export(), self.im.export())
+        }
+    }
+
+    fn is_real(&self) -> bool {
+        self.im.is_zero()
+    }
+}
+
+impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
     /// Create a C++ code representation of the evaluation tree.
     /// With `inline_asm` set to any value other than `None`,
     /// high-performance inline ASM code will be generated for most
@@ -1301,34 +1421,34 @@ impl<T: std::fmt::Display> ExpressionEvaluator<T> {
             function_name
         );
 
-        res += &format!(
-            "\tT {};\n",
-            (0..self.stack.len())
-                .map(|x| format!("Z{}", x))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
         for i in 0..self.param_count {
-            res += &format!("\tZ{} = params[{}];\n", i, i);
+            res += &format!("\tZ[{}] = params[{}];\n", i, i);
         }
 
         for i in self.param_count..self.reserved_indices {
-            res += &format!("\tZ{} = {};\n", i, self.stack[i]);
+            res += &format!("\tZ[{}] = {};\n", i, self.stack[i].export_wrapped());
         }
 
         Self::export_cpp_impl(&self.instructions, &mut res);
 
         for (i, r) in &mut self.result_indices.iter().enumerate() {
-            res += &format!("\tout[{}] = Z{};\n", i, r);
+            res += &format!("\tout[{}] = Z[{}];\n", i, r);
         }
 
         res += "\treturn;\n}\n";
 
-        res += &format!(
-            "\nextern \"C\" {{\n\tvoid {0}_double(double *params, double *buffer, double *out) {{\n\t\t{0}(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n",
-            function_name
-        );
+        if self.stack.iter().all(|x| x.is_real()) {
+            res += &format!(
+                "\nextern \"C\" {{\n\tvoid {0}_double(double *params, double *buffer, double *out) {{\n\t\t{0}(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n",
+                function_name
+            );
+        } else {
+            res += &format!(
+                "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n\tstd::cout << \"Cannot evaluate complex function with doubles\" << std::endl;\n\treturn; \n}}",
+                function_name
+            );
+        }
+
         res += &format!(
             "\nextern \"C\" {{\n\tvoid {0}_complex(std::complex<double> *params, std::complex<double> *buffer,  std::complex<double> *out) {{\n\t\t{0}(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n",
             function_name
@@ -1343,50 +1463,54 @@ impl<T: std::fmt::Display> ExpressionEvaluator<T> {
                 Instr::Add(o, a) => {
                     let args = a
                         .iter()
-                        .map(|x| format!("Z{}", x))
+                        .map(|x| format!("Z[{}]", x))
                         .collect::<Vec<_>>()
                         .join("+");
 
-                    *out += format!("\tZ{} = {};\n", o, args).as_str();
+                    *out += format!("\tZ[{}] = {};\n", o, args).as_str();
                 }
                 Instr::Mul(o, a) => {
                     let args = a
                         .iter()
-                        .map(|x| format!("Z{}", x))
+                        .map(|x| format!("Z[{}]", x))
                         .collect::<Vec<_>>()
                         .join("*");
 
-                    *out += format!("\tZ{} = {};\n", o, args).as_str();
+                    *out += format!("\tZ[{}] = {};\n", o, args).as_str();
                 }
                 Instr::Pow(o, b, e) => {
-                    let base = format!("Z{}", b);
-                    *out += format!("\tZ{} = pow({}, {});\n", o, base, e).as_str();
+                    let base = format!("Z[{}]", b);
+                    if *e == -1 {
+                        *out += format!("\tZ[{}] = T(1) / {};\n", o, base).as_str();
+                    } else {
+                        *out += format!("\tZ[{}] = pow({}, {});\n", o, base, e).as_str();
+                    }
                 }
                 Instr::Powf(o, b, e) => {
-                    let base = format!("Z{}", b);
-                    let exp = format!("Z{}", e);
-                    *out += format!("\tZ{} = pow({}, {});\n", o, base, exp).as_str();
+                    let base = format!("Z[{}]", b);
+                    let exp = format!("Z[{}]", e);
+                    *out += format!("\tZ[{}] = pow({}, {});\n", o, base, exp).as_str();
                 }
                 Instr::BuiltinFun(o, s, a) => match s.0 {
                     Atom::EXP => {
-                        let arg = format!("Z{}", a);
-                        *out += format!("\tZ{} = exp({});\n", o, arg).as_str();
+                        let arg = format!("Z[{}]", a);
+                        *out += format!("\tZ[{}] = exp({});\n", o, arg).as_str();
                     }
                     Atom::LOG => {
-                        let arg = format!("Z{}", a);
-                        *out += format!("\tZ{} = log({});\n", o, arg).as_str();
+                        let arg = format!("Z[{}]", a);
+                        *out += format!("\tZ[{}] = log({});\n", o, arg).as_str();
                     }
                     Atom::SIN => {
-                        let arg = format!("Z{}", a);
-                        *out += format!("\tZ{} = sin({});\n", o, arg).as_str();
+                        let arg = format!("Z[{}]", a);
+                        *out += format!("\tZ[{}] = sin({});\n", o, arg).as_str();
                     }
                     Atom::COS => {
-                        let arg = format!("Z{}", a);
-                        *out += format!("\tZ{} = cos({});\n", o, arg).as_str();
+                        let arg = format!("Z[{}]", a);
+                        *out += format!("\tZ[{}] = cos({});\n", o, arg).as_str();
                     }
                     Atom::SQRT => {
-                        let arg = format!("Z{}", a);
-                        *out += format!("\tZ{} = sqrt({});\n", o, arg).as_str();
+                        let arg = format!("Z[{}]", a);
+                        *out += format!("\tZ[{}] = sqrt({});\n", o, arg).as_str();
                     }
                     _ => unreachable!(),
                 },
@@ -1417,7 +1541,7 @@ impl<T: std::fmt::Display> ExpressionEvaluator<T> {
             self.reserved_indices - self.param_count + 1,
             {
                 let mut nums = (self.param_count..self.reserved_indices)
-                    .map(|i| format!("std::complex<double>({})", self.stack[i]))
+                    .map(|i| format!("std::complex<double>({})", self.stack[i].export()))
                     .collect::<Vec<_>>();
                 nums.push("std::complex<double>(0, -0.)".to_string()); // used for inversion
                 nums.join(",")
@@ -1433,28 +1557,34 @@ impl<T: std::fmt::Display> ExpressionEvaluator<T> {
 
         res += "\treturn;\n}\n\n";
 
-        res += &format!(
-            "static const double {}_CONSTANTS_double[{}] = {{{}}};\n\n",
-            function_name,
-            self.reserved_indices - self.param_count + 1,
-            {
-                let mut nums = (self.param_count..self.reserved_indices)
-                    .map(|i| format!("double({})", self.stack[i]))
-                    .collect::<Vec<_>>();
-                nums.push("1".to_string()); // used for inversion
-                nums.join(",")
-            }
-        );
+        if self.stack.iter().all(|x| x.is_real()) {
+            res += &format!(
+                "static const double {}_CONSTANTS_double[{}] = {{{}}};\n\n",
+                function_name,
+                self.reserved_indices - self.param_count + 1,
+                {
+                    let mut nums = (self.param_count..self.reserved_indices)
+                        .map(|i| format!("double({})", self.stack[i].export()))
+                        .collect::<Vec<_>>();
+                    nums.push("1".to_string()); // used for inversion
+                    nums.join(",")
+                }
+            );
 
-        res += &format!(
-            "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n",
-            function_name
-        );
+            res += &format!(
+                "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n",
+                function_name
+            );
 
-        self.export_asm_double_impl(&self.instructions, function_name, asm_flavour, &mut res);
+            self.export_asm_double_impl(&self.instructions, function_name, asm_flavour, &mut res);
 
-        res += "\treturn;\n}\n";
-
+            res += "\treturn;\n}\n";
+        } else {
+            res += &format!(
+                "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n\tstd::cout << \"Cannot evaluate complex function with doubles\" << std::endl;\n\treturn; \n}}",
+                function_name,
+            );
+        }
         res
     }
 
@@ -2927,7 +3057,7 @@ impl<T: Clone> ExpressionEvaluator<T> {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Instr {
     Add(usize, Vec<usize>),
     Mul(usize, Vec<usize>),
@@ -3220,7 +3350,7 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
     }
 }
 
-impl EvalTree<Rational> {
+impl EvalTree<Complex<Rational>> {
     /// Find a near-optimal Horner scheme that minimizes the number of multiplications
     /// and additions, using `iterations` iterations of the optimization algorithm
     /// and `n_cores` cores. Optionally, a starting scheme can be provided.
@@ -3228,9 +3358,9 @@ impl EvalTree<Rational> {
         &mut self,
         iterations: usize,
         n_cores: usize,
-        start_scheme: Option<Vec<Expression<Rational>>>,
+        start_scheme: Option<Vec<Expression<Complex<Rational>>>>,
         verbose: bool,
-    ) -> ExpressionEvaluator<Rational> {
+    ) -> ExpressionEvaluator<Complex<Rational>> {
         let _ = self.optimize_horner_scheme(iterations, n_cores, start_scheme, verbose);
         self.common_subexpression_elimination();
         self.clone().linearize(None)
@@ -3265,9 +3395,9 @@ impl EvalTree<Rational> {
         &mut self,
         iterations: usize,
         n_cores: usize,
-        start_scheme: Option<Vec<Expression<Rational>>>,
+        start_scheme: Option<Vec<Expression<Complex<Rational>>>>,
         verbose: bool,
-    ) -> Vec<Expression<Rational>> {
+    ) -> Vec<Expression<Complex<Rational>>> {
         let v = match start_scheme {
             Some(a) => a,
             None => {
@@ -3285,7 +3415,7 @@ impl EvalTree<Rational> {
 
                 // for now, limit for parameters only
                 v.retain(|(x, _)| matches!(x, Expression::Parameter(_)));
-                v.sort_by_key(|k| std::cmp::Reverse(k.1));
+                v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 v.into_iter().map(|(k, _)| k).collect::<Vec<_>>()
             }
         };
@@ -3334,8 +3464,8 @@ impl EvalTree<Rational> {
     }
 }
 
-impl Expression<Rational> {
-    pub fn apply_horner_scheme(&mut self, scheme: &[Expression<Rational>]) {
+impl Expression<Complex<Rational>> {
+    pub fn apply_horner_scheme(&mut self, scheme: &[Expression<Complex<Rational>>]) {
         if scheme.is_empty() {
             return;
         }
@@ -3441,7 +3571,7 @@ impl Expression<Rational> {
                 }
 
                 if m.is_empty() {
-                    x = Expression::Const(Rational::one());
+                    x = Expression::Const(Complex::new_one());
                 } else if m.len() == 1 {
                     x = m.pop().unwrap();
                 }
@@ -3449,7 +3579,7 @@ impl Expression<Rational> {
                 found = pow_counter > 0;
             } else if x == scheme[0] {
                 found = true;
-                x = Expression::Const(Rational::one());
+                x = Expression::Const(Complex::new_one());
             }
 
             if found {
@@ -3481,7 +3611,7 @@ impl Expression<Rational> {
         }
 
         v.push(extracted);
-        v.retain(|x| *x != Expression::Const(Rational::one()));
+        v.retain(|x| *x != Expression::Const(Rational::one().into()));
         v.sort();
 
         let c = if v.len() == 1 {
@@ -3659,13 +3789,15 @@ impl Expression<Rational> {
 
         std::thread::scope(|s| {
             for i in 0..n_cores {
+                let mut rng = MonteCarloRng::new(0, i);
+
                 let mut cvars = vars.to_vec();
                 let best_scheme = best_scheme.clone();
                 let best_mul = best_mul.clone();
                 let best_add = best_add.clone();
+                let mut last_mul = usize::MAX;
+                let mut last_add = usize::MAX;
                 s.spawn(move || {
-                    let mut r = rng();
-
                     for j in 0..iterations / n_cores {
                         // try a random swap
                         let mut t1 = 0;
@@ -3679,8 +3811,8 @@ impl Expression<Rational> {
                             let perm = &p[i * (p.len() / n_cores) + j];
                             cvars = perm.iter().map(|x| vars[*x].clone()).collect();
                         } else {
-                            t1 = r.random_range(0..cvars.len());
-                            t2 = r.random_range(0..cvars.len() - 1);
+                            t1 = rng.random_range(0..cvars.len());
+                            t2 = rng.random_range(0..cvars.len() - 1);
 
                             cvars.swap(t1, t2);
                         }
@@ -3702,21 +3834,45 @@ impl Expression<Rational> {
                         }
 
                         // prefer fewer multiplications
-                        if cur_ops.1 <= best_mul.load(Ordering::Relaxed)
-                            || cur_ops.1 == best_mul.load(Ordering::Relaxed)
-                                && cur_ops.0 <= best_add.load(Ordering::Relaxed)
-                        {
+                        if cur_ops.1 <= last_mul || cur_ops.1 == last_mul && cur_ops.0 <= last_add {
                             if verbose {
                                 println!(
-                                    "Accept move at core iteration {}/{}: {} additions and {} multiplications",
-                                    j, iterations / n_cores,
-                                    cur_ops.0, cur_ops.1
+                                    "Accept move at step {}/{}: {} + and {} ×",
+                                    j,
+                                    iterations / n_cores,
+                                    cur_ops.0,
+                                    cur_ops.1
                                 );
                             }
 
-                            best_mul.store(cur_ops.1, Ordering::Relaxed);
-                            best_add.store(cur_ops.0, Ordering::Relaxed);
-                            best_scheme.lock().unwrap().clone_from_slice(&cvars);
+                            last_add = cur_ops.0;
+                            last_mul = cur_ops.1;
+
+                            if cur_ops.1 <= best_mul.load(Ordering::Relaxed)
+                                || cur_ops.1 == best_mul.load(Ordering::Relaxed)
+                                    && cur_ops.0 <= best_add.load(Ordering::Relaxed)
+                            {
+                                let mut best_scheme = best_scheme.lock().unwrap();
+
+                                // check again if it is the best now that we have locked
+                                let best_mul_l = best_mul.load(Ordering::Relaxed);
+                                let best_add_l = best_add.load(Ordering::Relaxed);
+                                if cur_ops.1 <= best_mul_l
+                                    || cur_ops.1 == best_mul_l && cur_ops.0 <= best_add_l
+                                {
+                                    if cur_ops.0 == best_add_l && cur_ops.1 == best_mul_l {
+                                        if *best_scheme < cvars {
+                                            // on a draw, accept the lexicographical minimum
+                                            // to get a deterministic scheme
+                                            *best_scheme = cvars.clone();
+                                        }
+                                    } else {
+                                        best_mul.store(cur_ops.1, Ordering::Relaxed);
+                                        best_add.store(cur_ops.0, Ordering::Relaxed);
+                                        *best_scheme = cvars.clone();
+                                    }
+                                }
+                            }
                         } else {
                             cvars.swap(t1, t2);
                         }
@@ -3725,10 +3881,18 @@ impl Expression<Rational> {
             }
         });
 
+        if verbose {
+            println!(
+                "Final scheme: {} + and {} ×",
+                best_add.load(Ordering::Relaxed),
+                best_mul.load(Ordering::Relaxed)
+            );
+        }
+
         Arc::try_unwrap(best_scheme).unwrap().into_inner().unwrap()
     }
 
-    fn find_all_variables(&self, vars: &mut HashMap<Expression<Rational>, usize>) {
+    fn find_all_variables(&self, vars: &mut HashMap<Expression<Complex<Rational>>, usize>) {
         match self {
             Expression::Const(_) | Expression::Parameter(_) | Expression::ReadArg(_) => {}
             Expression::Eval(_, ae) => {
@@ -3782,7 +3946,7 @@ impl Expression<Rational> {
     }
 }
 
-impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> EvalTree<T> {
+impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrdering> EvalTree<T> {
     pub fn common_subexpression_elimination(&mut self) {
         self.expressions.common_subexpression_elimination();
 
@@ -3805,7 +3969,9 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> EvalTree
     }
 }
 
-impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> SplitExpression<T> {
+impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrdering>
+    SplitExpression<T>
+{
     /// Eliminate common subexpressions in the expression, also checking for subexpressions
     /// up to length `max_subexpr_len`.
     pub fn common_subexpression_elimination(&mut self) {
@@ -3823,9 +3989,13 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> SplitExp
 
         h.retain(|_, v| *v > 1);
 
+        let mut v: Vec<_> = h.iter().map(|(k, v)| (*v, (*k).clone())).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
         // make the second argument a unique index of the subexpression
-        for (i, v) in h.values_mut().enumerate() {
-            *v = self.subexpressions.len() + i;
+        for (i, (index, e)) in v.iter_mut().enumerate() {
+            *index = self.subexpressions.len() + i;
+            *h.get_mut(e).unwrap() = *index;
         }
 
         let mut n_hash_tree = hashed_tree.clone();
@@ -3834,10 +4004,6 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> SplitExp
         }
 
         self.tree = n_hash_tree.iter().map(|x| x.to_expression()).collect();
-
-        let mut v: Vec<_> = h.clone().into_iter().map(|(k, v)| (v, k)).collect();
-
-        v.sort_by_key(|k| k.0); // not needed
 
         // replace subexpressions in subexpressions and
         // sort them based on their dependencies
@@ -3881,7 +4047,7 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> SplitExp
     }
 }
 
-impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> Expression<T> {
+impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrdering> Expression<T> {
     fn rename_subexpression(&mut self, subexp: &HashMap<usize, usize>) {
         match self {
             Expression::Const(_) | Expression::Parameter(_) | Expression::ReadArg(_) => {}
@@ -3943,7 +4109,9 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> Expressi
     }
 }
 
-impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> SplitExpression<T> {
+impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrdering>
+    SplitExpression<T>
+{
     pub fn count_operations(&self) -> (usize, usize) {
         let mut add = 0;
         let mut mul = 0;
@@ -3963,7 +4131,7 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> SplitExp
     }
 }
 
-impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + Ord> Expression<T> {
+impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrdering> Expression<T> {
     // Count the number of additions and multiplications in the expression.
     pub fn count_operations(&self) -> (usize, usize) {
         match self {
@@ -4603,18 +4771,18 @@ impl<'a> AtomView<'a> {
     /// Convert nested expressions to a tree.
     pub fn to_evaluation_tree(
         &self,
-        fn_map: &FunctionMap<Rational>,
+        fn_map: &FunctionMap<Complex<Rational>>,
         params: &[Atom],
-    ) -> Result<EvalTree<Rational>, String> {
+    ) -> Result<EvalTree<Complex<Rational>>, String> {
         Self::to_eval_tree_multiple(std::slice::from_ref(self), fn_map, params)
     }
 
     /// Convert nested expressions to a tree.
     pub fn to_eval_tree_multiple<A: AtomCore>(
         exprs: &[A],
-        fn_map: &FunctionMap<Rational>,
+        fn_map: &FunctionMap<Complex<Rational>>,
         params: &[Atom],
-    ) -> Result<EvalTree<Rational>, String> {
+    ) -> Result<EvalTree<Complex<Rational>>, String> {
         let mut funcs = vec![];
         let tree = exprs
             .iter()
@@ -4636,11 +4804,11 @@ impl<'a> AtomView<'a> {
 
     fn to_eval_tree_impl(
         &self,
-        fn_map: &FunctionMap<Rational>,
+        fn_map: &FunctionMap<Complex<Rational>>,
         params: &[Atom],
         args: &[Symbol],
-        funcs: &mut Vec<(String, Vec<Symbol>, SplitExpression<Rational>)>,
-    ) -> Result<Expression<Rational>, String> {
+        funcs: &mut Vec<(String, Vec<Symbol>, SplitExpression<Complex<Rational>>)>,
+    ) -> Result<Expression<Complex<Rational>>, String> {
         if let Some(p) = params.iter().position(|a| a.as_view() == *self) {
             return Ok(Expression::Parameter(p));
         }
@@ -4651,11 +4819,19 @@ impl<'a> AtomView<'a> {
 
         match self {
             AtomView::Num(n) => match n.get_coeff_view() {
-                CoefficientView::Natural(n, d) => Ok(Expression::Const((n, d).into())),
-                CoefficientView::Large(l) => Ok(Expression::Const(l.to_rat())),
-                CoefficientView::Float(f) => {
+                CoefficientView::Natural(n, d, ni, di) => Ok(Expression::Const(Complex::new(
+                    Rational::from((n, d)),
+                    Rational::from((ni, di)),
+                ))),
+                CoefficientView::Large(l, i) => {
+                    Ok(Expression::Const(Complex::new(l.to_rat(), i.to_rat())))
+                }
+                CoefficientView::Float(r, i) => {
                     // TODO: converting back to rational is slow
-                    Ok(Expression::Const(f.to_float().to_rational()))
+                    Ok(Expression::Const(Complex::new(
+                        r.to_float().to_rational(),
+                        i.to_float().to_rational(),
+                    )))
                 }
                 CoefficientView::FiniteField(_, _) => {
                     Err("Finite field not yet supported for evaluation".to_string())
@@ -4737,8 +4913,8 @@ impl<'a> AtomView<'a> {
                 let b_eval = b.to_eval_tree_impl(fn_map, params, args, funcs)?;
 
                 if let AtomView::Num(n) = e {
-                    if let CoefficientView::Natural(num, den) = n.get_coeff_view() {
-                        if den == 1 {
+                    if let CoefficientView::Natural(num, den, num_i, _den_i) = n.get_coeff_view() {
+                        if den == 1 && num_i == 0 {
                             if num > 1 {
                                 return Ok(Expression::Mul(vec![b_eval.clone(); num as usize]));
                             } else {
@@ -4813,11 +4989,42 @@ impl<'a> AtomView<'a> {
 
         match self {
             AtomView::Num(n) => match n.get_coeff_view() {
-                CoefficientView::Natural(n, d) => Ok(coeff_map(&Rational::from_unchecked(n, d))),
-                CoefficientView::Large(l) => Ok(coeff_map(&l.to_rat())),
-                CoefficientView::Float(f) => {
+                CoefficientView::Natural(n, d, ni, di) => {
+                    if ni == 0 {
+                        Ok(coeff_map(&Rational::from_unchecked(n, d)))
+                    } else {
+                        let num = coeff_map(&Rational::from_unchecked(n, d));
+                        Ok(coeff_map(&Rational::from_unchecked(ni, di))
+                            * num.i().ok_or_else(|| {
+                                "Numerical type does not support imaginary unit".to_string()
+                            })?
+                            + num)
+                    }
+                }
+                CoefficientView::Large(l, i) => {
+                    if i.is_zero() {
+                        Ok(coeff_map(&l.to_rat()))
+                    } else {
+                        let num = coeff_map(&l.to_rat());
+                        Ok(coeff_map(&i.to_rat())
+                            * num.i().ok_or_else(|| {
+                                "Numerical type does not support imaginary unit".to_string()
+                            })?
+                            + num)
+                    }
+                }
+                CoefficientView::Float(r, i) => {
                     // TODO: converting back to rational is slow
-                    Ok(coeff_map(&f.to_float().to_rational()))
+                    let rm = coeff_map(&r.to_float().to_rational());
+                    if i.is_zero() {
+                        Ok(rm)
+                    } else {
+                        Ok(coeff_map(&i.to_float().to_rational())
+                            * rm.i().ok_or_else(|| {
+                                "Numerical type does not support imaginary unit".to_string()
+                            })?
+                            + rm)
+                    }
                 }
                 CoefficientView::FiniteField(_, _) => {
                     Err("Finite field not yet supported for evaluation".to_string())
@@ -4829,9 +5036,6 @@ impl<'a> AtomView<'a> {
             AtomView::Var(v) => match v.get_symbol() {
                 Atom::E => Ok(coeff_map(&1.into()).e()),
                 Atom::PI => Ok(coeff_map(&1.into()).pi()),
-                Atom::I => coeff_map(&1.into())
-                    .i()
-                    .ok_or_else(|| "Numerical type does not support imaginary unit".to_string()),
                 _ => Err(format!("Variable {} not in constant map", v.get_symbol())),
             },
             AtomView::Fun(f) => {
@@ -4873,8 +5077,8 @@ impl<'a> AtomView<'a> {
                 let b_eval = b.evaluate_impl(coeff_map, const_map, function_map, cache)?;
 
                 if let AtomView::Num(n) = e {
-                    if let CoefficientView::Natural(num, den) = n.get_coeff_view() {
-                        if den == 1 {
+                    if let CoefficientView::Natural(num, den, ni, _di) = n.get_coeff_view() {
+                        if den == 1 && ni == 0 {
                             if num >= 0 {
                                 return Ok(b_eval.pow(num as u64));
                             } else {
@@ -4947,9 +5151,9 @@ impl<'a> AtomView<'a> {
     fn zero_test_impl(&self, iterations: usize, tolerance: f64) -> ConditionResult {
         // collect all variables and functions and fill in random variables
 
-        let mut rng = rand::rng();
+        let mut rng = MonteCarloRng::new(0, 0);
 
-        if self.contains_symbol(State::I) {
+        if self.has_complex_coefficients() {
             let mut vars: HashMap<_, _> = self
                 .get_all_indeterminates(true)
                 .into_iter()
@@ -5064,7 +5268,10 @@ mod test {
 
     use crate::{
         atom::{Atom, AtomCore},
-        domains::{float::Float, rational::Rational},
+        domains::{
+            float::{Complex, Float},
+            rational::Rational,
+        },
         evaluate::{EvaluationFn, FunctionMap, OptimizationSettings},
         id::ConditionResult,
         parse, symbol,
@@ -5075,10 +5282,10 @@ mod test {
         let x = symbol!("v1");
         let f = symbol!("f1");
         let g = symbol!("f2");
-        let p0 = parse!("v2(0)").unwrap();
-        let a = parse!("v1*cos(v1) + f1(v1, 1)^2 + f2(f2(v1)) + v2(0)").unwrap();
+        let p0 = parse!("v2(0)");
+        let a = parse!("v1*cos(v1) + f1(v1, 1)^2 + f2(f2(v1)) + v2(0)");
 
-        let v = Atom::new_var(x);
+        let v = Atom::var(x);
 
         let mut const_map = HashMap::default();
         let mut fn_map: HashMap<_, EvaluationFn<_, _>> = HashMap::default();
@@ -5111,11 +5318,11 @@ mod test {
     #[test]
     fn arb_prec() {
         let x = symbol!("v1");
-        let a = parse!("128731/12893721893721 + v1").unwrap();
+        let a = parse!("128731/12893721893721 + v1");
 
         let mut const_map = HashMap::default();
 
-        let v = Atom::new_var(x);
+        let v = Atom::var(x);
         const_map.insert(v.as_view(), Float::with_val(200, 6));
 
         let r = a
@@ -5134,21 +5341,21 @@ mod test {
 
     #[test]
     fn nested() {
-        let e1 = parse!("x + pi + cos(x) + f(g(x+1),h(x*2)) + p(1,x)").unwrap();
-        let e2 = parse!("x + h(x*2) + cos(x)").unwrap();
-        let f = parse!("y^2 + z^2*y^2").unwrap();
-        let g = parse!("i(y+7)+x*i(y+7)*(y-1)").unwrap();
-        let h = parse!("y*(1+x*(1+x^2)) + y^2*(1+x*(1+x^2))^2 + 3*(1+x^2)").unwrap();
-        let i = parse!("y - 1").unwrap();
-        let p1 = parse!("3*z^3 + 4*z^2 + 6*z +8").unwrap();
+        let e1 = parse!("x + pi + cos(x) + f(g(x+1),h(x*2)) + p(1,x)");
+        let e2 = parse!("x + h(x*2) + cos(x)");
+        let f = parse!("y^2 + z^2*y^2");
+        let g = parse!("i(y+7)+x*i(y+7)*(y-1)");
+        let h = parse!("y*(1+x*(1+x^2)) + y^2*(1+x*(1+x^2))^2 + 3*(1+x^2)");
+        let i = parse!("y - 1");
+        let p1 = parse!("3*z^3 + 4*z^2 + 6*z +8");
 
         let mut fn_map = FunctionMap::new();
 
-        fn_map.add_constant(symbol!("pi").into(), Rational::from((22, 7)));
+        fn_map.add_constant(symbol!("pi").into(), Complex::from(Rational::from((22, 7))));
         fn_map
             .add_tagged_function(
                 symbol!("p"),
-                vec![Atom::new_num(1)],
+                vec![Atom::num(1)],
                 "p1".to_string(),
                 vec![symbol!("z")],
                 p1,
@@ -5172,23 +5379,25 @@ mod test {
             .add_function(symbol!("i"), "i".to_string(), vec![symbol!("y")], i)
             .unwrap();
 
-        let params = vec![parse!("x").unwrap()];
+        let params = vec![parse!("x")];
 
         let evaluator =
             Atom::evaluator_multiple(&[e1, e2], &fn_map, &params, OptimizationSettings::default())
                 .unwrap();
 
-        let mut e_f64 = evaluator.map_coeff(&|x| x.into());
+        let mut e_f64 = evaluator.map_coeff(&|x| x.clone().to_real().unwrap().into());
         let r = e_f64.evaluate_single(&[1.1]);
         assert!((r - 1622709.2254269677).abs() / 1622709.2254269677 < 1e-10);
     }
 
     #[test]
     fn zero_test() {
-        let e = parse!("(sin(v1)^2-sin(v1))(sin(v1)^2+sin(v1))^2 - (1/4 sin(2v1)^2-1/2 sin(2v1)cos(v1)-2 cos(v1)^2+1/2 sin(2v1)cos(v1)^3+3 cos(v1)^4-cos(v1)^6)").unwrap();
+        let e = parse!(
+            "(sin(v1)^2-sin(v1))(sin(v1)^2+sin(v1))^2 - (1/4 sin(2v1)^2-1/2 sin(2v1)cos(v1)-2 cos(v1)^2+1/2 sin(2v1)cos(v1)^3+3 cos(v1)^4-cos(v1)^6)"
+        );
         assert_eq!(e.zero_test(10, f64::EPSILON), ConditionResult::Inconclusive);
 
-        let e = parse!("x + (1+x)^2 + (x+2)*5").unwrap();
+        let e = parse!("x + (1+x)^2 + (x+2)*5");
         assert_eq!(e.zero_test(10, f64::EPSILON), ConditionResult::False);
     }
 }

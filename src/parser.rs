@@ -15,12 +15,17 @@ use smallvec::SmallVec;
 use smartstring::{LazyCompact, SmartString};
 
 use crate::{
+    LicenseManager,
     atom::{Atom, DefaultNamespace},
     coefficient::{Coefficient, ConvertToRing},
-    domains::{float::Float, integer::Integer, Ring},
-    poly::{polynomial::MultivariatePolynomial, PositiveExponent, Variable},
+    domains::{
+        Ring,
+        float::{Complex, Float, NumericalFloatLike},
+        integer::Integer,
+        rational::Rational,
+    },
+    poly::{PositiveExponent, Variable, polynomial::MultivariatePolynomial},
     state::{State, Workspace},
-    LicenseManager,
 };
 
 const HEX_DIGIT_MASK: [bool; 255] = [
@@ -164,7 +169,7 @@ pub struct Position {
 /// an expression or a polynomial.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
-    Number(SmartString<LazyCompact>),
+    Number(SmartString<LazyCompact>, bool),
     ID(SmartString<LazyCompact>),
     RationalPolynomial(SmartString<LazyCompact>),
     Op(bool, bool, Operator, Vec<Token>),
@@ -179,7 +184,14 @@ pub enum Token {
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Token::Number(n) => f.write_str(n),
+            Token::Number(n, is_imag) => {
+                if *is_imag {
+                    f.write_str(n)?;
+                    f.write_char('𝑖')
+                } else {
+                    f.write_str(n)
+                }
+            }
             Token::ID(v) => f.write_str(v),
             Token::RationalPolynomial(v) => {
                 f.write_char('[')?;
@@ -243,7 +255,7 @@ impl Token {
     /// Return if the token does not require any further arguments.
     fn is_normal(&self) -> bool {
         match self {
-            Token::Number(_) => true,
+            Token::Number(_, _) => true,
             Token::ID(_) => true,
             Token::RationalPolynomial(_) => true,
             Token::Op(more_left, more_right, _, _) => !more_left && !more_right,
@@ -256,7 +268,7 @@ impl Token {
     #[inline]
     fn get_precedence(&self) -> u8 {
         match self {
-            Token::Number(_) => 11,
+            Token::Number(_, _) => 11,
             Token::ID(_) => 11,
             Token::RationalPolynomial(_) => 11,
             Token::Op(_, _, o, _) => o.get_precedence(),
@@ -296,21 +308,38 @@ impl Token {
         }
     }
 
-    fn distribute_neg(&mut self) {
+    fn distribute_neg(&mut self, distribute_neg: bool) {
         match self {
-            Token::Op(_, _, Operator::Neg, args3) => {
-                debug_assert!(args3.len() == 1);
-                *self = args3.pop().unwrap();
+            Token::Op(_, _, Operator::Neg, args) => {
+                debug_assert!(args.len() == 1);
+                *self = args.pop().unwrap();
             }
-            Token::Op(_, _, Operator::Mul, args2) => {
-                args2[0].distribute_neg();
-            }
-            Token::Op(_, _, Operator::Add, args2) => {
-                for a in args2 {
-                    a.distribute_neg();
+            Token::Op(_, _, Operator::Mul, args) => {
+                if distribute_neg {
+                    args[0].distribute_neg(distribute_neg);
+                } else {
+                    if let Token::Number(n, _) = &mut args[0] {
+                        if n.starts_with('-') {
+                            n.remove(0);
+                        } else {
+                            n.insert(0, '-');
+                        }
+                    } else {
+                        args.push(Token::Number("-1".into(), false));
+                    }
                 }
             }
-            Token::Number(n) => {
+            Token::Op(_, _, Operator::Add, args) => {
+                if distribute_neg {
+                    for a in args {
+                        a.distribute_neg(true);
+                    }
+                } else {
+                    let t = std::mem::replace(self, Token::EOF);
+                    *self = Token::Op(false, false, Operator::Neg, vec![t]);
+                }
+            }
+            Token::Number(n, _) => {
                 if n.starts_with('-') {
                     n.remove(0);
                 } else {
@@ -326,20 +355,20 @@ impl Token {
 
     /// Add `other` to right side of `self`, where `self` is a binary operation.
     #[inline]
-    fn add_right(&mut self, mut other: Token) -> Result<(), String> {
+    fn add_right(&mut self, mut other: Token, distribute_neg: bool) -> Result<(), String> {
         if let Token::Op(_, mr, o1, args) = self {
             debug_assert!(*mr);
             *mr = false;
 
             if *o1 == Operator::Neg {
-                if let Token::Number(n) = &mut other {
+                if let Token::Number(n, _) = &mut other {
                     if n.starts_with('-') {
                         n.remove(0);
                     } else {
                         n.insert(0, '-');
                     }
                 } else {
-                    other.distribute_neg();
+                    other.distribute_neg(distribute_neg);
                 }
                 *self = other;
                 return Ok(());
@@ -363,7 +392,7 @@ impl Token {
             }
 
             Ok(())
-        } else if let Token::Number(n) = other {
+        } else if let Token::Number(n, _) = other {
             Err(format!("operator expected between '{}' and '{}'", self, n))
         } else {
             Err(format!(
@@ -402,20 +431,28 @@ impl Token {
         out: &mut Atom,
     ) -> Result<(), String> {
         match self {
-            Token::Number(n) => match n.parse::<Integer>() {
+            Token::Number(n, is_imag) => match n.parse::<Integer>() {
                 Ok(x) => {
-                    out.to_num(x.into());
+                    if *is_imag {
+                        out.to_num(Complex::new(Rational::zero(), x.into()).into());
+                    } else {
+                        out.to_num(x.into());
+                    }
                 }
                 Err(_) => match Float::parse(n, None) {
                     Ok(f) => {
                         // derive precision from string length, should be overestimate
-                        out.to_num(Coefficient::Float(f));
+                        if *is_imag {
+                            out.to_num(Complex::new(f.zero(), f.into()).into());
+                        } else {
+                            out.to_num(Coefficient::Float(f.into()));
+                        }
                     }
                     Err(e) => Err(format!("Error parsing number: {}", e))?,
                 },
             },
             Token::ID(x) => {
-                out.to_var(state.get_symbol(namespace.attach_namespace(x)));
+                out.to_var(state.get_symbol(namespace.attach_namespace(x))?);
             }
             Token::Op(_, _, op, args) => match op {
                 Operator::Mul => {
@@ -480,7 +517,7 @@ impl Token {
                     _ => unreachable!(),
                 };
 
-                let fun = out.to_fun(state.get_symbol(namespace.attach_namespace(name)));
+                let fun = out.to_fun(state.get_symbol(namespace.attach_namespace(name))?);
                 let mut atom = workspace.new_atom();
                 for a in args.iter().skip(1) {
                     a.to_atom_with_output_no_norm(namespace, state, workspace, &mut atom)?;
@@ -506,13 +543,22 @@ impl Token {
         out: &mut Atom,
     ) -> Result<(), String> {
         match self {
-            Token::Number(n) => match n.parse::<Integer>() {
+            Token::Number(n, is_imag) => match n.parse::<Integer>() {
                 Ok(x) => {
-                    out.to_num(x.into());
+                    if *is_imag {
+                        out.to_num(Complex::new(Rational::zero(), x.into()).into());
+                    } else {
+                        out.to_num(x.into());
+                    }
                 }
                 Err(_) => match Float::parse(n, None) {
                     Ok(f) => {
-                        out.to_num(Coefficient::Float(f));
+                        // derive precision from string length, should be overestimate
+                        if *is_imag {
+                            out.to_num(Complex::new(f.zero(), f.into()).into());
+                        } else {
+                            out.to_num(Coefficient::Float(f.into()));
+                        }
                     }
                     Err(e) => Err(format!("Error parsing number: {}", e))?,
                 },
@@ -657,8 +703,11 @@ impl Token {
         Ok(())
     }
 
-    /// Parse a Symbolica expression.
-    pub fn parse(input: &str) -> Result<Token, String> {
+    /// Parse a Symbolica expression, generating a token tree. For most users,
+    /// it is recommended to use [crate::parse] instead, which returns an atom.
+    ///
+    /// Optionally, distribute distribute unary minus operators into sums.
+    pub fn parse(input: &str, distribute_neg: bool) -> Result<Token, String> {
         LicenseManager::check();
 
         let mut stack: Vec<_> = Vec::with_capacity(20);
@@ -683,6 +732,7 @@ impl Token {
                 ParseState::Identifier => {
                     if ops.contains(&c) || whitespace.contains(&c) {
                         state = ParseState::Any;
+
                         stack.push(Token::ID(id_buffer.as_str().into()));
                         id_buffer.clear();
                     } else if !forbidden.contains(&c) {
@@ -712,13 +762,34 @@ impl Token {
 
                             let e = id_buffer.pop().unwrap();
                             state = ParseState::Any;
-                            stack.push(Token::Number(id_buffer.as_str().into()));
+                            stack.push(Token::Number(id_buffer.as_str().into(), false));
                             id_buffer.clear();
 
                             extra_ops.push(e);
                             extra_ops.push(c);
                             c = '*';
 
+                            break;
+                        }
+
+                        if c == 'i' || c == '𝑖' {
+                            let old_c = c;
+                            // complex number has trailing i and must be followed by whitespace or an operator
+                            c = char_iter.next().unwrap_or('\0');
+
+                            let is_imag = whitespace.contains(&c) || ops.contains(&c);
+
+                            state = ParseState::Any;
+                            stack.push(Token::Number(id_buffer.as_str().into(), is_imag));
+                            id_buffer.clear();
+
+                            if !is_imag {
+                                extra_ops.push(old_c);
+                                extra_ops.push(c);
+                                c = '*';
+                            }
+
+                            last_digit_is_exp = true; // prevent adding the number again
                             break;
                         }
 
@@ -744,7 +815,7 @@ impl Token {
 
                     if !last_digit_is_exp {
                         state = ParseState::Any;
-                        stack.push(Token::Number(id_buffer.as_str().into()));
+                        stack.push(Token::Number(id_buffer.as_str().into(), false));
                         id_buffer.clear();
                     }
                 }
@@ -877,7 +948,7 @@ impl Token {
                             && (!c.is_ascii_digit()
                                 || !matches!(
                                     unsafe { stack.last().unwrap_unchecked() },
-                                    Token::Number(_)
+                                    Token::Number(_, _)
                                 ))
                         {
                             // insert implicit multiplication: x y -> x*y
@@ -910,9 +981,9 @@ impl Token {
                     match unsafe { stack.get_unchecked(stack.len() - 1) } {
                         Token::Op(true, _, op, _) => {
                             Err(format!(
-                            "Error at line {} and position {}: operator '{}' is missing left-hand side",
-                            line_counter, column_counter, op,
-                        ))?;
+                                "Error at line {} and position {}: operator '{}' is missing left-hand side",
+                                line_counter, column_counter, op,
+                            ))?;
                         }
 
                         x @ Token::CloseParenthesis | x @ Token::CloseBracket => {
@@ -965,7 +1036,7 @@ impl Token {
 
                 match first.get_precedence().cmp(&last.get_precedence()) {
                     std::cmp::Ordering::Greater => {
-                        first.add_right(middle).map_err(|e| {
+                        first.add_right(middle, distribute_neg).map_err(|e| {
                             format!(
                                 "Error at line {} and position {}: ",
                                 line_counter, column_counter
@@ -1321,13 +1392,13 @@ mod test {
 
     #[test]
     fn pow() {
-        let input = parse!("v1^v2^v3^3").unwrap();
+        let input = parse!("v1^v2^v3^3");
         assert_eq!(
             format!("{}", input.printer(PrintOptions::file_no_namespace())),
             "v1^v2^v3^3"
         );
 
-        let input = parse!("(v1^v2)^v3").unwrap();
+        let input = parse!("(v1^v2)^v3");
         assert_eq!(
             format!("{}", input.printer(PrintOptions::file_no_namespace())),
             "(v1^v2)^v3"
@@ -1336,13 +1407,13 @@ mod test {
 
     #[test]
     fn unary() {
-        let input = parse!("-x^z").unwrap();
+        let input = parse!("-x^z");
         assert_eq!(
             format!("{}", input.printer(PrintOptions::file_no_namespace())),
             "-x^z"
         );
 
-        let input = parse!("(-x)^z").unwrap();
+        let input = parse!("(-x)^z");
         assert_eq!(
             format!("{}", input.printer(PrintOptions::file_no_namespace())),
             "(-x)^z"
@@ -1354,15 +1425,14 @@ mod test {
         let input = parse!(
             "89233_21837281 x   
             ^2 / y + 5 + 5x"
-        )
-        .unwrap();
-        let res = parse!("8923321837281*x^2*y^-1+5+5x").unwrap();
+        );
+        let res = parse!("8923321837281*x^2*y^-1+5+5x");
         assert_eq!(input, res);
     }
 
     #[test]
     fn float() {
-        let input = parse!("1.2`20x+1e-5`20+1e+5 * 1.1234e23 +2exp(5)").unwrap();
+        let input = parse!("1.2`20x+1e-5`20+1e+5 * 1.1234e23 +2exp(5)");
 
         let r = format!("{}", input.printer(PrintOptions::file_no_namespace()));
         assert_eq!(r, "1.2000000000000000000*x+2*exp(5)+1.123400000000000e28");
@@ -1370,8 +1440,8 @@ mod test {
 
     #[test]
     fn square_bracket_function() {
-        let input = parse!("v1  [v1, v2]+5 + v1[]").unwrap();
-        let res = parse!("v1(v1,v2)+5+v1()").unwrap();
+        let input = parse!("v1  [v1, v2]+5 + v1[]");
+        let res = parse!("v1(v1,v2)+5+v1()");
         assert_eq!(input, res);
     }
 
@@ -1385,9 +1455,7 @@ mod test {
         assert!(rest.is_empty());
         assert_eq!(
             input,
-            parse!("5+2748*v1^2*v2")
-                .unwrap()
-                .to_polynomial(&Z, var_map.clone())
+            parse!("5+2748*v1^2*v2").to_polynomial(&Z, var_map.clone())
         );
     }
 }

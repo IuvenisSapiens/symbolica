@@ -8,18 +8,18 @@ use std::{
 
 use crate::{
     domains::{
+        EuclideanDomain, Field, InternalOrdering, Ring, SelfRing,
         float::{Complex, FloatField, NumericalFloatLike, Real, SingleFloat},
         integer::{Integer, IntegerRing, Z},
-        rational::{Rational, RationalField, Q},
-        EuclideanDomain, Field, InternalOrdering, Ring, SelfRing,
+        rational::{Q, Rational, RationalField},
     },
     printer::{PrintOptions, PrintState},
 };
 
 use super::{
+    PositiveExponent, Variable,
     factor::Factorize,
     polynomial::{MultivariatePolynomial, PolynomialRing},
-    PositiveExponent, Variable,
 };
 
 /// A univariate polynomial ring.
@@ -552,11 +552,7 @@ impl<F: Ring> UnivariatePolynomial<F> {
         }
 
         let (a, b) = self.quot_rem_impl(div, true);
-        if b.is_zero() {
-            Some(a)
-        } else {
-            None
-        }
+        if b.is_zero() { Some(a) } else { None }
     }
 
     fn quot_rem_impl(&self, div: &Self, early_return: bool) -> (Self, Self) {
@@ -641,7 +637,7 @@ impl<F: Ring> SelfRing for UnivariatePolynomial<F> {
             .count();
 
         let add_paren = non_zero > 1 && state.in_product
-            || (state.in_exp
+            || ((state.in_exp || state.in_exp_base)
                 && (non_zero > 1
                     || self
                         .coefficients
@@ -658,6 +654,7 @@ impl<F: Ring> SelfRing for UnivariatePolynomial<F> {
 
             state.in_product = false;
             state.in_exp = false;
+            state.in_exp_base = false;
             f.write_str("(")?;
         }
 
@@ -679,7 +676,7 @@ impl<F: Ring> SelfRing for UnivariatePolynomial<F> {
             let suppressed_one = self.ring.format(
                 c,
                 opts,
-                state.step(state.in_sum, state.in_product, false),
+                state.step(state.in_sum, state.in_product, false, false),
                 f,
             )?;
 
@@ -860,11 +857,7 @@ impl UnivariatePolynomial<RationalField> {
             }
         }
 
-        if iter_bound {
-            Err(roots)
-        } else {
-            Ok(roots)
-        }
+        if iter_bound { Err(roots) } else { Ok(roots) }
     }
 }
 
@@ -1573,7 +1566,9 @@ impl<F: EuclideanDomain> UnivariatePolynomial<F> {
             if !self.ring.is_zero(oc) {
                 let (q, r) = self.ring.quot_rem(oc, &self.ring.nth(Integer::from(p) + 1));
                 if !self.ring.is_zero(&r) {
-                    panic!("Could not compute integral since there is a remainder in the division of the exponent number.");
+                    panic!(
+                        "Could not compute integral since there is a remainder in the division of the exponent number."
+                    );
                 }
                 *nc = q;
             }
@@ -1796,7 +1791,6 @@ mod test {
     #[test]
     fn derivative_integrate() {
         let a = parse!("x^2+5x+x^7+3")
-            .unwrap()
             .to_polynomial::<_, u8>(&Q, None)
             .to_univariate_from_univariate(0);
 
@@ -1808,31 +1802,25 @@ mod test {
     #[test]
     fn test_uni() {
         let a = parse!("x^2+5x+x^7+3")
-            .unwrap()
             .to_polynomial::<_, u8>(&Z, None)
             .to_univariate_from_univariate(0);
         let b = parse!("x^2 + 6")
-            .unwrap()
             .to_polynomial::<_, u8>(&Z, None)
             .to_univariate_from_univariate(0);
 
         let a_plus_b = parse!("9+5*x+2*x^2+x^7")
-            .unwrap()
             .to_polynomial::<_, u8>(&Z, None)
             .to_univariate_from_univariate(0);
 
         let a_mul_b = parse!("18+30*x+9*x^2+5*x^3+x^4+6*x^7+x^9")
-            .unwrap()
             .to_polynomial::<_, u8>(&Z, None)
             .to_univariate_from_univariate(0);
 
         let a_quot_b = parse!("1+36*x+-6*x^3+x^5")
-            .unwrap()
             .to_polynomial::<_, u8>(&Z, None)
             .to_univariate_from_univariate(0);
 
         let a_rem_b = parse!("-3+-211*x")
-            .unwrap()
             .to_polynomial::<_, u8>(&Z, None)
             .to_univariate_from_univariate(0);
 
@@ -1848,7 +1836,6 @@ mod test {
     fn isolate() {
         let p =
         parse!("-13559717115*x^6+624134407779*x^7+-13046815434285*x^8+163110612017313*x^9+-1347733455544188*x^10+7635969738026784*x^11+-29444295941654904*x^12+71604709665043392*x^13+-77045857071990336*x^14+-99619711608972096*x^15+375578692434494208*x^16+66256662107418624*x^17+-1548072112541055488*x^18+800263217632600064*x^19+4816054475648851968*x^20+-4271696436901249024*x^21+-12066471810013724672*x^22+10894783995791278080*x^23+28270081588804452352*x^24+-17402041731641245696*x^25+-56047633173904883712*x^26+8535267319469834240*x^27+82086860869945262080*x^28+30788799964221800448*x^29+-66898313364436418560*x^30+-66318040948916879360*x^31+44159548067414016*x^32+31084367995645984768*x^33+20957883496015069184*x^34+6860635897973440512*x^35+1254041389990150144*x^36+123004564822556672*x^37+5066549580791808*x^38")
-        .unwrap()
         .to_polynomial::<_, u32>(&Q, None)
         .to_univariate_from_univariate(0);
 
@@ -1890,7 +1877,6 @@ mod test {
     #[test]
     fn complex_roots() {
         let p = parse!("x^10+9x^7+4x^3+2x+1")
-            .unwrap()
             .to_polynomial::<_, u16>(&Q, None)
             .to_univariate_from_univariate(0);
         let pc = p.approximate_roots::<F64>(10000, &1e-8.into()).unwrap();

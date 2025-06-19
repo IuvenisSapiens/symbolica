@@ -7,7 +7,7 @@ use colored::Colorize;
 use crate::{
     atom::{AddView, AtomView, MulView, NumView, PowView, VarView, representation::FunView},
     coefficient::CoefficientView,
-    domains::{SelfRing, finite_field::FiniteFieldCore},
+    domains::{SelfRing, finite_field::FiniteFieldCore, float::Complex},
     state::State,
 };
 
@@ -239,6 +239,7 @@ pub struct PrintState {
     pub in_product: bool,
     pub suppress_one: bool,
     pub in_exp: bool,
+    pub in_exp_base: bool,
     pub top_level_add_child: bool,
     pub superscript: bool,
     pub level: u16,
@@ -256,6 +257,7 @@ impl PrintState {
             in_sum: false,
             in_product: false,
             in_exp: false,
+            in_exp_base: false,
             suppress_one: false,
             top_level_add_child: true,
             superscript: false,
@@ -275,11 +277,12 @@ impl PrintState {
         self
     }
 
-    pub fn step(self, in_sum: bool, in_product: bool, in_exp: bool) -> Self {
+    pub fn step(self, in_sum: bool, in_product: bool, in_exp: bool, in_exp_base: bool) -> Self {
         Self {
             in_sum,
             in_product,
             in_exp,
+            in_exp_base,
             level: self.level + 1,
             ..self
         }
@@ -321,7 +324,7 @@ define_formatters!(
 /// ```
 /// use symbolica::{atom::AtomCore, parse};
 /// use symbolica::printer::PrintOptions;
-/// let a = parse!("x + y").unwrap();
+/// let a = parse!("x + y");
 /// println!("{}", a.printer(PrintOptions::latex()));
 /// ```
 pub struct AtomPrinter<'a> {
@@ -605,13 +608,21 @@ impl FormattedPrintNum for NumView<'_> {
 
         let d = self.get_coeff_view();
 
-        let is_negative = match d {
-            CoefficientView::Natural(n, _) => n < 0,
-            CoefficientView::Large(r) => r.is_negative(),
+        let global_negative = match d {
+            CoefficientView::Natural(n, _, ni, _) => n < 0 && ni == 0 || ni < 0 && n == 0,
+            CoefficientView::Large(r, ri) => {
+                r.is_negative() && ri.is_zero() || ri.is_negative() && r.is_zero()
+            }
+            _ => false,
+        } && print_state.in_sum;
+
+        print_state.superscript &= match d {
+            CoefficientView::Natural(_, d, ni, _) => d == 1 && ni == 0,
+            CoefficientView::Large(r, ri) => r.to_rat().is_integer() && ri.is_zero(),
             _ => false,
         };
 
-        if is_negative {
+        if global_negative {
             if print_state.top_level_add_child
                 && opts.mode.is_symbolica()
                 && opts.color_top_level_sum
@@ -637,63 +648,242 @@ impl FormattedPrintNum for NumView<'_> {
             print_state.in_sum = false;
         }
 
+        let i_str = if opts.color_builtin_symbols {
+            "\u{1b}\u{5b}\u{33}\u{35}\u{6d}\u{1d456}\u{1b}\u{5b}\u{30}\u{6d}"
+        } else {
+            "𝑖"
+        };
+
         match d {
-            CoefficientView::Natural(num, den) => {
-                if den == 1 && print_state.suppress_one && (num == 1 || num == -1) {
+            CoefficientView::Natural(num, den, num_i, den_i) => {
+                if num_i == 0 && den == 1 && print_state.suppress_one && (num == 1 || num == -1) {
+                    if num == -1 && !global_negative {
+                        f.write_char('-')?;
+                    }
                     return Ok(true);
                 }
 
+                let need_paren = (print_state.in_product
+                    || print_state.in_exp
+                    || print_state.in_exp_base)
+                    && (num != 0 && num_i != 0)
+                    || print_state.in_exp_base && (num < 0 || num_i < 0 || den != 1 || den_i != 1)
+                    || print_state.in_exp && (den != 1 || den_i != 1);
+
+                if need_paren {
+                    f.write_char('(')?;
+                }
+
                 if !opts.mode.is_latex()
                     && (opts.number_thousands_separator.is_some() || print_state.superscript)
                 {
-                    format_num(num.unsigned_abs().to_string(), opts, &print_state, f)?;
-                    if den != 1 {
-                        f.write_char('/')?;
-                        format_num(den.to_string(), opts, &print_state, f)?;
+                    if num != 0 {
+                        if !global_negative && num < 0 {
+                            f.write_char('-')?;
+                        }
+
+                        format_num(num.unsigned_abs().to_string(), opts, &print_state, f)?;
+                        if den != 1 {
+                            f.write_char('/')?;
+                            format_num(den.to_string(), opts, &print_state, f)?;
+                        }
                     }
-                } else if den != 1 {
-                    if opts.mode.is_latex() {
-                        f.write_fmt(format_args!("\\frac{{{}}}{{{}}}", num.unsigned_abs(), den))?;
-                    } else {
-                        f.write_fmt(format_args!("{}/{}", num.unsigned_abs(), den))?;
+
+                    if num != 0 && num_i > 0 {
+                        f.write_char('+')?;
+                    }
+
+                    if num_i != 0 {
+                        if !global_negative && num_i < 0 {
+                            f.write_char('-')?;
+                        }
+                        format_num(num_i.unsigned_abs().to_string(), opts, &print_state, f)?;
+                        f.write_str(i_str)?;
+                        if den_i != 1 {
+                            f.write_char('/')?;
+                            format_num(den_i.to_string(), opts, &print_state, f)?;
+                        }
                     }
                 } else {
-                    f.write_fmt(format_args!("{}", num.unsigned_abs()))?;
+                    if num != 0 || num_i == 0 {
+                        if !global_negative && num < 0 {
+                            f.write_char('-')?;
+                        }
+                        if den != 1 {
+                            if opts.mode.is_latex() {
+                                f.write_fmt(format_args!(
+                                    "\\frac{{{}}}{{{}}}",
+                                    num.unsigned_abs(),
+                                    den
+                                ))?;
+                            } else {
+                                f.write_fmt(format_args!("{}/{}", num.unsigned_abs(), den))?;
+                            }
+                        } else {
+                            f.write_fmt(format_args!("{}", num.unsigned_abs()))?;
+                        }
+                    }
+
+                    if num != 0 && num_i > 0 {
+                        f.write_char('+')?;
+                    }
+
+                    if num_i != 0 {
+                        if !global_negative && num_i < 0 {
+                            f.write_char('-')?;
+                        }
+                        if den_i != 1 {
+                            if opts.mode.is_latex() {
+                                f.write_fmt(format_args!(
+                                    "\\frac{{{}}}{{{}}}𝑖",
+                                    num_i.unsigned_abs(),
+                                    den_i,
+                                ))?;
+                            } else {
+                                f.write_fmt(format_args!(
+                                    "{}{}/{}",
+                                    num_i.unsigned_abs(),
+                                    i_str,
+                                    den_i
+                                ))?;
+                            }
+                        } else {
+                            f.write_fmt(format_args!("{}{}", num_i.unsigned_abs(), i_str))?;
+                        }
+                    }
+                }
+
+                if need_paren {
+                    f.write_char(')')?;
                 }
 
                 Ok(false)
             }
-            CoefficientView::Float(fl) => {
-                fl.to_float().format(opts, print_state, f)?;
+            CoefficientView::Float(r, i) => {
+                if i.is_zero() {
+                    r.to_float().format(opts, print_state, f)?;
+                } else {
+                    Complex::new(r.to_float(), i.to_float()).format(opts, print_state, f)?;
+                }
+
                 Ok(false)
             }
-            CoefficientView::Large(r) => {
-                let rat = r.to_rat().abs();
+            CoefficientView::Large(r, i) => {
+                let real = r.to_rat();
+                let imag = i.to_rat();
+
+                let need_paren =
+                    (print_state.in_product || print_state.in_exp || print_state.in_exp_base)
+                        && (!real.is_zero() && !imag.is_zero())
+                        || print_state.in_exp_base
+                            && (real.is_negative()
+                                || imag.is_negative()
+                                || !real.is_integer()
+                                || !imag.is_integer())
+                        || print_state.in_exp && (!real.is_integer() || !imag.is_integer());
+
+                if need_paren {
+                    f.write_char('(')?;
+                }
+
                 if !opts.mode.is_latex()
                     && (opts.number_thousands_separator.is_some() || print_state.superscript)
                 {
-                    format_num(rat.numerator().to_string(), opts, &print_state, f)?;
-                    if !rat.is_integer() {
-                        f.write_char('/')?;
-                        format_num(rat.denominator().to_string(), opts, &print_state, f)?;
+                    if !real.is_zero() {
+                        if !global_negative && real.is_negative() {
+                            f.write_char('-')?;
+                        }
+
+                        format_num(
+                            real.numerator_ref().abs().to_string(),
+                            opts,
+                            &print_state,
+                            f,
+                        )?;
+                        if !real.is_integer() {
+                            f.write_char('/')?;
+                            format_num(real.denominator_ref().to_string(), opts, &print_state, f)?;
+                        }
                     }
-                } else if !rat.is_integer() {
-                    if opts.mode.is_latex() {
-                        f.write_fmt(format_args!(
-                            "\\frac{{{}}}{{{}}}",
-                            rat.numerator(),
-                            rat.denominator(),
-                        ))?;
-                    } else {
-                        f.write_fmt(format_args!(
-                            "{}/{}",
-                            rat.numerator_ref(),
-                            rat.denominator_ref()
-                        ))?;
+
+                    if !real.is_zero() && !imag.is_zero() && !imag.is_negative() {
+                        f.write_char('+')?;
+                    }
+
+                    if !imag.is_zero() {
+                        if !global_negative && imag.is_negative() {
+                            f.write_char('-')?;
+                        }
+                        format_num(
+                            imag.numerator_ref().abs().to_string(),
+                            opts,
+                            &print_state,
+                            f,
+                        )?;
+                        f.write_str(i_str)?;
+                        if !imag.is_integer() {
+                            f.write_char('/')?;
+                            format_num(imag.denominator_ref().to_string(), opts, &print_state, f)?;
+                        }
                     }
                 } else {
-                    f.write_fmt(format_args!("{}", rat.numerator_ref()))?;
+                    if !real.is_zero() || imag.is_zero() {
+                        if !global_negative && real.is_negative() {
+                            f.write_char('-')?;
+                        }
+                        if !real.is_integer() {
+                            if opts.mode.is_latex() {
+                                f.write_fmt(format_args!(
+                                    "\\frac{{{}}}{{{}}}",
+                                    real.numerator_ref().abs(),
+                                    real.denominator_ref()
+                                ))?;
+                            } else {
+                                f.write_fmt(format_args!(
+                                    "{}/{}",
+                                    real.numerator_ref().abs(),
+                                    real.denominator_ref()
+                                ))?;
+                            }
+                        } else {
+                            f.write_fmt(format_args!("{}", real.numerator_ref().abs()))?;
+                        }
+                    }
+
+                    if !real.is_zero() && !imag.is_zero() && !imag.is_negative() {
+                        f.write_char('+')?;
+                    }
+
+                    if !imag.is_zero() {
+                        if !global_negative && imag.is_negative() {
+                            f.write_char('-')?;
+                        }
+
+                        if !imag.is_integer() {
+                            if opts.mode.is_latex() {
+                                f.write_fmt(format_args!(
+                                    "\\frac{{{}}}{{{}}}𝑖",
+                                    imag.numerator_ref().abs(),
+                                    imag.denominator_ref(),
+                                ))?;
+                            } else {
+                                f.write_fmt(format_args!(
+                                    "{}{}/{}",
+                                    imag.numerator_ref().abs(),
+                                    i_str,
+                                    imag.denominator_ref()
+                                ))?;
+                            }
+                        } else {
+                            f.write_fmt(format_args!("{}{}", imag.numerator_ref().abs(), i_str))?;
+                        }
+                    }
                 }
+
+                if need_paren {
+                    f.write_char(')')?;
+                }
+
                 Ok(false)
             }
             CoefficientView::FiniteField(num, fi) => {
@@ -725,7 +915,7 @@ impl FormattedPrintMul for MulView<'_> {
         opts: &PrintOptions,
         mut print_state: PrintState,
     ) -> Result<bool, Error> {
-        let add_paren = print_state.in_exp;
+        let add_paren = print_state.in_exp || print_state.in_exp_base;
         if add_paren {
             if print_state.in_sum {
                 print_state.in_sum = false;
@@ -734,29 +924,18 @@ impl FormattedPrintMul for MulView<'_> {
 
             f.write_char('(')?;
             print_state.in_exp = false;
+            print_state.in_exp_base = false;
         }
+
+        print_state.in_product = true;
 
         // write the coefficient first
         let mut first = true;
         let mut skip_num = false;
         if let Some(AtomView::Num(n)) = self.iter().last() {
-            // write -1*x as -x
-            if n.get_coeff_view() == CoefficientView::Natural(-1, 1) {
-                if print_state.top_level_add_child
-                    && opts.mode.is_symbolica()
-                    && opts.color_top_level_sum
-                {
-                    f.write_fmt(format_args!("{}", "-".yellow()))?;
-                } else {
-                    f.write_char('-')?;
-                }
-
-                first = true;
-            } else {
-                n.fmt_output(f, opts, print_state)?;
-                first = false;
-            }
-
+            print_state.suppress_one = true;
+            first = n.fmt_output(f, opts, print_state)?;
+            print_state.suppress_one = false;
             skip_num = true;
         } else if print_state.in_sum {
             if print_state.top_level_add_child
@@ -772,6 +951,7 @@ impl FormattedPrintMul for MulView<'_> {
         print_state.top_level_add_child = false;
         print_state.level += 1;
         print_state.in_sum = false;
+
         for x in self.iter().take(if skip_num {
             self.get_nargs() - 1
         } else {
@@ -786,21 +966,7 @@ impl FormattedPrintMul for MulView<'_> {
             }
             first = false;
 
-            if let AtomView::Add(_) = x {
-                if opts.mode.is_latex() {
-                    f.write_str("\\left(")?;
-                } else {
-                    f.write_char('(')?;
-                }
-                x.format(f, opts, print_state)?;
-                if opts.mode.is_latex() {
-                    f.write_str("\\right)")?;
-                } else {
-                    f.write_char(')')?;
-                }
-            } else {
-                x.format(f, opts, print_state)?;
-            }
+            x.format(f, opts, print_state)?;
         }
 
         if add_paren {
@@ -849,6 +1015,9 @@ impl FormattedPrintFn for FunView<'_> {
         print_state.top_level_add_child = false;
         print_state.level += 1;
         print_state.in_sum = false;
+        print_state.in_product = false;
+        print_state.in_exp = false;
+        print_state.in_exp_base = false;
         print_state.suppress_one = false;
         let mut first = true;
         for x in self.iter() {
@@ -894,18 +1063,26 @@ impl FormattedPrintPow for PowView<'_> {
             }
         }
 
+        let add_paren = print_state.in_exp_base; // right associative
+        if add_paren {
+            f.write_char('(')?;
+            print_state.in_exp = false;
+            print_state.in_exp_base = false;
+        }
+
         let b = self.get_base();
         let e = self.get_exp();
 
         print_state.top_level_add_child = false;
         print_state.level += 1;
         print_state.in_sum = false;
+        print_state.in_product = false;
         print_state.suppress_one = false;
 
         let mut superscript_exponent = false;
         if opts.mode.is_latex() {
             if let AtomView::Num(n) = e {
-                if n.get_coeff_view() == CoefficientView::Natural(-1, 1) {
+                if n.get_coeff_view() == CoefficientView::Natural(-1, 1, 0, 1) {
                     // TODO: construct the numerator
                     f.write_str("\\frac{1}{")?;
                     b.format(f, opts, print_state)?;
@@ -919,38 +1096,12 @@ impl FormattedPrintPow for PowView<'_> {
             }
         }
 
-        let base_needs_parentheses =
-            matches!(b, AtomView::Add(_) | AtomView::Mul(_) | AtomView::Pow(_))
-                || if let AtomView::Num(n) = b {
-                    match n.get_coeff_view() {
-                        CoefficientView::Natural(n, d) => n < 0 || d != 1,
-                        CoefficientView::Float(_) => true, // TODO
-                        CoefficientView::Large(r) => r.is_negative() || !r.to_rat().is_integer(),
-                        CoefficientView::FiniteField(n, i) => {
-                            opts.symmetric_representation_for_finite_field
-                                && n.0 * 2 > State::get_finite_field(i).get_prime()
-                        }
-                        CoefficientView::RationalPolynomial(_) => true,
-                    }
-                } else {
-                    false
-                };
+        print_state.in_exp_base = true;
 
-        if base_needs_parentheses {
-            if opts.mode.is_latex() {
-                f.write_str("\\left(")?;
-            } else {
-                f.write_char('(')?;
-            }
-            b.format(f, opts, print_state)?;
-            if opts.mode.is_latex() {
-                f.write_str("\\right)")?;
-            } else {
-                f.write_char(')')?;
-            }
-        } else {
-            b.format(f, opts, print_state)?;
-        }
+        b.format(f, opts, print_state)?;
+
+        print_state.in_exp_base = false;
+        print_state.in_exp = true;
 
         if !superscript_exponent {
             if opts.mode.is_sympy()
@@ -964,24 +1115,20 @@ impl FormattedPrintPow for PowView<'_> {
 
         if opts.mode.is_latex() {
             f.write_char('{')?;
+            print_state.in_exp = false;
             e.format(f, opts, print_state)?;
             f.write_char('}')?;
         } else {
-            let exp_needs_parentheses = matches!(e, AtomView::Add(_) | AtomView::Mul(_))
-                || if let AtomView::Num(n) = e {
-                    !n.get_coeff_view().is_integer()
-                } else {
-                    false
-                };
-
-            if exp_needs_parentheses {
-                f.write_char('(')?;
-                e.format(f, opts, print_state)?;
-                f.write_char(')')?;
-            } else {
-                print_state.superscript = superscript_exponent;
-                e.format(f, opts, print_state)?;
+            if superscript_exponent {
+                print_state.in_exp = false;
+                print_state.superscript = true;
             }
+
+            e.format(f, opts, print_state)?;
+        }
+
+        if add_paren {
+            f.write_char(')')?;
         }
 
         Ok(false)
@@ -1004,7 +1151,7 @@ impl FormattedPrintAdd for AddView<'_> {
         print_state.level += 1;
         print_state.suppress_one = false;
 
-        let add_paren = print_state.in_product || print_state.in_exp;
+        let add_paren = print_state.in_product || print_state.in_exp || print_state.in_exp_base;
         if add_paren {
             if print_state.in_sum {
                 if opts.mode.is_symbolica()
@@ -1020,7 +1167,13 @@ impl FormattedPrintAdd for AddView<'_> {
             print_state.in_sum = false;
             print_state.in_product = false;
             print_state.in_exp = false;
-            f.write_char('(')?;
+            print_state.in_exp_base = false;
+
+            if opts.mode.is_latex() {
+                f.write_str("\\left(")?;
+            } else {
+                f.write_char('(')?;
+            }
         }
 
         let mut count = 0;
@@ -1056,7 +1209,11 @@ impl FormattedPrintAdd for AddView<'_> {
         }
 
         if add_paren {
-            f.write_char(')')?;
+            if opts.mode.is_latex() {
+                f.write_str("\\right)")?;
+            } else {
+                f.write_char(')')?;
+            }
         }
         Ok(false)
     }
@@ -1080,7 +1237,7 @@ mod test {
 
     #[test]
     fn atoms() {
-        let a = parse!("f(x,y^2)^(x+z)/5+3").unwrap();
+        let a = parse!("f(x,y^2)^(x+z)/5+3");
 
         if ShouldColorize::from_env().should_colorize() {
             assert_eq!(
@@ -1110,7 +1267,7 @@ mod test {
             "1/5 f[x,y^2]^(x+z)+3"
         );
 
-        let a = parse!("8127389217 x^2").unwrap();
+        let a = parse!("8127389217 x^2");
         assert_eq!(
             format!(
                 "{}",
@@ -1130,9 +1287,7 @@ mod test {
 
     #[test]
     fn polynomials() {
-        let a = parse!("15 x^2")
-            .unwrap()
-            .to_polynomial::<_, u8>(&Zp::new(17), None);
+        let a = parse!("15 x^2").to_polynomial::<_, u8>(&Zp::new(17), None);
 
         let mut s = String::new();
         a.format(
@@ -1151,21 +1306,16 @@ mod test {
 
     #[test]
     fn rational_polynomials() {
-        let a = parse!("15 x^2 / (1+x)")
-            .unwrap()
-            .to_rational_polynomial::<_, _, u8>(&Z, &Z, None);
+        let a = parse!("15 x^2 / (1+x)").to_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert_eq!(format!("{}", a), "15*x^2/(1+x)");
 
-        let a = parse!("(15 x^2 + 6) / (1+x)")
-            .unwrap()
-            .to_rational_polynomial::<_, _, u8>(&Z, &Z, None);
+        let a = parse!("(15 x^2 + 6) / (1+x)").to_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert_eq!(format!("{}", a), "(6+15*x^2)/(1+x)");
     }
 
     #[test]
     fn factorized_rational_polynomials() {
         let a = parse!("15 x^2 / ((1+x)(x+2))")
-            .unwrap()
             .to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert!(
             format!("{}", a) == "15*x^2/((1+x)*(2+x))"
@@ -1173,27 +1323,22 @@ mod test {
         );
 
         let a = parse!("(15 x^2 + 6) / ((1+x)(x+2))")
-            .unwrap()
             .to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert!(
             format!("{}", a) == "3*(2+5*x^2)/((1+x)*(2+x))"
                 || format!("{}", a) == "3*(2+5*x^2)/((2+x)*(1+x))"
         );
 
-        let a = parse!("1/(v1*v2)")
-            .unwrap()
-            .to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
+        let a = parse!("1/(v1*v2)").to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert!(format!("{}", a) == "1/(v1*v2)" || format!("{}", a) == "1/(v2*v1)");
 
-        let a = parse!("-1/(2+v1)")
-            .unwrap()
-            .to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
+        let a = parse!("-1/(2+v1)").to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert!(format!("{}", a) == "-1/(2+v1)");
     }
 
     #[test]
     fn base_parentheses() {
-        let a = parse!("(-1)^(x+1)-(1/2)^x").unwrap();
+        let a = parse!("(-1)^(x+1)-(1/2)^x");
         assert_eq!(
             format!(
                 "{}",
@@ -1205,14 +1350,13 @@ mod test {
 
     #[test]
     fn canon() {
-        let _ = symbol!("canon_f"; Symmetric).unwrap();
+        let _ = symbol!("canon_f"; Symmetric);
         let _ = symbol!("canon_y");
         let _ = symbol!("canon_x");
 
         let a = parse!(
             "canon_x^2 + 2*canon_x*canon_y + canon_y^2*(canon_x+canon_y) + canon_f(canon_x,canon_y)"
-        )
-        .unwrap();
+        );
         assert_eq!(
             a.to_canonical_string(),
             "(symbolica::canon_x+symbolica::canon_y)*symbolica::canon_y^2+2*symbolica::canon_x*symbolica::canon_y+symbolica::canon_f(symbolica::canon_x,symbolica::canon_y)+symbolica::canon_x^2"
@@ -1243,10 +1387,9 @@ mod test {
             }
 
             Some(fmt)
-        })
-        .unwrap();
+        });
 
-        let e = crate::parse!("mu^2 + mu(1) + mu(1,2)").unwrap();
+        let e = crate::parse!("mu^2 + mu(1) + mu(1,2)");
         let s = format!("{}", e.printer(PrintOptions::latex()));
         assert_eq!(s, "\\mu^{2}+\\mu_{1}+\\mu_{1,2}");
     }

@@ -167,7 +167,7 @@ impl bincode::Encode for Symbol {
         &self,
         encoder: &mut E,
     ) -> Result<(), bincode::error::EncodeError> {
-        Atom::new_var(*self).encode(encoder)
+        Atom::var(*self).encode(encoder)
     }
 }
 
@@ -1952,6 +1952,15 @@ impl<'a> ListSlice<'a> {
             data: view.get_data(),
             length: 1,
             slice_type: SliceType::One,
+        }
+    }
+
+    #[inline]
+    pub fn empty() -> Self {
+        ListSlice {
+            data: &[],
+            length: 0,
+            slice_type: SliceType::Empty,
         }
     }
 

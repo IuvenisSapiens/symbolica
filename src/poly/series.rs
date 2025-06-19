@@ -5,13 +5,13 @@
 //! use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
 //!
 //! let x = symbol!("x");
-//! let a = parse!("(1-cos(x))/sin(x)").unwrap();
+//! let a = parse!("(1-cos(x))/sin(x)");
 //!
 //! let out = a
-//!     .series(x, Atom::new_num(0), 4.into(), true)
+//!     .series(x, Atom::num(0), 4.into(), true)
 //!     .unwrap();
 //! println!("{}", out);
-//! assert_eq!(out.to_atom(), parse!("1/2*x+1/24*x^3").unwrap());
+//! assert_eq!(out.to_atom(), parse!("1/2*x+1/24*x^3"));
 //! ```
 use core::panic;
 use std::{
@@ -45,13 +45,13 @@ use super::Variable;
 /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
 ///
 /// let x = symbol!("x");
-/// let a = parse!("(1-cos(x))/sin(x)").unwrap();
+/// let a = parse!("(1-cos(x))/sin(x)");
 ///
 /// let out = a
-///     .series(x, Atom::new_num(0), 4.into(), true)
+///     .series(x, Atom::num(0), 4.into(), true)
 ///     .unwrap();
 /// println!("{}", out);
-/// assert_eq!(out.to_atom(), parse!("1/2*x+1/24*x^3").unwrap());
+/// assert_eq!(out.to_atom(), parse!("1/2*x+1/24*x^3"));
 /// ```
 #[derive(Clone)]
 pub struct Series<F: Ring> {
@@ -501,6 +501,30 @@ impl<F: Ring> Series<F> {
 
         self
     }
+
+    /// Get the coefficient of the series at a given exponent.
+    pub fn coefficient(&self, exponent: Rational) -> F::Element {
+        let r = exponent * &Rational::from(self.ramification as i64);
+        if !r.is_integer() {
+            return self.field.zero();
+        }
+
+        let i = r.numerator().to_i64().unwrap() - self.shift as i64;
+
+        if i >= 0 && i < self.coefficients.len() as i64 {
+            self.coefficients[i as usize].clone()
+        } else {
+            self.field.zero()
+        }
+    }
+
+    /// Iterate over the terms of the series, yielding the exponent and its coefficient.
+    pub fn terms(&self) -> impl Iterator<Item = (Rational, &F::Element)> {
+        self.coefficients
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (self.get_exponent(i), c))
+    }
 }
 
 impl<F: Ring> SelfRing for Series<F> {
@@ -532,13 +556,13 @@ impl<F: Ring> SelfRing for Series<F> {
                 write!(f, "\\mathcal{{O}}\\left({}^{{{}}}\\right)", v, o)?;
             } else {
                 write!(f, "𝒪({}^", v)?;
-                Q.format(&o, opts, state.step(false, false, true), f)?;
+                Q.format(&o, opts, state.step(false, false, true, false), f)?;
                 f.write_char(')')?;
             }
             return Ok(false);
         }
 
-        let add_paren = state.in_product || state.in_exp;
+        let add_paren = state.in_product || state.in_exp || state.in_exp_base;
         if add_paren {
             if state.in_sum {
                 f.write_str("+")?;
@@ -547,6 +571,7 @@ impl<F: Ring> SelfRing for Series<F> {
 
             state.in_product = false;
             state.in_exp = false;
+            state.in_exp_base = false;
             f.write_str("(")?;
         }
         let in_product = state.in_product;
@@ -563,7 +588,7 @@ impl<F: Ring> SelfRing for Series<F> {
             let suppressed_one = self.field.format(
                 c,
                 opts,
-                state.step(state.in_sum, state.in_product, false),
+                state.step(state.in_sum, state.in_product, false, false),
                 f,
             )?;
 
@@ -581,7 +606,7 @@ impl<F: Ring> SelfRing for Series<F> {
                     f.write_char('{')?;
                 }
 
-                Q.format(&e, opts, state.step(false, false, true), f)?;
+                Q.format(&e, opts, state.step(false, false, true, false), f)?;
 
                 if opts.mode.is_latex() {
                     f.write_char('}')?;
@@ -597,7 +622,7 @@ impl<F: Ring> SelfRing for Series<F> {
             write!(f, "+\\mathcal{{O}}\\left({}^{{{}}}\\right)", v, o)?;
         } else {
             write!(f, "+𝒪({}^", v)?;
-            Q.format(&o, opts, state.step(false, false, true), f)?;
+            Q.format(&o, opts, state.step(false, false, true, false), f)?;
             f.write_char(')')?;
         }
 
@@ -911,10 +936,14 @@ impl Series<AtomField> {
 
                 if b == s {
                     if let AtomView::Num(n) = exp {
-                        if let CoefficientView::Natural(n, d) = n.get_coeff_view() {
-                            Ok(self.monomial(self.field.one(), (n, d).into()))
+                        if let CoefficientView::Natural(n, d, ni, _di) = n.get_coeff_view() {
+                            if ni == 0 {
+                                Ok(self.monomial(self.field.one(), (n, d).into()))
+                            } else {
+                                Err("Cannot series expand with complex exponent")
+                            }
                         } else {
-                            unimplemented!("Cannot series expand with large exponents yet")
+                            Err("Cannot series expand with large exponents yet")
                         }
                     } else {
                         Err("Power of variable must be rational")
@@ -972,7 +1001,7 @@ impl Series<AtomField> {
         for i in 1..=self.order {
             let s = sp
                 .clone()
-                .div_coeff(&Atom::new_num(Integer::factorial(i as u32)));
+                .div_coeff(&Atom::num(Integer::factorial(i as u32)));
 
             sp = sp * &p;
 
@@ -1000,7 +1029,7 @@ impl Series<AtomField> {
         let mut e = self.constant(FunctionBuilder::new(Atom::LOG).add_arg(&c).finish());
         let mut sp = p.clone();
         for i in 1..=self.order {
-            let s = sp.clone().div_coeff(&Atom::new_num(i as i64));
+            let s = sp.clone().div_coeff(&Atom::num(i as i64));
 
             sp = sp * &p;
 
@@ -1059,7 +1088,7 @@ impl Series<AtomField> {
             let s = sp
                 .clone()
                 .mul_coeff(&b)
-                .div_coeff(&Atom::new_num(Integer::factorial(i as u32)));
+                .div_coeff(&Atom::num(Integer::factorial(i as u32)));
 
             sp = sp * &p;
 
@@ -1115,7 +1144,7 @@ impl Series<AtomField> {
             let s = sp
                 .clone()
                 .mul_coeff(&b)
-                .div_coeff(&Atom::new_num(Integer::factorial(i as u32)));
+                .div_coeff(&Atom::num(Integer::factorial(i as u32)));
 
             sp = sp * &p;
 
@@ -1165,8 +1194,8 @@ impl Series<AtomField> {
 
             let p = x
                 .clone()
-                .mul_coeff(&Atom::new_num(num.clone()))
-                .div_coeff(&Atom::new_num(Integer::factorial(i as u32)));
+                .mul_coeff(&Atom::num(num.clone()))
+                .div_coeff(&Atom::num(Integer::factorial(i as u32)));
 
             r = r + p;
         }

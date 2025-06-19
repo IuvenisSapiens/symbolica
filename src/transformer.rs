@@ -200,6 +200,7 @@ pub enum Transformer {
     CollectFactors,
     /// Collect numbers.
     CollectNum,
+    Conjugate,
     /// Apply find-and-replace on the lhs.
     ReplaceAll(
         Pattern,
@@ -260,6 +261,7 @@ impl std::fmt::Debug for Transformer {
                 .field(b)
                 .finish(),
             Transformer::CollectNum => f.debug_tuple("CollectNum").finish(),
+            Transformer::Conjugate => f.debug_tuple("Conjugate").finish(),
             Transformer::ReplaceAll(pat, rhs, ..) => {
                 f.debug_tuple("ReplaceAll").field(pat).field(rhs).finish()
             }
@@ -497,7 +499,7 @@ impl Transformer {
         state: &TransformerState,
     ) -> Result<Atom, TransformerError> {
         let mut a = Atom::new();
-        Workspace::get_local().with(|ws| {
+        let _ = Workspace::get_local().with(|ws| {
             Transformer::execute_chain(input, std::slice::from_ref(self), ws, state, &mut a)
         })?;
         Ok(a)
@@ -547,7 +549,7 @@ impl Transformer {
                     }
                 }
                 Transformer::IfChanged(cond, t1, t2) => {
-                    Transformer::execute_chain(cur_input, cond, workspace, state, out)?;
+                    let _ = Transformer::execute_chain(cur_input, cond, workspace, state, out)?;
                     std::mem::swap(out, &mut tmp);
 
                     if tmp.as_view() != out.as_view() {
@@ -575,7 +577,7 @@ impl Transformer {
                             |arg| {
                                 Workspace::get_local().with(|ws| {
                                     let mut a = Atom::new();
-                                    Self::execute_chain(arg, t, ws, state, &mut a).unwrap();
+                                    let _ = Self::execute_chain(arg, t, ws, state, &mut a).unwrap();
                                     a
                                 })
                             },
@@ -585,7 +587,7 @@ impl Transformer {
                         *out = cur_input.map_terms_single_core(|arg| {
                             Workspace::get_local().with(|ws| {
                                 let mut a = Atom::new();
-                                Self::execute_chain(arg, t, ws, state, &mut a).unwrap();
+                                let _ = Self::execute_chain(arg, t, ws, state, &mut a).unwrap();
                                 a
                             })
                         })
@@ -599,7 +601,7 @@ impl Transformer {
 
                             let mut a = workspace.new_atom();
                             for arg in f {
-                                Self::execute_chain(arg, t, workspace, state, &mut a)?;
+                                let _ = Self::execute_chain(arg, t, workspace, state, &mut a)?;
                                 ff.add_arg(a.as_view());
                             }
 
@@ -608,7 +610,7 @@ impl Transformer {
                         }
                     }
 
-                    Self::execute_chain(cur_input, t, workspace, state, out)?;
+                    let _ = Self::execute_chain(cur_input, t, workspace, state, out);
                 }
                 Transformer::Expand(s, via_poly) => {
                     if *via_poly {
@@ -638,7 +640,8 @@ impl Transformer {
                             let state = state.clone();
                             Some(Box::new(move |i, o| {
                                 Workspace::get_local().with(|ws| {
-                                    Self::execute_chain(i, &key_map, ws, &state, o).unwrap()
+                                    let _ =
+                                        Self::execute_chain(i, &key_map, ws, &state, o).unwrap();
                                 });
                             }))
                         },
@@ -649,7 +652,8 @@ impl Transformer {
                             let state = state.clone();
                             Some(Box::new(move |i, o| {
                                 Workspace::get_local().with(|ws| {
-                                    Self::execute_chain(i, &coeff_map, ws, &state, o).unwrap()
+                                    let _ =
+                                        Self::execute_chain(i, &coeff_map, ws, &state, o).unwrap();
                                 });
                             }))
                         },
@@ -664,7 +668,7 @@ impl Transformer {
                             let key_map = key_map.clone();
                             let state = state.clone();
                             Some(Box::new(move |i, o| {
-                                Workspace::get_local().with(|ws| {
+                                let _ = Workspace::get_local().with(|ws| {
                                     Self::execute_chain(i, &key_map, ws, &state, o).unwrap()
                                 });
                             }))
@@ -675,7 +679,7 @@ impl Transformer {
                             let coeff_map = coeff_map.clone();
                             let state = state.clone();
                             Some(Box::new(move |i, o| {
-                                Workspace::get_local().with(|ws| {
+                                let _ = Workspace::get_local().with(|ws| {
                                     Self::execute_chain(i, &coeff_map, ws, &state, o).unwrap()
                                 });
                             }))
@@ -687,6 +691,9 @@ impl Transformer {
                 }
                 Transformer::CollectNum => {
                     *out = cur_input.collect_num();
+                }
+                Transformer::Conjugate => {
+                    *out = cur_input.conjugate();
                 }
                 Transformer::Series(x, expansion_point, depth, depth_is_absolute) => {
                     if let Ok(s) = cur_input.series(
@@ -957,7 +964,9 @@ impl Transformer {
                     std::mem::swap(out, &mut tmp);
                 }
                 Transformer::Repeat(r) => loop {
-                    Self::execute_chain(tmp.as_view(), r, workspace, state, out)?;
+                    if Self::execute_chain(tmp.as_view(), r, workspace, state, out)?.is_break() {
+                        break;
+                    }
 
                     if tmp.as_view() == out.as_view() {
                         break;
@@ -975,7 +984,9 @@ impl Transformer {
                         .unwrap_or(std::time::Duration::from_secs(0));
 
                     let t = Instant::now();
-                    Self::execute_chain(cur_input, r, workspace, state, out)?;
+                    if Self::execute_chain(cur_input, r, workspace, state, out)?.is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
                     let dt = t.elapsed();
 
                     if let Some(stats_export) = &state.stats_export {
@@ -1021,14 +1032,14 @@ mod test {
 
     #[test]
     fn expand_derivative() {
-        let p = parse!("(1+v1)^2").unwrap();
+        let p = parse!("(1+v1)^2");
 
         let mut out = Atom::new();
-        Workspace::get_local().with(|ws| {
+        let _ = Workspace::get_local().with(|ws| {
             Transformer::execute_chain(
                 p.as_view(),
                 &[
-                    Transformer::Expand(Some(Atom::new_var(symbol!("v1"))), false),
+                    Transformer::Expand(Some(Atom::var(symbol!("v1"))), false),
                     Transformer::Derivative(symbol!("v1")),
                 ],
                 ws,
@@ -1038,16 +1049,16 @@ mod test {
             .unwrap()
         });
 
-        let r = parse!("2+2*v1").unwrap();
+        let r = parse!("2+2*v1");
         assert_eq!(out, r);
     }
 
     #[test]
     fn split_argcount() {
-        let p = parse!("v1+v2+v3").unwrap();
+        let p = parse!("v1+v2+v3");
 
         let mut out = Atom::new();
-        Workspace::get_local().with(|ws| {
+        let _ = Workspace::get_local().with(|ws| {
             Transformer::execute_chain(
                 p.as_view(),
                 &[Transformer::Split, Transformer::ArgCount(true)],
@@ -1058,21 +1069,21 @@ mod test {
             .unwrap()
         });
 
-        let r = parse!("3").unwrap();
+        let r = parse!("3");
         assert_eq!(out, r);
     }
 
     #[test]
     fn product_series() {
-        let p = parse!("arg(v1,v1+1,3)").unwrap();
+        let p = parse!("arg(v1,v1+1,3)");
 
         let mut out = Atom::new();
-        Workspace::get_local().with(|ws| {
+        let _ = Workspace::get_local().with(|ws| {
             Transformer::execute_chain(
                 p.as_view(),
                 &[
                     Transformer::Product,
-                    Transformer::Series(symbol!("v1"), Atom::new_num(1), 3.into(), true),
+                    Transformer::Series(symbol!("v1"), Atom::num(1), 3.into(), true),
                 ],
                 ws,
                 &TransformerState::default(),
@@ -1081,22 +1092,22 @@ mod test {
             .unwrap()
         });
 
-        let r = parse!("3*(v1-1)^2+9*(v1-1)+6").unwrap();
+        let r = parse!("3*(v1-1)^2+9*(v1-1)+6");
         assert_eq!(out, r);
     }
 
     #[test]
     fn sort_deduplicate() {
-        let p = parse!("f1(3,2,1,3)").unwrap();
+        let p = parse!("f1(3,2,1,3)");
 
         let mut out = Atom::new();
-        Workspace::get_local().with(|ws| {
+        let _ = Workspace::get_local().with(|ws| {
             Transformer::execute_chain(
                 p.as_view(),
                 &[
                     Transformer::ReplaceAll(
-                        parse!("f1(x__)").unwrap().to_pattern(),
-                        parse!("x__").unwrap().to_pattern().into(),
+                        parse!("f1(x__)").to_pattern(),
+                        parse!("x__").to_pattern().into(),
                         Condition::default(),
                         MatchSettings::default(),
                     ),
@@ -1116,16 +1127,16 @@ mod test {
             .unwrap()
         });
 
-        let r = parse!("f1(1,2,3)").unwrap();
+        let r = parse!("f1(1,2,3)");
         assert_eq!(out, r);
     }
 
     #[test]
     fn deep_nesting() {
-        let p = parse!("arg(3,2,1,3)").unwrap();
+        let p = parse!("arg(3,2,1,3)");
 
         let mut out = Atom::new();
-        Workspace::get_local().with(|ws| {
+        let _ = Workspace::get_local().with(|ws| {
             Transformer::execute_chain(
                 p.as_view(),
                 &[Transformer::Repeat(vec![Transformer::Stats(
@@ -1137,12 +1148,12 @@ mod test {
                     vec![Transformer::ForEach(vec![
                         Transformer::Print(PrintOptions::default()),
                         Transformer::ReplaceAll(
-                            parse!("x_").unwrap().to_pattern(),
-                            parse!("x_-1").unwrap().to_pattern().into(),
+                            parse!("x_").to_pattern(),
+                            parse!("x_-1").to_pattern().into(),
                             (
                                 symbol!("x_"),
                                 WildcardRestriction::Filter(Box::new(|x| {
-                                    x != &Match::Single(Atom::new_num(0).as_view())
+                                    x != &Match::Single(Atom::num(0).as_view())
                                 })),
                             )
                                 .into(),
@@ -1157,30 +1168,29 @@ mod test {
             .unwrap()
         });
 
-        let r = parse!("arg(0,0,0,0)").unwrap();
+        let r = parse!("arg(0,0,0,0)");
         assert_eq!(out, r);
     }
 
     #[test]
     fn linearize() {
-        let p = parse!("f1(v1+v2,4*v3*v4+3*v4/v3)").unwrap();
+        let p = parse!("f1(v1+v2,4*v3*v4+3*v4/v3)");
 
         let out = Transformer::Linearize(Some(vec![symbol!("v3")]))
             .execute(p.as_view())
             .unwrap();
 
-        let r =
-            parse!("4*v3*f1(v1,v4)+4*v3*f1(v2,v4)+3*v3^-1*f1(v1,v4)+3*v3^-1*f1(v2,v4)").unwrap();
+        let r = parse!("4*v3*f1(v1,v4)+4*v3*f1(v2,v4)+3*v3^-1*f1(v1,v4)+3*v3^-1*f1(v2,v4)");
         assert_eq!(out, r);
     }
 
     #[test]
     fn cycle_symmetrize() {
-        let p = parse!("f1(1,2,3,5,1,2,3,4)").unwrap();
+        let p = parse!("f1(1,2,3,5,1,2,3,4)");
 
         let out = Transformer::CycleSymmetrize.execute(p.as_view()).unwrap();
 
-        let r = parse!("f1(1,2,3,4,1,2,3,5)").unwrap();
+        let r = parse!("f1(1,2,3,4,1,2,3,5)");
         assert_eq!(out, r);
     }
 }

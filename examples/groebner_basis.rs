@@ -2,7 +2,7 @@ use symbolica::{
     atom::AtomCore,
     domains::finite_field::Zp,
     parse,
-    poly::{groebner::GroebnerBasis, polynomial::MultivariatePolynomial, GrevLexOrder},
+    poly::{GrevLexOrder, groebner::GroebnerBasis, polynomial::MultivariatePolynomial},
     symbol,
 };
 
@@ -22,7 +22,7 @@ fn main() {
     let ideal: Vec<MultivariatePolynomial<_, u16>> = polys
         .iter()
         .map(|x| {
-            let a = parse!(x).unwrap().expand();
+            let a = parse!(x).expand();
             a.to_polynomial(&Zp::new(13), None)
         })
         .collect();

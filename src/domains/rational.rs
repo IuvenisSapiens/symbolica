@@ -7,17 +7,17 @@ use std::{
 };
 
 use crate::{
-    poly::{polynomial::PolynomialRing, Exponent},
+    poly::{Exponent, polynomial::PolynomialRing},
     printer::{PrintOptions, PrintState},
 };
 
 use super::{
+    EuclideanDomain, Field, InternalOrdering, Ring, SelfRing, UpgradeToField,
     finite_field::{
         FiniteField, FiniteFieldCore, FiniteFieldWorkspace, PrimeIteratorU64, ToFiniteField, Two,
-        Zp, Z2,
+        Z2, Zp,
     },
     integer::{Integer, IntegerRing, Z},
-    EuclideanDomain, Field, InternalOrdering, Ring, SelfRing, UpgradeToField,
 };
 
 /// The field of rational numbers.
@@ -94,11 +94,7 @@ pub trait FractionNormalization: Ring {
 
 impl FractionNormalization for Z {
     fn get_normalization_factor(&self, a: &Integer) -> Integer {
-        if *a < 0 {
-            (-1).into()
-        } else {
-            1.into()
-        }
+        if *a < 0 { (-1).into() } else { 1.into() }
     }
 }
 
@@ -389,7 +385,7 @@ impl<R: EuclideanDomain + FractionNormalization> Ring for FractionField<R> {
     ) -> Result<bool, Error> {
         let has_denom = !self.ring.is_one(&element.denominator);
 
-        let write_par = has_denom && state.in_exp;
+        let write_par = has_denom && (state.in_exp || state.in_exp_base);
         if write_par {
             if state.in_sum {
                 state.in_sum = false;
@@ -398,6 +394,7 @@ impl<R: EuclideanDomain + FractionNormalization> Ring for FractionField<R> {
 
             f.write_char('(')?;
             state.in_exp = false;
+            state.in_exp_base = false;
         }
 
         if self.ring.format(
@@ -416,8 +413,12 @@ impl<R: EuclideanDomain + FractionNormalization> Ring for FractionField<R> {
 
         if has_denom {
             f.write_char('/')?;
-            self.ring
-                .format(&element.denominator, opts, state.step(false, true, true), f)?;
+            self.ring.format(
+                &element.denominator,
+                opts,
+                state.step(false, true, false, true),
+                f,
+            )?;
         }
 
         if write_par {
@@ -448,7 +449,7 @@ where
     ) -> Result<bool, Error> {
         let has_denom = !self.denominator.is_one();
 
-        let write_par = has_denom && state.in_exp;
+        let write_par = has_denom && (state.in_exp || state.in_exp_base);
         if write_par {
             if state.in_sum {
                 state.in_sum = false;
@@ -457,6 +458,7 @@ where
 
             f.write_char('(')?;
             state.in_exp = false;
+            state.in_exp_base = false;
         }
 
         if self.numerator.format(
@@ -475,7 +477,7 @@ where
         if has_denom {
             f.write_char('/')?;
             self.denominator
-                .format(opts, state.step(false, true, true), f)?;
+                .format(opts, state.step(false, true, false, true), f)?;
         }
 
         if write_par {
@@ -687,6 +689,10 @@ impl ToFiniteField<Two> for Rational {
 }
 
 impl Rational {
+    pub fn new<T: Into<Integer>>(num: T, den: T) -> Rational {
+        Q.to_element(num.into(), den.into(), true)
+    }
+
     pub fn from_unchecked<T: Into<Integer>>(num: T, den: T) -> Rational {
         Q.to_element(num.into(), den.into(), false)
     }
@@ -797,11 +803,7 @@ impl Rational {
             bound1
         };
 
-        if self.is_negative() {
-            res.neg()
-        } else {
-            res
-        }
+        if self.is_negative() { res.neg() } else { res }
     }
 
     /// Round the rational to the one with the smallest numerator or denominator in the interval
@@ -1218,9 +1220,9 @@ mod test {
     use crate::{
         atom::AtomCore,
         domains::{
-            integer::Z,
-            rational::{FractionField, Rational, Q},
             Field, Ring,
+            integer::Z,
+            rational::{FractionField, Q, Rational},
         },
         parse,
         poly::polynomial::PolynomialRing,
@@ -1263,9 +1265,7 @@ mod test {
 
     #[test]
     fn fraction_poly() {
-        let poly = parse!("-3/2*x^2+1/5x+4")
-            .unwrap()
-            .to_polynomial::<_, u8>(&Q, None);
+        let poly = parse!("-3/2*x^2+1/5x+4").to_polynomial::<_, u8>(&Q, None);
 
         let f = FractionField::new(Z);
         let poly2 = poly.map_coeff(
@@ -1281,12 +1281,8 @@ mod test {
         let c = f.add(&rat, &b);
         let d = f.div(&c, &rat);
 
-        let num = parse!("-10-2*x+15*x^2")
-            .unwrap()
-            .to_polynomial::<_, u8>(&Z, None);
-        let den = parse!("-40-2*x+15*x^2")
-            .unwrap()
-            .to_polynomial::<_, u8>(&Z, None);
+        let num = parse!("-10-2*x+15*x^2").to_polynomial::<_, u8>(&Z, None);
+        let den = parse!("-40-2*x+15*x^2").to_polynomial::<_, u8>(&Z, None);
 
         assert_eq!(d, f.to_element(num, den, false));
     }

@@ -864,8 +864,10 @@ impl Variable<Rational> {
                         if f.get_nargs() == 1 {
                             if let Some(a) = f.iter().next() {
                                 if let AtomView::Num(n) = a {
-                                    if let CoefficientView::Natural(n, d) = n.get_coeff_view() {
-                                        if d == 1 && n >= 0 {
+                                    if let CoefficientView::Natural(n, d, ni, _di) =
+                                        n.get_coeff_view()
+                                    {
+                                        if d == 1 && ni == 0 && n >= 0 {
                                             return format!("{}[{}]", f.get_symbol(), a);
                                         }
                                     }
@@ -1670,7 +1672,7 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
                             None
                         }
                     } else if let super::Variable::Symbol(i) = x {
-                        if [Atom::E, Atom::I, Atom::PI].contains(i) {
+                        if [Atom::E, Atom::PI].contains(i) {
                             None
                         } else {
                             Some(format!("T {}", x))
@@ -1846,7 +1848,7 @@ impl ExpressionEvaluator {
                                 None
                             }
                         } else if let super::Variable::Symbol(i) = x {
-                            if [Atom::E, Atom::I, Atom::PI].contains(i) {
+                            if [Atom::E, Atom::PI].contains(i) {
                                 None
                             } else {
                                 Some(x.clone())
@@ -2016,7 +2018,7 @@ a0^2*a2*b2^2*b3^3-2*a0^2*a2*b1*b3^4-a0^2*a1*b2*b3^4+a0^3*b3^5";
 
     #[test]
     fn res_53() {
-        let poly: MultivariatePolynomial<_, u8> = parse!(RES_53).unwrap().to_polynomial(&Q, None);
+        let poly: MultivariatePolynomial<_, u8> = parse!(RES_53).to_polynomial(&Q, None);
 
         let (h, _ops, scheme) = poly.optimize_horner_scheme(1000);
         let mut i = h.to_instr(poly.nvars());

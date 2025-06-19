@@ -237,7 +237,7 @@ impl<R: Ring, E: PositiveExponent> SelfRing for RationalPolynomial<R, E> {
         if self.denominator.is_one() {
             self.numerator.format(opts, state, f)
         } else {
-            let write_par = state.in_exp;
+            let write_par = state.in_exp || state.in_exp_base;
             if write_par {
                 if state.in_sum {
                     state.in_sum = false;
@@ -246,6 +246,7 @@ impl<R: Ring, E: PositiveExponent> SelfRing for RationalPolynomial<R, E> {
 
                 f.write_char('(')?;
                 state.in_exp = false;
+                state.in_exp_base = false;
             }
 
             if opts.mode.is_latex() {
@@ -260,10 +261,10 @@ impl<R: Ring, E: PositiveExponent> SelfRing for RationalPolynomial<R, E> {
             } else {
                 state.suppress_one = false;
                 self.numerator
-                    .format(opts, state.step(state.in_sum, true, false), f)?;
+                    .format(opts, state.step(state.in_sum, true, false, false), f)?;
                 f.write_char('/')?;
                 self.denominator
-                    .format(opts, state.step(false, false, true), f)?;
+                    .format(opts, state.step(false, false, false, true), f)?;
             }
 
             if write_par {
@@ -1436,18 +1437,19 @@ mod test {
 
     #[test]
     fn hermite_reduction() {
-        let p: RationalPolynomial<_, _> = parse!("1/(v1 + 1)^5")
-            .unwrap()
-            .to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
+        let p: RationalPolynomial<_, _> =
+            parse!("1/(v1 + 1)^5").to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
 
         let (r, l) = p.integrate(0);
 
         assert_eq!(
             r,
             vec![
-                parse!("-1/(4+16*v1+24*v1^2+16*v1^3+4*v1^4)")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+                parse!("-1/(4+16*v1+24*v1^2+16*v1^3+4*v1^4)").to_rational_polynomial::<_, _, u8>(
+                    &Q,
+                    &Z,
+                    r[0].get_variables().clone()
+                )
             ]
         );
         assert_eq!(l, vec![]);
@@ -1456,7 +1458,6 @@ mod test {
     #[test]
     fn constant() {
         let p: RationalPolynomial<_, _> = parse!("(v1^4+v2+v1*v2+2*v1)/(v2 + 1)")
-            .unwrap()
             .to_rational_polynomial::<_, _, u8>(
                 &Q,
                 &Z,
@@ -1468,7 +1469,6 @@ mod test {
             r,
             vec![
                 parse!("(10*v1*v2+10*v1^2+5*v1^2*v2+2*v1^5)/(10+10*v2)")
-                    .unwrap()
                     .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
             ]
         );
@@ -1478,7 +1478,6 @@ mod test {
     #[test]
     fn mixed_denominator() {
         let p: RationalPolynomial<_, _> = parse!("(v1^4+v2+v1*v2+2*v1)/(v1)/(v2 + 1)")
-            .unwrap()
             .to_rational_polynomial::<_, _, u8>(
                 &Q,
                 &Z,
@@ -1492,20 +1491,18 @@ mod test {
         assert_eq!(
             r,
             vec![
-                parse!("(8*v1+4*v1*v2+v1^4)/(4+4*v2)")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+                parse!("(8*v1+4*v1*v2+v1^4)/(4+4*v2)").to_rational_polynomial::<_, _, u8>(
+                    &Q,
+                    &Z,
+                    r[0].get_variables().clone()
+                )
             ]
         );
         assert_eq!(
             l,
             vec![(
-                parse!("v2/(1+v2)")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                parse!("v1")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                parse!("v2/(1+v2)").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                parse!("v1").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
             ),]
         );
     }
@@ -1514,7 +1511,6 @@ mod test {
     fn three_factors() {
         let p: RationalPolynomial<_, _> =
             parse!("(36v1^2+1167v1+3549/2)/(v1^3+23/30v1^2-2/15v1-2/15)")
-                .unwrap()
                 .to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
 
         let (r, l) = p.integrate(0);
@@ -1526,28 +1522,16 @@ mod test {
             l,
             vec![
                 (
-                    parse!("-8000")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("(1+2*v1)/2")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("-8000").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("(1+2*v1)/2").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 ),
                 (
-                    parse!("91125/16")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("(2+3*v1)/3")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("91125/16").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("(2+3*v1)/3").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 ),
                 (
-                    parse!("37451/16")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("(-2+5*v1)/5")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("37451/16").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("(-2+5*v1)/5").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 )
             ]
         );
@@ -1558,7 +1542,6 @@ mod test {
         let p: RationalPolynomial<_, _> = parse!(
             "(7v1^13+10v1^8+4v1^7-7v1^6-4v1^3-4v1^2+3v1+3)/(v1^14-2v1^8-2v1^7-2v1^4-4v1^3-v1^2+2v1+1)"
         )
-        .unwrap()
         .to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
 
         let (r, mut l) = p.integrate(0);
@@ -1579,21 +1562,24 @@ mod test {
         assert_eq!(
             l,
             vec![(
-                parse!("-1-4*v2+4*v2^2")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, new_map.clone()),
-                parse!("-1-2*v1*v2+v1^2-2*v1^2*v2+v1^7")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, new_map.clone()),
+                parse!("-1-4*v2+4*v2^2").to_rational_polynomial::<_, _, u8>(
+                    &Q,
+                    &Z,
+                    new_map.clone()
+                ),
+                parse!("-1-2*v1*v2+v1^2-2*v1^2*v2+v1^7").to_rational_polynomial::<_, _, u8>(
+                    &Q,
+                    &Z,
+                    new_map.clone()
+                ),
             )]
         );
     }
 
     #[test]
     fn multi_factor() {
-        let p: RationalPolynomial<_, _> = parse!("1/(v1^3+v1)")
-            .unwrap()
-            .to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
+        let p: RationalPolynomial<_, _> =
+            parse!("1/(v1^3+v1)").to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
 
         let (r, l) = p.integrate(0);
 
@@ -1604,20 +1590,12 @@ mod test {
             l,
             vec![
                 (
-                    parse!("-1/2")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("1+v1^2")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("-1/2").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("1+v1^2").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 ),
                 (
-                    parse!("1")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("v1")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("1").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("v1").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 )
             ]
         );
@@ -1626,7 +1604,6 @@ mod test {
     #[test]
     fn multiple_variables() {
         let p: RationalPolynomial<_, _> = parse!("(v1^4+v2+v1*v2+2*v1)/((v1-v2)(v1-2)(v1-4))")
-            .unwrap()
             .to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
 
         let (r, l) = p.integrate(0);
@@ -1636,37 +1613,39 @@ mod test {
         assert_eq!(
             r,
             vec![
-                parse!("(12*v1+2*v1*v2+v1^2)/2")
-                    .unwrap()
-                    .to_rational_polynomial::<_, _, u8>(&Q, &Z, r[0].get_variables().clone())
+                parse!("(12*v1+2*v1*v2+v1^2)/2").to_rational_polynomial::<_, _, u8>(
+                    &Q,
+                    &Z,
+                    r[0].get_variables().clone()
+                )
             ]
         );
         assert_eq!(
             l,
             vec![
                 (
-                    parse!("(20+3*v2)/(-4+2*v2)")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("-2+v1")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("(20+3*v2)/(-4+2*v2)").to_rational_polynomial::<_, _, u8>(
+                        &Q,
+                        &Z,
+                        v.clone()
+                    ),
+                    parse!("-2+v1").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 ),
                 (
-                    parse!("(-264-5*v2)/(-8+2*v2)")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("-4+v1")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("(-264-5*v2)/(-8+2*v2)").to_rational_polynomial::<_, _, u8>(
+                        &Q,
+                        &Z,
+                        v.clone()
+                    ),
+                    parse!("-4+v1").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 ),
                 (
-                    parse!("(3*v2+v2^2+v2^4)/(8-6*v2+v2^2)")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
-                    parse!("-v2+v1")
-                        .unwrap()
-                        .to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
+                    parse!("(3*v2+v2^2+v2^4)/(8-6*v2+v2^2)").to_rational_polynomial::<_, _, u8>(
+                        &Q,
+                        &Z,
+                        v.clone()
+                    ),
+                    parse!("-v2+v1").to_rational_polynomial::<_, _, u8>(&Q, &Z, v.clone()),
                 )
             ]
         );

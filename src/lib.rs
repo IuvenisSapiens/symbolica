@@ -10,7 +10,7 @@
 //! use symbolica::{atom::AtomCore, parse, symbol};
 //!
 //! fn main() {
-//!     let input = parse!("x^2*log(2*x + y) + exp(3*x)").unwrap();
+//!     let input = parse!("x^2*log(2*x + y) + exp(3*x)");
 //!     let a = input.derivative(symbol!("x"));
 //!     println!("d/dx {} = {}:", input, a);
 //! }
@@ -216,22 +216,24 @@ impl LicenseManager {
 
                 drop(o);
 
-                std::thread::spawn(move || loop {
-                    let new_port =
-                        env::var("SYMBOLICA_PORT").unwrap_or_else(|_| "12011".to_owned());
+                std::thread::spawn(move || {
+                    loop {
+                        let new_port =
+                            env::var("SYMBOLICA_PORT").unwrap_or_else(|_| "12011".to_owned());
 
-                    if port != new_port {
-                        println!("{}", MULTIPLE_INSTANCE_WARNING);
-                        abort();
-                    }
-
-                    match TcpListener::bind(format!("127.0.0.1:{}", port)) {
-                        Ok(_) => {
-                            std::thread::sleep(Duration::from_secs(1));
-                        }
-                        Err(_) => {
+                        if port != new_port {
                             println!("{}", MULTIPLE_INSTANCE_WARNING);
                             abort();
+                        }
+
+                        match TcpListener::bind(format!("127.0.0.1:{}", port)) {
+                            Ok(_) => {
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                            Err(_) => {
+                                println!("{}", MULTIPLE_INSTANCE_WARNING);
+                                abort();
+                            }
                         }
                     }
                 });

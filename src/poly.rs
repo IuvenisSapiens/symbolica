@@ -37,8 +37,6 @@ use crate::state::Workspace;
 use self::factor::Factorize;
 use self::gcd::PolynomialGCD;
 use self::polynomial::MultivariatePolynomial;
-#[cfg(feature = "python_api")]
-use pyo3_stub_gen::derive::*;
 
 pub(crate) const INLINED_EXPONENTS: usize = 6;
 
@@ -710,7 +708,7 @@ impl Variable {
 
     pub fn to_atom(&self) -> Atom {
         match self {
-            Variable::Symbol(s) => Atom::new_var(*s),
+            Variable::Symbol(s) => Atom::var(*s),
             Variable::Function(_, a) | Variable::Other(a) => a.as_ref().clone(),
             Variable::Temporary(_) => panic!("Cannot convert a temporary variable to an atom"),
         }
@@ -799,16 +797,17 @@ impl AtomView<'_> {
 
                     match exp {
                         AtomView::Num(n) => match n.get_coeff_view() {
-                            CoefficientView::Natural(n, d) => {
-                                if d == 1 && n >= 0 && n <= u32::MAX as i64 {
+                            CoefficientView::Natural(n, d, ni, _di) => {
+                                if d == 1 && ni == 0 && n >= 0 && n <= u32::MAX as i64 {
                                     Ok(())
                                 } else {
                                     Err("Exponent negative or a fraction")
                                 }
                             }
-                            CoefficientView::Large(r) => {
+                            CoefficientView::Large(r, ri) => {
                                 let r = r.to_rat();
-                                if r.is_integer()
+                                if ri.is_zero()
+                                    && r.is_integer()
                                     && !r.is_negative()
                                     && r.numerator_ref() <= &u32::MAX
                                 {
@@ -817,7 +816,7 @@ impl AtomView<'_> {
                                     Err("Exponent too large or negative or a fraction")
                                 }
                             }
-                            CoefficientView::Float(_) => {
+                            CoefficientView::Float(_, _) => {
                                 Err("Float is not supported in conversion routine")
                             }
                             CoefficientView::FiniteField(_, _) => {
@@ -898,10 +897,10 @@ impl AtomView<'_> {
 
                     match exp {
                         AtomView::Num(n) => match n.get_coeff_view() {
-                            CoefficientView::Natural(r, _) => {
+                            CoefficientView::Natural(r, _, _, _) => {
                                 exponents[var_index] += E::from_i32(r as i32)
                             }
-                            CoefficientView::Large(r) => {
+                            CoefficientView::Large(r, _) => {
                                 exponents[var_index] +=
                                     E::from_i32(r.to_rat().numerator_ref().to_i64().unwrap() as i32)
                             }
@@ -987,8 +986,8 @@ impl AtomView<'_> {
 
                 if let AtomView::Num(n) = exp {
                     let num_n = n.get_coeff_view();
-                    if let CoefficientView::Natural(nn, nd) = num_n {
-                        if nd == 1 {
+                    if let CoefficientView::Natural(nn, nd, ni, _di) = num_n {
+                        if nd == 1 && ni == 0 {
                             if nn > 0 && nn < i32::MAX as i64 {
                                 return base.to_polynomial_impl(field, var_map).pow(nn as usize);
                             } else if nn < 0 && nn > i32::MIN as i64 {
@@ -1127,12 +1126,12 @@ impl AtomView<'_> {
 
                 if let AtomView::Num(n) = exp {
                     let num_n = n.get_coeff_view();
-                    if let CoefficientView::Natural(nn, nd) = num_n {
-                        if nd == 1 && nn > 0 && nn < i32::MAX as i64 {
+                    if let CoefficientView::Natural(nn, nd, ni, _) = num_n {
+                        if ni == 0 && nd == 1 && nn > 0 && nn < i32::MAX as i64 {
                             return base
                                 .to_polynomial_in_vars_impl(var_map, poly)
                                 .pow(nn as usize);
-                        } else if nd == 1 && nn < 0 && nn > i32::MIN as i64 {
+                        } else if ni == 0 && nd == 1 && nn < 0 && nn > i32::MIN as i64 {
                             // allow x^-2 as a term if supported by the exponent
                             if let Ok(e) = (nn as i32).try_into() {
                                 if let AtomView::Var(v) = base {
@@ -1246,8 +1245,8 @@ impl AtomView<'_> {
                 if let AtomView::Num(n) = exp {
                     let num_n = n.get_coeff_view();
 
-                    if let CoefficientView::Natural(nn, nd) = num_n {
-                        if nd == 1 {
+                    if let CoefficientView::Natural(nn, nd, ni, _) = num_n {
+                        if ni == 0 && nd == 1 {
                             let b = base.to_rational_polynomial_impl(field, out_field, var_map);
 
                             return if nn < 0 {
@@ -1391,8 +1390,8 @@ impl AtomView<'_> {
                 if let AtomView::Num(n) = exp {
                     let num_n = n.get_coeff_view();
 
-                    if let CoefficientView::Natural(nn, nd) = num_n {
-                        if nd == 1 {
+                    if let CoefficientView::Natural(nn, nd, ni, _) = num_n {
+                        if ni == 0 && nd == 1 {
                             let b = base
                                 .to_factorized_rational_polynomial_impl(field, out_field, var_map);
 
@@ -1767,7 +1766,7 @@ impl Token {
             field: &R,
         ) -> Result<(), Cow<'static, str>> {
             match factor {
-                Token::Number(n) => match n.parse::<Integer>() {
+                Token::Number(n, false) => match n.parse::<Integer>() {
                     Ok(x) => {
                         field.mul_assign(coefficient, &field.element_from_integer(x));
                     }
@@ -1801,7 +1800,7 @@ impl Token {
                     };
 
                     match &args[1] {
-                        Token::Number(n) => {
+                        Token::Number(n, false) => {
                             if let Ok(x) = n.parse::<i32>() {
                                 exponents[var_index] += E::from_i32(x);
                             } else {
@@ -1935,7 +1934,7 @@ impl Token {
         }
 
         match self {
-            Token::Number(_) | Token::ID(_) => {
+            Token::Number(_, false) | Token::ID(_) => {
                 let num = self.to_polynomial(field, var_map, var_name_map)?;
                 let den = num.one();
                 Ok(RationalPolynomial::from_num_den(num, den, out_field, false))
@@ -1949,7 +1948,7 @@ impl Token {
                 // we have a pow that could not be parsed by to_polynomial
                 // if the exponent is not -1, we pass the subexpression to
                 // the general routine
-                if Token::Number("-1".into()) == args[1] {
+                if Token::Number("-1".into(), false) == args[1] {
                     let r =
                         args[0].to_rational_polynomial(field, out_field, var_map, var_name_map)?;
                     Ok(r.inv())
@@ -2075,7 +2074,7 @@ impl Token {
         }
 
         match self {
-            Token::Number(_) | Token::ID(_) => {
+            Token::Number(_, false) | Token::ID(_) => {
                 let num = self.to_polynomial(field, var_map, var_name_map)?;
                 let den = vec![(num.one(), 1)];
                 Ok(FactorizedRationalPolynomial::from_num_den(
@@ -2096,7 +2095,7 @@ impl Token {
                 // we have a pow that could not be parsed by to_polynomial
                 // if the exponent is not -1, we pass the subexpression to
                 // the general routine
-                if Token::Number("-1".into()) == args[1] {
+                if Token::Number("-1".into(), false) == args[1] {
                     let r = args[0].to_factorized_rational_polynomial(
                         field,
                         out_field,

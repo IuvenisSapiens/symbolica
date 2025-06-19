@@ -1,26 +1,26 @@
 use symbolica::{
     atom::{Atom, AtomCore},
-    domains::rational::Rational,
+    domains::{float::Complex, rational::Rational},
     evaluate::{CompileOptions, FunctionMap, InlineASM, OptimizationSettings},
     parse, symbol,
 };
 
 fn main() {
-    let e1 = parse!("x + pi + cos(x) + f(g(x+1),h(x*2)) + p(1,x)").unwrap();
-    let e2 = parse!("x + h(x*2) + cos(x)").unwrap();
-    let f = parse!("y^2 + z^2*y^2").unwrap();
-    let g = parse!("i(y+7)+x*i(y+7)*(y-1)").unwrap();
-    let h = parse!("y*(1+x*(1+x^2)) + y^2*(1+x*(1+x^2))^2 + 3*(1+x^2)").unwrap();
-    let i = parse!("y - 1").unwrap();
-    let p1 = parse!("3*z^3 + 4*z^2 + 6*z +8").unwrap();
+    let e1 = parse!("x + pi + cos(x) + f(g(x+1),h(x*2)) + p(1,x)");
+    let e2 = parse!("x + h(x*2) + cos(x)");
+    let f = parse!("y^2 + z^2*y^2");
+    let g = parse!("i(y+7)+x*i(y+7)*(y-1)");
+    let h = parse!("y*(1+x*(1+x^2)) + y^2*(1+x*(1+x^2))^2 + 3*(1+x^2)");
+    let i = parse!("y - 1");
+    let p1 = parse!("3*z^3 + 4*z^2 + 6*z +8");
 
     let mut fn_map = FunctionMap::new();
 
-    fn_map.add_constant(symbol!("pi").into(), Rational::from((22, 7)));
+    fn_map.add_constant(symbol!("pi").into(), Complex::from(Rational::from((22, 7))));
     fn_map
         .add_tagged_function(
             symbol!("p"),
-            vec![Atom::new_num(1)],
+            vec![Atom::num(1)],
             "p1".to_string(),
             vec![symbol!("z")],
             p1,
@@ -44,7 +44,7 @@ fn main() {
         .add_function(symbol!("i"), "i".to_string(), vec![symbol!("y")], i)
         .unwrap();
 
-    let params = vec![parse!("x").unwrap()];
+    let params = vec![parse!("x")];
 
     let evaluator = Atom::evaluator_multiple(
         &[e1.as_view(), e2.as_view()],
@@ -54,7 +54,7 @@ fn main() {
     )
     .unwrap();
 
-    let mut e_f64 = evaluator.map_coeff(&|x| x.into());
+    let mut e_f64 = evaluator.map_coeff(&|x| x.to_real().unwrap().into());
     let r = e_f64.evaluate_single(&[5.]);
     println!("{}", r);
 
