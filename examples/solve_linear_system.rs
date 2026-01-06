@@ -8,7 +8,7 @@ use symbolica::{
         rational_polynomial::{RationalPolynomial, RationalPolynomialField},
     },
     parse,
-    poly::Variable,
+    poly::PolyVariable,
     symbol,
     tensors::matrix::Matrix,
 };
@@ -24,7 +24,7 @@ fn solve() {
     let sol = AtomView::solve_linear_system::<u8, _, InlineVar>(&system, &[x, y, z]).unwrap();
 
     for (v, s) in ["x", "y", "z"].iter().zip(&sol) {
-        println!("{} = {}", v, s);
+        println!("{v} = {s}");
     }
 }
 
@@ -37,23 +37,17 @@ fn solve_from_matrix() {
         println!("\t ({}).x\u{20D7} = {}", r.join(","), v);
     }
 
-    let var_map = Arc::new(vec![Variable::Symbol(symbol!("c"))]);
+    let var_map = Arc::new(vec![PolyVariable::Symbol(symbol!("c"))]);
 
     let system_rat: Vec<RationalPolynomial<_, u8>> = system
         .iter()
         .flatten()
-        .map(|s| {
-            parse!(s)
-                .to_rational_polynomial(&Q, &Z, Some(var_map.clone()))
-        })
+        .map(|s| parse!(s).to_rational_polynomial(&Q, &Z, Some(var_map.clone())))
         .collect();
 
     let rhs_rat: Vec<RationalPolynomial<_, u8>> = rhs
         .iter()
-        .map(|s| {
-            parse!(s)
-                .to_rational_polynomial(&Q, &Z, Some(var_map.clone()))
-        })
+        .map(|s| parse!(s).to_rational_polynomial(&Q, &Z, Some(var_map.clone())))
         .collect();
 
     let field = RationalPolynomialField::from_poly(&rhs_rat[0].numerator);
@@ -72,12 +66,12 @@ fn solve_from_matrix() {
                 "x\u{20D7} = {{{}}}",
                 sol.row_iter()
                     .flatten()
-                    .map(|r| format!("{}", r))
+                    .map(|r| format!("{r}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         }
-        Err(e) => panic!("Could not solve {:?}", e),
+        Err(e) => panic!("Could not solve {e:?}"),
     }
 }
 

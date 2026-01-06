@@ -4,23 +4,22 @@ requires = ["maturin>=1.0,<2.0"]
 
 [project]
 authors = [{ email = "ben@symbolica.io" }, { name = "Ben Ruijl" }]
-summary = "Symbolica is a blazing fast computer algebra system"
 description = "Symbolica is a blazing fast computer algebra system"
 keywords = ["math", "algebra", "polynomial", "expression", "manipulation"]
 license = { file = "License.md" }
 name = "symbolica"
 readme = "Readme.md"
-version = "0.17.0"
+version = "1.2.0"
 
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 
 [project.urls]
 homepage = "https://symbolica.io"
-repository = "https://github.com/benruijl/symbolica"
+repository = "https://github.com/symbolica-dev/symbolica"
 
 [tool.maturin]
-features = ["python_api", "python_abi3"]
+features = ["python_api", "python_abi3", "tracing/release_max_level_info"]

@@ -6,6 +6,10 @@ use ahash::{HashMap, HashSet};
 use rayon::ThreadPool;
 
 use crate::{
+    atom::{
+        AddView, FunctionBuilder, Indeterminate, KeyLookup, MulView, NumView, VarView,
+        representation::FunView,
+    },
     coefficient::{Coefficient, CoefficientView, ConvertToRing},
     domains::{
         EuclideanDomain, InternalOrdering,
@@ -26,30 +30,75 @@ use crate::{
         PatternAtomTreeIterator, PatternRestriction, ReplaceBuilder,
     },
     poly::{
-        Exponent, PositiveExponent, Variable, factor::Factorize, gcd::PolynomialGCD,
+        Exponent, PolyVariable, PositiveExponent, factor::Factorize, gcd::PolynomialGCD,
         polynomial::MultivariatePolynomial, series::Series,
     },
-    printer::{AtomPrinter, PrintOptions, PrintState},
+    printer::{AtomPrinter, CanonicalOrderingSettings, PrintOptions, PrintState},
+    solve::SolveError,
     state::Workspace,
-    tensors::matrix::Matrix,
-    utils::BorrowedOrOwned,
+    tensors::{CanonicalTensor, matrix::Matrix},
+    utils::{BorrowedOrOwned, Settable},
 };
 use std::sync::Arc;
 
 use super::{
-    Atom, AtomOrView, AtomView, KeyLookup, ListSlice, Symbol,
+    Atom, AtomOrView, AtomView, ListSlice, Symbol,
     representation::{InlineNum, InlineVar},
 };
 
 /// All core features of expressions, such as expansion and
 /// pattern matching that leave the expression unchanged.
-pub trait AtomCore {
+///
+///
+/// This trait is sealed, such that new methods can be added
+/// without breaking existing implementations.
+pub trait AtomCore: private::Sealed {
     /// Take a view of the atom.
-    fn as_atom_view(&self) -> AtomView;
+    fn as_atom_view(&self) -> AtomView<'_>;
+
+    /// Get a function view if the atom is a function.
+    fn as_fun_view(&self) -> Option<FunView<'_>> {
+        match self.as_atom_view() {
+            AtomView::Fun(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Get a variable view if the atom is a variable.
+    fn as_var_view(&self) -> Option<VarView<'_>> {
+        match self.as_atom_view() {
+            AtomView::Var(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Get a numerical view if the atom is a number.
+    fn as_num_view(&self) -> Option<NumView<'_>> {
+        match self.as_atom_view() {
+            AtomView::Num(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Get a multiplication view if the atom is a multiplication.
+    fn as_mul_view(&self) -> Option<MulView<'_>> {
+        match self.as_atom_view() {
+            AtomView::Mul(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Get an addition view if the atom is an addition.
+    fn as_add_view(&self) -> Option<AddView<'_>> {
+        match self.as_atom_view() {
+            AtomView::Add(a) => Some(a),
+            _ => None,
+        }
+    }
 
     /// Export the atom and state to a binary stream. It can be loaded
     /// with [Atom::import].
-    fn export<W: std::io::Write>(&self, dest: W) -> Result<(), std::io::Error> {
+    fn export<W: std::io::Write>(&self, dest: &mut W) -> Result<(), std::io::Error> {
         self.as_atom_view().export(dest)
     }
 
@@ -233,8 +282,8 @@ pub trait AtomCore {
     /// let r = parse!("1 / y + 1 / x");
     /// assert_eq!(apart, r);
     /// ```
-    fn apart(&self, x: Symbol) -> Atom {
-        self.as_atom_view().apart(x)
+    fn apart<'a, V: Into<BorrowedOrOwned<'a, Indeterminate>>>(&self, x: V) -> Atom {
+        self.as_atom_view().apart(x.into().borrow())
     }
 
     /// Write the expression as a sum of terms with minimal denominators in all variables.
@@ -428,8 +477,8 @@ pub trait AtomCore {
     /// let r = parse!("2 * x + 2");
     /// assert_eq!(derivative, r);
     /// ```
-    fn derivative(&self, x: Symbol) -> Atom {
-        self.as_atom_view().derivative(x)
+    fn derivative<'a, V: Into<BorrowedOrOwned<'a, Indeterminate>>>(&self, x: V) -> Atom {
+        self.as_atom_view().derivative(x.into().borrow())
     }
 
     /// Take a derivative of the expression with respect to `x` and
@@ -446,8 +495,12 @@ pub trait AtomCore {
     /// assert!(non_zero);
     /// assert_eq!(out, parse!("2 * x + 2"));
     /// ```
-    fn derivative_into(&self, x: Symbol, out: &mut Atom) -> bool {
-        self.as_atom_view().derivative_into(x, out)
+    fn derivative_into<'a, V: Into<BorrowedOrOwned<'a, Indeterminate>>>(
+        &self,
+        x: V,
+        out: &mut Atom,
+    ) -> bool {
+        self.as_atom_view().derivative_into(x.into().borrow(), out)
     }
 
     /// Series expand in `x` around `expansion_point` to depth `depth`.
@@ -465,15 +518,19 @@ pub trait AtomCore {
     ///     parse!("1 + x + x^2 / 2 + x^3 / 6 + x^4 / 24")
     /// );
     /// ```
-    fn series<T: AtomCore>(
+    fn series<'a, T: AtomCore, V: Into<BorrowedOrOwned<'a, Indeterminate>>>(
         &self,
-        x: Symbol,
+        x: V,
         expansion_point: T,
         depth: Rational,
         depth_is_absolute: bool,
-    ) -> Result<Series<AtomField>, &'static str> {
-        self.as_atom_view()
-            .series(x, expansion_point.as_atom_view(), depth, depth_is_absolute)
+    ) -> Result<Series<AtomField>, String> {
+        self.as_atom_view().series(
+            x.into().borrow(),
+            expansion_point.as_atom_view(),
+            depth,
+            depth_is_absolute,
+        )
     }
 
     /// Find the root of a function in `x` numerically over the reals using Newton's method.
@@ -486,14 +543,19 @@ pub trait AtomCore {
     /// let root = expr.nsolve(symbol!("x"), 1.0, 1e-7, 100).unwrap();
     /// assert!((root - 1.414213562373095).abs() < 1e-7);
     /// ```
-    fn nsolve<N: SingleFloat + Real + PartialOrd>(
+    fn nsolve<
+        'a,
+        N: SingleFloat + Real + PartialOrd,
+        V: Into<BorrowedOrOwned<'a, Indeterminate>>,
+    >(
         &self,
-        x: Symbol,
+        x: V,
         init: N,
         prec: N,
         max_iterations: usize,
     ) -> Result<N, String> {
-        self.as_atom_view().nsolve(x, init, prec, max_iterations)
+        self.as_atom_view()
+            .nsolve(x.into().borrow(), init, prec, max_iterations)
     }
 
     /// Solve a non-linear system numerically over the reals using Newton's method.
@@ -506,7 +568,7 @@ pub trait AtomCore {
     /// let expr1 = parse!("x^2 + y^2 - 1");
     /// let expr2 = parse!("x^2 - y");
     /// let system = &[expr1, expr2];
-    /// let vars = &[symbol!("x"), symbol!("y")];
+    /// let vars = &[symbol!("x").into(), symbol!("y").into()];
     /// let init = &[F64::from(0.5), F64::from(0.5)];
     /// let roots = Atom::nsolve_system(system, vars, init, 1e-7.into(), 100).unwrap();
     /// assert!((roots[0].into_inner() - 0.786151377757424).abs() < 1e-7);
@@ -517,7 +579,7 @@ pub trait AtomCore {
         T: AtomCore,
     >(
         system: &[T],
-        vars: &[Symbol],
+        vars: &[Indeterminate],
         init: &[N],
         prec: N,
         max_iterations: usize,
@@ -528,6 +590,11 @@ pub trait AtomCore {
     /// Solve a system that is linear in `vars`, if possible.
     /// Each expression in `system` is understood to yield 0.
     ///
+    /// If the system is underdetermined, a partial solution is returned
+    /// where each bound variable is a linear combination of the free
+    /// variables. The free variables are chosen such that they have the
+    /// highest index in the `vars` list.
+    ///
     /// # Example
     ///
     /// ```
@@ -537,13 +604,34 @@ pub trait AtomCore {
     /// let system = &[expr1, expr2];
     /// let vars = &[parse!("x"), parse!("y")];
     /// let solution = Atom::solve_linear_system::<u8, _, _>(system, vars).unwrap();
-    /// assert_eq!(solution[0], Atom::num(2));
-    /// assert_eq!(solution[1], Atom::num(-3));
+    /// assert_eq!(solution, [Atom::num(2), Atom::num(-3)]);
+    /// ```
+    ///
+    /// Underdetermined system example:
+    ///
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, solve::SolveError, symbol};
+    /// let (v1, v2, v3) = symbol!("v1", "v2", "v3");
+    /// let eqs = ["v1 + v2 - 3", "2*v1 + 2*v2 - 6", "v1 + v3 - 5"];
+    /// let system: Vec<_> = eqs.iter().map(|e| parse!(e)).collect();
+    ///
+    /// let sol = Atom::solve_linear_system::<u8, _, Atom>(
+    ///     &system,
+    ///     &[v1.into(), v2.into(), v3.into()],
+    /// );
+    ///
+    /// assert_eq!(
+    ///     sol,
+    ///     Err(SolveError::Underdetermined {
+    ///         rank: 2,
+    ///         partial_solution: vec![parse!("-v3+5"), parse!("v3-2"), parse!("v3"),],
+    ///     })
+    /// );
     /// ```
     fn solve_linear_system<E: PositiveExponent, T1: AtomCore, T2: AtomCore>(
         system: &[T1],
         vars: &[T2],
-    ) -> Result<Vec<Atom>, String> {
+    ) -> Result<Vec<Atom>, SolveError> {
         AtomView::solve_linear_system::<E, T1, T2>(system, vars)
     }
 
@@ -622,7 +710,7 @@ pub trait AtomCore {
     ///
     /// ```
     /// use symbolica::{atom::AtomCore, parse};
-    /// use symbolica::evaluate::FunctionMap;
+    /// use symbolica::evaluate::{FunctionMap, OptimizationSettings};
     /// let expr = parse!("x + y");
     /// let x = parse!("x");
     /// let y = parse!("y");
@@ -630,7 +718,7 @@ pub trait AtomCore {
     /// let params = vec![x.clone(), y.clone()];
     /// let mut tree = expr.to_evaluation_tree(&fn_map, &params).unwrap();
     /// tree.common_subexpression_elimination();
-    /// let e = tree.optimize(1, 1, None, false);
+    /// let e = tree.optimize(&OptimizationSettings::default());
     /// let mut e = e.map_coeff(&|c| c.to_real().unwrap().to_f64());
     /// let r = e.evaluate_single(&[0.5, 0.3]);
     /// assert_eq!(r, 0.8);
@@ -648,22 +736,54 @@ pub trait AtomCore {
     /// and user functions in the expression must occur in the function map.
     /// The function map may have nested expressions.
     ///
-    /// # Example
+    /// # Examples
+    ///
+    /// A simple evaluation without nested expressions:
     ///
     /// ```
     /// use symbolica::{atom::AtomCore, parse};
     /// use symbolica::evaluate::{FunctionMap, OptimizationSettings};
-    /// let expr = parse!("x + y");
-    /// let x = parse!("x");
-    /// let y = parse!("y");
     /// let fn_map = FunctionMap::new();
-    /// let params = vec![x.clone(), y.clone()];
+    /// let params = vec![parse!("x"), parse!("y")];
     /// let optimization_settings = OptimizationSettings::default();
-    /// let mut evaluator = expr
+    /// let mut evaluator = parse!("x + y")
     ///     .evaluator(&fn_map, &params, optimization_settings)
     ///     .unwrap()
     ///     .map_coeff(&|x| x.to_real().unwrap().to_f64());
     /// assert_eq!(evaluator.evaluate_single(&[1.0, 2.0]), 3.0);
+    /// ```
+    ///
+    /// An evaluation with a nested function `f(x) = x^2 + 1`:
+    /// ```rust
+    /// use symbolica::{atom::AtomCore, parse, symbol};
+    /// use symbolica::evaluate::{FunctionMap, OptimizationSettings};
+    /// let mut fn_map = FunctionMap::new();
+    /// fn_map.add_function(symbol!("f"), "f".to_string(), vec![symbol!("x")], parse!("x^2 + 1")).unwrap();
+    ///
+    /// let optimization_settings = OptimizationSettings::default();
+    /// let mut evaluator = parse!("f(x)")
+    ///     .evaluator(&fn_map, &vec![parse!("x")], optimization_settings)
+    ///     .unwrap().map_coeff(&|x| x.re.to_f64());
+    /// assert_eq!(evaluator.evaluate_single(&[2.0]), 5.0);
+    /// ```
+    ///
+    /// An evaluation with externally defined functions:
+    /// ```rust
+    /// use ahash::HashMap;
+    /// use symbolica::{atom::AtomCore, evaluate::{FunctionMap, OptimizationSettings}, parse, symbol};
+    ///
+    /// let mut ext: HashMap<String, Box<dyn Fn(&[f64]) -> f64 + Send + Sync>> = HashMap::default();
+    /// ext.insert("f".to_string(), Box::new(|a| a[0] * a[0] + a[1]));
+    ///
+    /// let mut f = FunctionMap::new();
+    /// f.add_external_function(symbol!("f"), "f".to_string()).unwrap();
+    ///
+    /// let params = vec![parse!("x"), parse!("y")];
+    /// let optimization_settings = OptimizationSettings::default();
+    /// let evaluator = parse!("f(x,y)").evaluator(&f, &params, optimization_settings).unwrap().map_coeff(&|x| x.re.to_f64());
+    ///
+    /// let mut ev = evaluator.with_external_functions(ext).unwrap();
+    /// assert_eq!(ev.evaluate_single(&[2.0, 3.0]), 7.0);
     /// ```
     fn evaluator(
         &self,
@@ -672,12 +792,7 @@ pub trait AtomCore {
         optimization_settings: OptimizationSettings,
     ) -> Result<ExpressionEvaluator<Complex<Rational>>, String> {
         let mut tree = self.to_evaluation_tree(fn_map, params)?;
-        Ok(tree.optimize(
-            optimization_settings.horner_iterations,
-            optimization_settings.n_cores,
-            optimization_settings.hot_start.clone(),
-            optimization_settings.verbose,
-        ))
+        Ok(tree.optimize(&optimization_settings))
     }
 
     /// Convert nested expressions to a tree suitable for repeated evaluations with
@@ -714,12 +829,7 @@ pub trait AtomCore {
         optimization_settings: OptimizationSettings,
     ) -> Result<ExpressionEvaluator<Complex<Rational>>, String> {
         let mut tree = AtomView::to_eval_tree_multiple(exprs, fn_map, params)?;
-        Ok(tree.optimize(
-            optimization_settings.horner_iterations,
-            optimization_settings.n_cores,
-            optimization_settings.hot_start.clone(),
-            optimization_settings.verbose,
-        ))
+        Ok(tree.optimize(&optimization_settings))
     }
 
     /// Check if the expression could be 0, using (potentially) numerical sampling with
@@ -751,29 +861,28 @@ pub trait AtomCore {
     /// let r = result.set_coefficient_ring(&Arc::new(vec![]));
     /// assert_eq!(r, parse!("y*(x+1)^-1*(x+2*x^2+x^3+1)"));
     /// ```
-    fn set_coefficient_ring(&self, vars: &Arc<Vec<Variable>>) -> Atom {
+    fn set_coefficient_ring(&self, vars: &Arc<Vec<PolyVariable>>) -> Atom {
         self.as_atom_view().set_coefficient_ring(vars)
     }
 
-    /// Convert all coefficients to floats with a given precision `decimal_prec`.
+    /// Convert all coefficients and built-in functions to floats with a given precision `decimal_prec`.
     /// The precision of floating point coefficients in the input will be truncated to `decimal_prec`.
     ///
     /// # Example
     ///
     /// ```
     /// use symbolica::{atom::AtomCore, parse};
-    /// let expr = parse!("1/3");
-    /// let result = expr.coefficients_to_float(2);
-    /// assert_eq!(result.to_string(), "3.3e-1");
+    /// let expr = parse!("cos(1/3) + 1/2");
+    /// let result = expr.to_float(2);
+    /// assert_eq!(result.to_string(), "1.4");
     /// ```
-    fn coefficients_to_float(&self, decimal_prec: u32) -> Atom {
+    fn to_float(&self, decimal_prec: u32) -> Atom {
         let mut a = Atom::new();
-        self.as_atom_view()
-            .coefficients_to_float_into(decimal_prec, &mut a);
+        self.as_atom_view().to_float_into(decimal_prec, &mut a);
         a
     }
 
-    /// Convert all coefficients to floats with a given precision `decimal_prec`.
+    /// Convert all coefficients and built-in functions to floats with a given precision `decimal_prec`.
     /// The precision of floating point coefficients in the input will be truncated to `decimal_prec`.
     ///
     /// # Example
@@ -782,26 +891,11 @@ pub trait AtomCore {
     /// use symbolica::{atom::{Atom, AtomCore}, parse};
     /// let expr = parse!("1/3");
     /// let mut out = Atom::new();
-    /// expr.coefficients_to_float_into(2, &mut out);
+    /// expr.to_float_into(2, &mut out);
     /// assert_eq!(out.to_string(), "3.3e-1");
     /// ```
-    fn coefficients_to_float_into(&self, decimal_prec: u32, out: &mut Atom) {
-        self.as_atom_view()
-            .coefficients_to_float_into(decimal_prec, out);
-    }
-
-    /// Complex conjugate all numbers in the expression.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use symbolica::{atom::{Atom, AtomCore}, symbol, parse};
-    /// let expr = parse!("1 + 2i") * Atom::var(symbol!("x")).pow(Atom::i());
-    /// let result = expr.conjugate();
-    /// assert_eq!(result, parse!("(1 - 2i)*x^(-1i)"));
-    /// ```
-    fn conjugate(&self) -> Atom {
-        self.as_atom_view().conjugate()
+    fn to_float_into(&self, decimal_prec: u32, out: &mut Atom) {
+        self.as_atom_view().to_float_into(decimal_prec, out);
     }
 
     /// Map all coefficients using a given function.
@@ -867,10 +961,10 @@ pub trait AtomCore {
     /// ```
     /// use symbolica::{atom::{Atom, AtomCore}, parse};
     /// let expr = parse!("0.333");
-    /// let result = expr.rationalize_coefficients(&(1, 100).into());
+    /// let result = expr.rationalize(&(1, 100).into());
     /// assert_eq!(result, Atom::num((1, 3)));
     /// ```
-    fn rationalize_coefficients(&self, relative_error: &Rational) -> Atom {
+    fn rationalize(&self, relative_error: &Rational) -> Atom {
         self.as_atom_view().rationalize_coefficients(relative_error)
     }
 
@@ -903,9 +997,43 @@ pub trait AtomCore {
     fn to_polynomial<R: EuclideanDomain + ConvertToRing, E: Exponent>(
         &self,
         field: &R,
-        var_map: impl Into<Option<Arc<Vec<Variable>>>>,
+        var_map: impl Into<Option<Arc<Vec<PolyVariable>>>>,
     ) -> MultivariatePolynomial<R, E> {
-        self.as_atom_view().to_polynomial(field, var_map.into())
+        self.try_to_polynomial(field, var_map.into()).unwrap()
+    }
+
+    /// Convert the atom to a polynomial, optionally in the variable ordering
+    /// specified by `var_map`. If new variables are encountered, they are
+    /// added to the variable map. Similarly, non-polynomial parts are automatically
+    /// defined as a new independent variable in the polynomial.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::AtomCore, parse};
+    /// use symbolica::domains::rational::Q;
+    /// let expr = parse!("x^2 + 2*x + 1");
+    /// let poly = expr.to_polynomial::<_,u8>(&Q, None);
+    /// assert_eq!(poly.to_expression(), parse!("x^2 + 2 * x + 1"));
+    /// ```
+    ///
+    /// With explicit variable ordering:
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// use symbolica::domains::rational::Q;
+    /// let expr = parse!("x^2 + 2*x + 1");
+    /// let var_map = Arc::new(vec![symbol!("x").into()]);
+    /// let poly = expr.to_polynomial::<_,u8>(&Q, Some(var_map));
+    /// assert_eq!(poly.to_expression(), parse!("x^2 + 2 * x + 1"));
+    /// ```
+    fn try_to_polynomial<R: EuclideanDomain + ConvertToRing, E: Exponent>(
+        &self,
+        field: &R,
+        var_map: impl Into<Option<Arc<Vec<PolyVariable>>>>,
+    ) -> Result<MultivariatePolynomial<R, E>, String> {
+        self.as_atom_view().try_to_polynomial(field, var_map.into())
     }
 
     /// Convert the atom to a polynomial in specific variables.
@@ -929,7 +1057,7 @@ pub trait AtomCore {
     /// ```
     fn to_polynomial_in_vars<E: Exponent>(
         &self,
-        var_map: &Arc<Vec<Variable>>,
+        var_map: &Arc<Vec<PolyVariable>>,
     ) -> MultivariatePolynomial<AtomField, E> {
         self.as_atom_view().to_polynomial_in_vars(var_map)
     }
@@ -957,14 +1085,47 @@ pub trait AtomCore {
         &self,
         field: &R,
         out_field: &RO,
-        var_map: impl Into<Option<Arc<Vec<Variable>>>>,
+        var_map: impl Into<Option<Arc<Vec<PolyVariable>>>>,
     ) -> RationalPolynomial<RO, E>
     where
         RationalPolynomial<RO, E>:
             FromNumeratorAndDenominator<R, RO, E> + FromNumeratorAndDenominator<RO, RO, E>,
     {
+        self.try_to_rational_polynomial(field, out_field, var_map)
+            .unwrap()
+    }
+
+    /// Convert the atom to a rational polynomial, optionally in the variable ordering
+    /// specified by `var_map`. If new variables are encountered, they are
+    /// added to the variable map. Similarly, non-rational polynomial parts are automatically
+    /// defined as a new independent variable in the rational polynomial.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::AtomCore, parse};;
+    /// use symbolica::domains::integer::Z;
+    /// use symbolica::domains::rational::Q;
+    /// let expr = parse!("(x^2 + 2*x + 1) / (x + 1)");
+    /// let rat_poly = expr.to_rational_polynomial::<_, _, u8>(&Q, &Z, None);
+    /// assert_eq!(rat_poly.to_expression(), parse!("1+x"));
+    /// ```
+    fn try_to_rational_polynomial<
+        R: EuclideanDomain + ConvertToRing,
+        RO: EuclideanDomain + PolynomialGCD<E>,
+        E: PositiveExponent,
+    >(
+        &self,
+        field: &R,
+        out_field: &RO,
+        var_map: impl Into<Option<Arc<Vec<PolyVariable>>>>,
+    ) -> Result<RationalPolynomial<RO, E>, String>
+    where
+        RationalPolynomial<RO, E>:
+            FromNumeratorAndDenominator<R, RO, E> + FromNumeratorAndDenominator<RO, RO, E>,
+    {
         self.as_atom_view()
-            .to_rational_polynomial(field, out_field, var_map.into())
+            .try_to_rational_polynomial(field, out_field, var_map.into())
     }
 
     /// Convert the atom to a rational polynomial with factorized denominators, optionally in the variable ordering
@@ -993,18 +1154,55 @@ pub trait AtomCore {
         &self,
         field: &R,
         out_field: &RO,
-        var_map: impl Into<Option<Arc<Vec<Variable>>>>,
+        var_map: impl Into<Option<Arc<Vec<PolyVariable>>>>,
     ) -> FactorizedRationalPolynomial<RO, E>
     where
         FactorizedRationalPolynomial<RO, E>: FromNumeratorAndFactorizedDenominator<R, RO, E>
             + FromNumeratorAndFactorizedDenominator<RO, RO, E>,
         MultivariatePolynomial<RO, E>: Factorize,
     {
-        self.as_atom_view()
-            .to_factorized_rational_polynomial(field, out_field, var_map.into())
+        self.try_to_factorized_rational_polynomial(field, out_field, var_map.into())
+            .unwrap()
     }
 
-    /// Format the atom.
+    /// Convert the atom to a rational polynomial with factorized denominators, optionally in the variable ordering
+    /// specified by `var_map`. If new variables are encountered, they are
+    /// added to the variable map. Similarly, non-rational polynomial parts are automatically
+    /// defined as a new independent variable in the rational polynomial.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::AtomCore, parse};
+    /// use symbolica::domains::integer::Z;
+    /// use symbolica::domains::rational::Q;
+    /// let expr = parse!("(x^2 + 2*x + 1) / (x + 1)");
+    /// let fact_rat_poly = expr.to_factorized_rational_polynomial::<_, _, u8>(&Q, &Z, None);
+    /// assert_eq!(
+    ///     fact_rat_poly.numerator.to_expression(),
+    ///     parse!("x+1")
+    /// );
+    /// ```
+    fn try_to_factorized_rational_polynomial<
+        R: EuclideanDomain + ConvertToRing,
+        RO: EuclideanDomain + PolynomialGCD<E>,
+        E: PositiveExponent,
+    >(
+        &self,
+        field: &R,
+        out_field: &RO,
+        var_map: impl Into<Option<Arc<Vec<PolyVariable>>>>,
+    ) -> Result<FactorizedRationalPolynomial<RO, E>, String>
+    where
+        FactorizedRationalPolynomial<RO, E>: FromNumeratorAndFactorizedDenominator<R, RO, E>
+            + FromNumeratorAndFactorizedDenominator<RO, RO, E>,
+        MultivariatePolynomial<RO, E>: Factorize,
+    {
+        self.as_atom_view()
+            .try_to_factorized_rational_polynomial(field, out_field, var_map.into())
+    }
+
+    /// Format the atom. See [AtomCore::printer] for more convenient printing.
     ///
     /// # Example
     ///
@@ -1041,13 +1239,33 @@ pub trait AtomCore {
     /// let printer = expr.printer(opts);
     /// assert_eq!(printer.to_string(), "x**2");
     /// ```
-    fn printer(&self, opts: PrintOptions) -> AtomPrinter {
+    fn printer(&self, opts: PrintOptions) -> AtomPrinter<'_> {
         AtomPrinter::new_with_options(self.as_atom_view(), opts)
     }
 
-    /// Print the atom in a form that is unique and independent of any implementation details.
+    /// Print the atom in a form that is independent of any implementation details, such
+    /// as the definition order of the symbols. Use [AtomCore::to_canonical_string] for a fully
+    /// canonical representation.
     ///
-    /// Anti-symmetric functions are not supported.
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::AtomCore, printer::CanonicalOrderingSettings, symbol};
+    /// let (y, x) = symbol!("canon::y", "canon::x");
+    /// let expr = x.to_atom() + y;
+    /// let canonical_str = expr.to_canonically_ordered_string(CanonicalOrderingSettings {
+    ///   include_namespace: false,
+    ///   include_attributes: false,
+    ///   ..Default::default()
+    /// });
+    /// assert_eq!(canonical_str, "x+y");
+    /// ```
+    fn to_canonically_ordered_string(&self, settings: CanonicalOrderingSettings) -> String {
+        self.as_atom_view().to_canonically_ordered_string(settings)
+    }
+
+    /// Print the atom in a form that is unique and independent of any implementation details.
+    /// The resulting string can be parsed back to the same expression.
     ///
     /// # Example
     ///
@@ -1055,7 +1273,7 @@ pub trait AtomCore {
     /// use symbolica::{atom::AtomCore, parse};
     /// let expr = parse!("x + y");
     /// let canonical_str = expr.to_canonical_string();
-    /// assert_eq!(canonical_str, "symbolica::x+symbolica::y");
+    /// assert_eq!(canonical_str, "symbolica::{}::x+symbolica::{}::y");
     /// ```
     fn to_canonical_string(&self) -> String {
         self.as_atom_view().to_canonical_string()
@@ -1117,6 +1335,9 @@ pub trait AtomCore {
     /// specification.
     /// This makes sure that an index will not be renamed to an index from a different group.
     ///
+    /// Returns the canonical expression, as well as the external indices and ordered dummy indices
+    /// appearing in the canonical expression.
+    ///
     /// Example
     /// -------
     /// ```
@@ -1132,20 +1353,19 @@ pub trait AtomCore {
     /// let mu3 = parse!("mu3");
     /// let mu4 = parse!("mu4");
     ///
-    /// let r = a.canonize_tensors(&[(mu1, 0), (mu2, 0), (mu3, 0), (mu4, 0)]).unwrap();
-    /// println!("{}", r);
+    /// let r = a.canonize_tensors([(mu1, 0), (mu2, 0), (mu3, 0), (mu4, 0)]).unwrap();
+    /// println!("{}", r.canonical_form);
     /// # }
     /// ```
     /// yields `fs(mu1,mu2)*fc(mu1,k1,mu3,k1,mu2,mu3)`.
-    fn canonize_tensors<T: AtomCore, G: Ord + std::hash::Hash>(
+    fn canonize_tensors<I, T: AtomCore, G: Ord + std::hash::Hash>(
         &self,
-        indices: &[(T, G)],
-    ) -> Result<Atom, String> {
-        let indices = indices
-            .iter()
-            .map(|(i, g)| (i.as_atom_view(), g))
-            .collect::<Vec<_>>();
-        self.as_atom_view().canonize_tensors(&indices)
+        indices: I,
+    ) -> Result<CanonicalTensor<T, G>, String>
+    where
+        I: IntoIterator<Item = (T, G)>,
+    {
+        self.as_atom_view().canonize_tensors(indices)
     }
 
     fn to_pattern(&self) -> Pattern {
@@ -1179,7 +1399,7 @@ pub trait AtomCore {
     /// assert!(indeterminates.contains(&Atom::var(symbol!("x")).as_view()));
     /// assert!(indeterminates.contains(&parse!("f(x)").as_view()));
     /// ```
-    fn get_all_indeterminates(&self, enter_functions: bool) -> HashSet<AtomView> {
+    fn get_all_indeterminates(&self, enter_functions: bool) -> HashSet<AtomView<'_>> {
         self.as_atom_view().get_all_indeterminates(enter_functions)
     }
 
@@ -1212,6 +1432,86 @@ pub trait AtomCore {
         self.as_atom_view().contains(s.as_atom_view())
     }
 
+    /// Returns true iff `self` is scalar, i.e. contains only numbers and symbols with the `Scalar` attribute.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// let _ = symbol!("x_scalar"; Scalar);
+    /// let expr = parse!("3*2^x_scalar + (1+x_scalar)^2");
+    /// assert!(expr.is_scalar());
+    /// ```
+    fn is_scalar(&self) -> bool {
+        self.as_atom_view().is_scalar()
+    }
+
+    /// Returns true iff an expression is real. Symbols must have the `Real` attribute.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// let _ = symbol!("x_real"; Real);
+    /// let expr = parse!("3*2^x_real + (1+x_real)^2 + (1/2)^x_real");
+    /// assert!(expr.is_real());
+    /// ```
+    fn is_real(&self) -> bool {
+        self.as_atom_view().is_real()
+    }
+
+    /// Returns true iff an expression only consists of integer numbers and symbols with the `Integer` attribute.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// let _ = symbol!("x_integer"; Integer);
+    /// let expr = parse!("3*2^x_integer + (1+x_integer)^2");
+    /// assert!(expr.is_integer());
+    /// ```
+    fn is_integer(&self) -> bool {
+        self.as_atom_view().is_integer()
+    }
+
+    /// Returns true iff an expression is positive. Symbols must have the `Positive` attribute.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// let _ = symbol!("x_p"; Positive);
+    /// let expr = parse!("3*2^x_p + (1+x_p)^2 + (1/2)^x_p");
+    /// assert!(expr.is_positive());
+    /// ```
+    fn is_positive(&self) -> bool {
+        self.as_atom_view().is_positive()
+    }
+
+    /// Returns true iff an expression has no explicit infinities and is not indeterminate.
+    ///
+    /// # Example
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// let expr = parse!("3x + x^2 + log(0)");
+    /// assert!(!expr.is_finite());
+    /// ```
+    fn is_finite(&self) -> bool {
+        self.as_atom_view().is_finite()
+    }
+
+    /// Returns true iff an expression is constant, i.e. contains no user-defined symbols or functions.
+    ///
+    /// # Example
+    /// ```
+    /// use symbolica::{atom::{Atom, AtomCore}, parse, symbol};
+    /// let expr = parse!("cos(2 + exp(3) ) + 1/3");
+    /// assert!(expr.is_constant());
+    /// ```
+    fn is_constant(&self) -> bool {
+        self.as_atom_view().is_constant()
+    }
+
     /// Check if the expression can be considered a polynomial in some variables, including
     /// redefinitions. For example `f(x)+y` is considered a polynomial in `f(x)` and `y`, whereas
     /// `f(x)+x` is not a polynomial.
@@ -1234,6 +1534,57 @@ pub trait AtomCore {
     ) -> Option<HashSet<AtomView<'_>>> {
         self.as_atom_view()
             .is_polynomial(allow_not_expanded, allow_negative_powers)
+    }
+
+    /// Exponentiate the atom.
+    fn exp(&self) -> Atom {
+        FunctionBuilder::new(Symbol::EXP)
+            .add_arg(self.as_atom_view())
+            .finish()
+    }
+
+    /// Take the logarithm of the atom.
+    fn log(&self) -> Atom {
+        FunctionBuilder::new(Symbol::LOG)
+            .add_arg(self.as_atom_view())
+            .finish()
+    }
+
+    /// Take the sine the atom.
+    fn sin(&self) -> Atom {
+        FunctionBuilder::new(Symbol::SIN)
+            .add_arg(self.as_atom_view())
+            .finish()
+    }
+
+    /// Take the cosine the atom.
+    fn cos(&self) -> Atom {
+        FunctionBuilder::new(Symbol::COS)
+            .add_arg(self.as_atom_view())
+            .finish()
+    }
+
+    /// Take the square root of the atom.
+    fn sqrt(&self) -> Atom {
+        FunctionBuilder::new(Symbol::SQRT)
+            .add_arg(self.as_atom_view())
+            .finish()
+    }
+
+    /// Take the complex conjugate of the atom.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::AtomCore, parse};
+    /// let expr = parse!("x+2 + 3^x + (5+2i) * (test::{real}::real) + (-2)^x");
+    /// let result = expr.conj();
+    /// assert_eq!(result, parse!("(5-2𝑖)*test::real+3^conj(x)+conj(x)+conj((-2)^x)+2"));
+    /// ```
+    fn conj(&self) -> Atom {
+        FunctionBuilder::new(Symbol::CONJ)
+            .add_arg(self.as_atom_view())
+            .finish()
     }
 
     /// Replace all occurrences of the pattern. The right-hand side is
@@ -1296,12 +1647,12 @@ pub trait AtomCore {
     /// let out = expr
     ///     .replace(parse!("f(x_,y_,z_)"))
     ///     .when(Condition::match_stack(|m| {
-    ///         if let Some(x) = m.get(symbol!("x")) {
-    ///             if let Some(y) = m.get(symbol!("y")) {
+    ///         if let Some(x) = m.get(symbol!("x_")) {
+    ///             if let Some(y) = m.get(symbol!("y_")) {
     ///                 if x.to_atom() > y.to_atom() {
     ///                     return ConditionResult::False;
     ///                 }
-    ///                 if let Some(z) = m.get(symbol!("z")) {
+    ///                 if let Some(z) = m.get(symbol!("z_")) {
     ///                     if y.to_atom() > z.to_atom() {
     ///                         return ConditionResult::False;
     ///                     }
@@ -1322,7 +1673,7 @@ pub trait AtomCore {
     }
 
     /// Replace all occurrences of the patterns, where replacements are tested in the order that they are given.
-    /// To repeatedly replace multiple patterns, wrap the call in [Atom::replace_map].
+    /// To repeatedly replace multiple patterns, wrap the call in [AtomCore::replace_map].
     ///
     /// # Example
     ///
@@ -1386,15 +1737,12 @@ pub trait AtomCore {
     /// let expr = Atom::var(x) + y;
     /// let result = expr.replace_map(|term, _ctx, out| {
     ///     if term.get_symbol() == Some(x) {
-    ///         *out = z.into();
-    ///         true
-    ///     } else {
-    ///         false
+    ///         **out = Atom::from(z);
     ///     }
     /// });
     /// assert_eq!(result, Atom::var(y) + z);
     /// ```
-    fn replace_map<F: FnMut(AtomView, &Context, &mut Atom) -> bool>(&self, m: F) -> Atom {
+    fn replace_map<F: FnMut(AtomView, &Context, &mut Settable<'_, Atom>)>(&self, m: F) -> Atom {
         self.as_atom_view().replace_map(m)
     }
 
@@ -1422,6 +1770,7 @@ pub trait AtomCore {
     }
 
     /// Return an iterator over matched expressions.
+    /// Alternatively, use [ReplaceBuilder::match_iter].
     ///
     /// # Example
     ///
@@ -1500,13 +1849,19 @@ pub trait AtomCore {
 }
 
 impl AtomCore for InlineVar {
-    fn as_atom_view(&self) -> AtomView {
+    fn as_atom_view(&self) -> AtomView<'_> {
         self.as_view()
     }
 }
 
 impl AtomCore for InlineNum {
-    fn as_atom_view(&self) -> AtomView {
+    fn as_atom_view(&self) -> AtomView<'_> {
+        self.as_view()
+    }
+}
+
+impl AtomCore for Indeterminate {
+    fn as_atom_view(&self) -> AtomView<'_> {
         self.as_view()
     }
 }
@@ -1518,13 +1873,26 @@ impl<'a> AtomCore for AtomView<'a> {
 }
 
 impl<T: AsRef<Atom>> AtomCore for T {
-    fn as_atom_view(&self) -> AtomView {
+    fn as_atom_view(&self) -> AtomView<'_> {
         self.as_ref().as_view()
     }
 }
 
 impl AtomCore for AtomOrView<'_> {
-    fn as_atom_view(&self) -> AtomView {
+    fn as_atom_view(&self) -> AtomView<'_> {
         self.as_view()
     }
+}
+
+mod private {
+    use crate::atom::{AtomView, Indeterminate, InlineNum, InlineVar};
+
+    pub trait Sealed {}
+
+    impl Sealed for InlineVar {}
+    impl Sealed for InlineNum {}
+    impl Sealed for Indeterminate {}
+    impl<'a> Sealed for AtomView<'a> {}
+    impl<T: AsRef<super::Atom>> Sealed for T {}
+    impl Sealed for super::AtomOrView<'_> {}
 }

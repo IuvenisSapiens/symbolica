@@ -1,8 +1,12 @@
 //! Symbolica is a blazing fast computer algebra system.
 //!
-//! It can be used to perform mathematical operations,
-//! such as symbolic differentiation, integration, simplification,
-//! pattern matching and solving equations.
+//! Its main features are:
+//! - Easily create and manipulate expressions in Rust and Python
+//! - Fast code generation (C++/ASM/SIMD/CUDA) for expression evaluation
+//! - Fast multivariate polynomial arithmetic
+//! - Pattern matching and expression transformation
+//! - Mixed exact and numerical computations with error propagation
+//! - Handling and compression of very large expressions
 //!
 //! For example:
 //!
@@ -18,7 +22,7 @@
 //!
 //! The main object to represent a general expressions is [Atom](atom::Atom). Most operations on [Atom](atom::Atom) are
 //! implemented as methods on the [AtomCore](atom::AtomCore) trait. The [Symbol](atom::Symbol) struct is used to represent
-//! variables or named functions, potentially with additional properties, such as symmetries.
+//! variables or named functions, potentially with additional properties, such as symmetries (see [atom::SymbolAttribute]).
 //!
 //! Instead of using general expressions, you can use more restricted formats such as [MultivariatePolynomial](poly::polynomial::MultivariatePolynomial), [UnivariatePolynomial](poly::univariate::UnivariatePolynomial) and [RationalPolynomial](domains::rational_polynomial::RationalPolynomial)
 //! which have optimized methods.
@@ -30,6 +34,8 @@
 //!
 //! Check out the [guide](https://symbolica.io/docs/get_started.html) for more information, examples,
 //! and additional documentation.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::{
     collections::HashMap,
@@ -46,39 +52,108 @@ use colored::Colorize;
 use once_cell::sync::OnceCell;
 use tinyjson::JsonValue;
 
-#[cfg(feature = "python_no_module")]
+#[cfg(feature = "python_export")]
 pub mod api;
-#[cfg(not(feature = "python_no_module"))]
+#[cfg(not(feature = "python_export"))]
 mod api;
 pub mod atom;
 pub mod coefficient;
 mod collect;
-pub mod combinatorics;
 mod derivative;
 pub mod domains;
 pub mod evaluate;
 mod expand;
-pub mod graph;
 pub mod id;
 mod normalize;
-pub mod numerical_integration;
 pub mod parser;
 pub mod poly;
 pub mod printer;
-mod solve;
+pub mod solve;
 pub mod state;
 pub mod streaming;
 pub mod tensors;
 pub mod transformer;
 pub mod utils;
 
+pub use graphica as graph; // re-export graphica
+pub use numerica::*; // re-export numerica
+
 #[cfg(feature = "faster_alloc")]
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static LICENSE_KEY: OnceCell<String> = OnceCell::new();
 static LICENSE_MANAGER: OnceCell<LicenseManager> = OnceCell::new();
 static LICENSED: AtomicBool = LicenseManager::init();
+
+/// Global settings for Symbolica.
+pub struct GlobalSettings {
+    /// Set whether a default tracing subscriber is initialized upon the first call to a logging macro.
+    pub initialize_tracing: AtomicBool,
+    /// Use an experimental implementation of the Hu-Monagan polynomial GCD algorithm.
+    pub use_hu_monagan_poly_gcd: AtomicBool,
+}
+
+/// Global settings for Symbolica.
+pub static GLOBAL_SETTINGS: GlobalSettings = GlobalSettings {
+    initialize_tracing: AtomicBool::new(true),
+    use_hu_monagan_poly_gcd: AtomicBool::new(false),
+};
+
+/// Write an error messages using `tracing`. Initializes a default tracing subscriber on the first call if [GlobalSettings::initialize_tracing] is `true`.
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) => {
+        if $crate::GLOBAL_SETTINGS.initialize_tracing.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::builder()
+                            .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                            .from_env_lossy(),
+                    )
+                    .try_init();
+            $crate::GLOBAL_SETTINGS.initialize_tracing.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        tracing::error!($($arg)*);
+   };
+}
+
+/// Write warning messages using `tracing`. Initializes a default tracing subscriber on the first call if [GlobalSettings::initialize_tracing] is `true`.
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)*) => {
+        if $crate::GLOBAL_SETTINGS.initialize_tracing.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::builder()
+                            .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                            .from_env_lossy(),
+                    )
+                    .try_init();
+            $crate::GLOBAL_SETTINGS.initialize_tracing.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::warn!($($arg)*);
+    };
+}
+
+/// Write info messages using `tracing`. Initializes a default tracing subscriber on the first call if [GlobalSettings::initialize_tracing] is `true`.
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {
+        if $crate::GLOBAL_SETTINGS.initialize_tracing.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::builder()
+                            .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                            .from_env_lossy(),
+                    )
+                    .try_init();
+            $crate::GLOBAL_SETTINGS.initialize_tracing.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::info!($($arg)*);
+    };
+}
 
 /// Manage the license of the Symbolica instance.
 #[allow(dead_code)]
@@ -174,7 +249,7 @@ impl LicenseManager {
             }
             Err(e) => {
                 if !e.contains("missing") {
-                    eprintln!("{}", e);
+                    eprintln!("{e}");
                 }
             }
         }
@@ -207,7 +282,7 @@ impl LicenseManager {
 
         let port = env::var("SYMBOLICA_PORT").unwrap_or_else(|_| "12011".to_owned());
 
-        match TcpListener::bind(format!("127.0.0.1:{}", port)) {
+        match TcpListener::bind(format!("127.0.0.1:{port}")) {
             Ok(o) => {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(1)
@@ -222,16 +297,16 @@ impl LicenseManager {
                             env::var("SYMBOLICA_PORT").unwrap_or_else(|_| "12011".to_owned());
 
                         if port != new_port {
-                            println!("{}", MULTIPLE_INSTANCE_WARNING);
+                            println!("{MULTIPLE_INSTANCE_WARNING}");
                             abort();
                         }
 
-                        match TcpListener::bind(format!("127.0.0.1:{}", port)) {
+                        match TcpListener::bind(format!("127.0.0.1:{port}")) {
                             Ok(_) => {
                                 std::thread::sleep(Duration::from_secs(1));
                             }
                             Err(_) => {
-                                println!("{}", MULTIPLE_INSTANCE_WARNING);
+                                println!("{MULTIPLE_INSTANCE_WARNING}");
                                 abort();
                             }
                         }
@@ -247,7 +322,7 @@ impl LicenseManager {
                 }
             }
             Err(_) => {
-                println!("{}", MULTIPLE_INSTANCE_WARNING);
+                println!("{MULTIPLE_INSTANCE_WARNING}");
                 abort();
             }
         }
@@ -295,7 +370,7 @@ impl LicenseManager {
                 h = h.wrapping_mul(33).wrapping_add(*b as u32);
             }
 
-            let h = format!("{:x}", h);
+            let h = format!("{h:x}");
             if f1 != h {
                 Err(ACTIVATION_ERROR.to_owned())?;
             }
@@ -318,11 +393,11 @@ impl LicenseManager {
 
             key = f3.to_owned();
             std::thread::spawn(|| {
-                if let Err(e) = Self::check_registration(key) {
-                    if e.contains("expired") {
-                        println!("{}", e);
-                        abort();
-                    }
+                if let Err(e) = Self::check_registration(key)
+                    && e.contains("expired")
+                {
+                    println!("{e}");
+                    abort();
                 }
             });
         } else {
@@ -336,7 +411,7 @@ impl LicenseManager {
     fn connect() -> Result<TcpStream, String> {
         let mut ip = ("symbolica.io", 12012)
             .to_socket_addrs()
-            .map_err(|e| format!("{}\nError: {}", RESOLVE_ERROR, e))?;
+            .map_err(|e| format!("{RESOLVE_ERROR}\nError: {e}"))?;
         let Some(n) = ip.next() else {
             return Err(RESOLVE_ERROR.to_owned());
         };
@@ -372,14 +447,14 @@ impl LicenseManager {
 
         stream
             .write_all(v.as_bytes())
-            .map_err(|e| format!("{}\nError: {}", NETWORK_ERROR, e))?;
+            .map_err(|e| format!("{NETWORK_ERROR}\nError: {e}"))?;
 
         let mut buf = Vec::new();
         stream
             .read_to_end(&mut buf)
-            .map_err(|e| format!("{}\nError: {}", NETWORK_ERROR, e))?;
+            .map_err(|e| format!("{NETWORK_ERROR}\nError: {e}"))?;
         let read_str =
-            std::str::from_utf8(&buf).map_err(|e| format!("{}\nError: {}", NETWORK_ERROR, e))?;
+            std::str::from_utf8(&buf).map_err(|e| format!("{NETWORK_ERROR}\nError: {e}"))?;
 
         if read_str == "{\"status\":\"ok\"}\n" {
             Ok(())
@@ -391,21 +466,20 @@ impl LicenseManager {
         } else {
             let message: JsonValue = read_str[..read_str.len() - 1]
                 .parse()
-                .map_err(|e| format!("{}\nError: {}", NETWORK_ERROR, e))?;
+                .map_err(|e| format!("{NETWORK_ERROR}\nError: {e}"))?;
             let message_parsed: &HashMap<_, _> = message
                 .get()
-                .ok_or_else(|| format!("{}\nError: Empty response", NETWORK_ERROR))?;
+                .ok_or_else(|| format!("{NETWORK_ERROR}\nError: Empty response"))?;
             let status: &String = message_parsed
                 .get("status")
                 .unwrap()
                 .get()
-                .ok_or_else(|| format!("{}\nError: missing status", NETWORK_ERROR))?;
+                .ok_or_else(|| format!("{NETWORK_ERROR}\nError: missing status"))?;
             Err(format!(
                 "┌──────────────────────────────────────────┐
 │ Could not activate the Symbolica license │
 └──────────────────────────────────────────┘
-Error: {}",
-                status,
+Error: {status}",
             ))
         }
     }
@@ -430,7 +504,7 @@ Error: {}",
         let thread_id = std::thread::current().id();
 
         if manager.pid != pid || manager.thread_id != thread_id {
-            println!("{}", MULTIPLE_INSTANCE_WARNING);
+            println!("{MULTIPLE_INSTANCE_WARNING}");
             abort();
         }
     }
@@ -469,15 +543,15 @@ Error: {}",
             h = h.wrapping_mul(33).wrapping_add(*b);
         }
 
-        if key1 == format!("SYMBOLICA_OEM_KEY_{:x}", h) {
+        if key1 == format!("SYMBOLICA_OEM_KEY_{h:x}") {
             LICENSED.store(true, Relaxed);
 
             std::thread::spawn(|| {
-                if let Err(e) = Self::check_registration(oom_key.to_owned()) {
-                    if e.contains("Unknown license") {
-                        println!("{}", e);
-                        abort();
-                    }
+                if let Err(e) = Self::check_registration(oom_key.to_owned())
+                    && e.contains("Unknown license")
+                {
+                    println!("{e}");
+                    abort();
                 }
             });
 
@@ -505,12 +579,12 @@ Error: {}",
 
         stream
             .write_all(v.as_bytes())
-            .map_err(|e| format!("{}\nError: {}", NETWORK_ERROR, e))?;
+            .map_err(|e| format!("{NETWORK_ERROR}\nError: {e}"))?;
 
         let mut buf = Vec::new();
         stream
             .read_to_end(&mut buf)
-            .map_err(|e| format!("{}\nError: {}", NETWORK_ERROR, e))?;
+            .map_err(|e| format!("{NETWORK_ERROR}\nError: {e}"))?;
         let read_str = std::str::from_utf8(&buf).map_err(|_| "Bad server response".to_string())?;
 
         if read_str == "{\"status\":\"email sent\"}\n" {

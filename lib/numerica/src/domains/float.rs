@@ -10,7 +10,7 @@ use std::{
 use rand::Rng;
 use wide::{f64x2, f64x4};
 
-use crate::domains::integer::Integer;
+use crate::domains::{RingOps, Set, integer::Integer};
 
 use super::{EuclideanDomain, Field, InternalOrdering, Ring, SelfRing, rational::Rational};
 use rug::{
@@ -30,6 +30,10 @@ impl<T> FloatField<T> {
     pub fn from_rep(rep: T) -> Self {
         FloatField { rep }
     }
+
+    pub fn get_rep(&self) -> &T {
+        &self.rep
+    }
 }
 
 impl Default for FloatField<F64> {
@@ -38,9 +42,23 @@ impl Default for FloatField<F64> {
     }
 }
 
+impl Default for FloatField<Complex<F64>> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FloatField<F64> {
-    pub fn new() -> Self {
-        FloatField { rep: (0.).into() }
+    pub const fn new() -> Self {
+        FloatField { rep: F64(0.) }
+    }
+}
+
+impl FloatField<Complex<F64>> {
+    pub const fn new() -> Self {
+        FloatField {
+            rep: Complex::new(F64(0.), F64(0.)),
+        }
     }
 }
 
@@ -58,47 +76,103 @@ impl<T> Display for FloatField<T> {
     }
 }
 
-impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Ring for FloatField<T> {
+impl<T: SingleFloat + Hash + Eq + InternalOrdering> Set for FloatField<T> {
     type Element = T;
 
     #[inline(always)]
-    fn add(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
-        a.clone() + b.clone()
+    fn size(&self) -> Option<Integer> {
+        None
+    }
+}
+
+impl<T: SingleFloat + Hash + Eq + InternalOrdering> RingOps<T> for FloatField<T> {
+    #[inline(always)]
+    fn add(&self, a: T, b: T) -> Self::Element {
+        a + b
     }
 
     #[inline(always)]
-    fn sub(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
-        a.clone() - b.clone()
+    fn sub(&self, a: T, b: T) -> Self::Element {
+        a - b
     }
 
     #[inline(always)]
-    fn mul(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
-        a.clone() * b.clone()
+    fn mul(&self, a: T, b: T) -> Self::Element {
+        a * b
     }
 
     #[inline(always)]
-    fn add_assign(&self, a: &mut Self::Element, b: &Self::Element) {
+    fn add_assign(&self, a: &mut Self::Element, b: T) {
         *a += b;
     }
 
     #[inline(always)]
-    fn sub_assign(&self, a: &mut Self::Element, b: &Self::Element) {
+    fn sub_assign(&self, a: &mut Self::Element, b: T) {
         *a -= b;
     }
 
     #[inline(always)]
-    fn mul_assign(&self, a: &mut Self::Element, b: &Self::Element) {
+    fn mul_assign(&self, a: &mut Self::Element, b: T) {
         *a *= b;
     }
 
     #[inline(always)]
-    fn add_mul_assign(&self, a: &mut Self::Element, b: &Self::Element, c: &Self::Element) {
+    fn add_mul_assign(&self, a: &mut Self::Element, b: T, c: T) {
+        // a += b * c
+        *a = b.mul_add(&c, a);
+    }
+
+    #[inline(always)]
+    fn sub_mul_assign(&self, a: &mut Self::Element, b: T, c: T) {
+        // a -= b * c
+        *a = b.mul_add(&(-c), a);
+    }
+
+    #[inline(always)]
+    fn neg(&self, a: T) -> Self::Element {
+        -a
+    }
+}
+
+impl<T: SingleFloat + Hash + Eq + InternalOrdering> RingOps<&T> for FloatField<T> {
+    #[inline(always)]
+    fn add(&self, a: &T, b: &T) -> Self::Element {
+        a.clone() + b.clone()
+    }
+
+    #[inline(always)]
+    fn sub(&self, a: &T, b: &T) -> Self::Element {
+        a.clone() - b.clone()
+    }
+
+    #[inline(always)]
+    fn mul(&self, a: &Self::Element, b: &T) -> Self::Element {
+        a.clone() * b.clone()
+    }
+
+    #[inline(always)]
+    fn add_assign(&self, a: &mut Self::Element, b: &T) {
+        *a += b;
+    }
+
+    #[inline(always)]
+    fn sub_assign(&self, a: &mut Self::Element, b: &T) {
+        *a -= b;
+    }
+
+    #[inline(always)]
+    fn mul_assign(&self, a: &mut Self::Element, b: &T) {
+        *a *= b;
+    }
+
+    #[inline(always)]
+    fn add_mul_assign(&self, a: &mut Self::Element, b: &T, c: &T) {
         // a += b * c
         *a = b.mul_add(c, a);
     }
 
     #[inline(always)]
-    fn sub_mul_assign(&self, a: &mut Self::Element, b: &Self::Element, c: &Self::Element) {
+    fn sub_mul_assign(&self, a: &mut Self::Element, b: &T, c: &T) {
         // a -= b * c
         *a = b.mul_add(&-c.clone(), a);
     }
@@ -107,7 +181,9 @@ impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Ring fo
     fn neg(&self, a: &Self::Element) -> Self::Element {
         -a.clone()
     }
+}
 
+impl<T: SingleFloat + Hash + Eq + InternalOrdering> Ring for FloatField<T> {
     #[inline(always)]
     fn zero(&self) -> Self::Element {
         self.rep.zero()
@@ -148,9 +224,8 @@ impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Ring fo
         0.into()
     }
 
-    #[inline(always)]
-    fn size(&self) -> Integer {
-        0.into()
+    fn try_inv(&self, a: &Self::Element) -> Option<Self::Element> {
+        if a.is_zero() { None } else { Some(a.inv()) }
     }
 
     fn try_div(&self, a: &Self::Element, b: &Self::Element) -> Option<Self::Element> {
@@ -170,16 +245,34 @@ impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Ring fo
         state: crate::printer::PrintState,
         f: &mut W,
     ) -> Result<bool, fmt::Error> {
+        if opts.mode.is_mathematica() {
+            let mut s = String::new();
+            if let Some(p) = opts.precision {
+                if state.in_sum {
+                    s.write_fmt(format_args!("{self:+.p$}"))?
+                } else {
+                    s.write_fmt(format_args!("{self:.p$}"))?
+                }
+            } else if state.in_sum {
+                s.write_fmt(format_args!("{self:+}"))?
+            } else {
+                s.write_fmt(format_args!("{self}"))?
+            }
+
+            f.write_str(&s.replace('e', "*^"))?;
+            return Ok(false);
+        }
+
         if let Some(p) = opts.precision {
             if state.in_sum {
-                f.write_fmt(format_args!("{:+.*}", p, element))?
+                f.write_fmt(format_args!("{element:+.p$}"))?
             } else {
-                f.write_fmt(format_args!("{:.*}", p, element))?
+                f.write_fmt(format_args!("{element:.p$}"))?
             }
         } else if state.in_sum {
-            f.write_fmt(format_args!("{:+}", element))?
+            f.write_fmt(format_args!("{element:+}"))?
         } else {
-            f.write_fmt(format_args!("{}", element))?
+            f.write_fmt(format_args!("{element}"))?
         }
 
         Ok(false)
@@ -209,16 +302,34 @@ impl SelfRing for F64 {
         state: crate::printer::PrintState,
         f: &mut W,
     ) -> Result<bool, fmt::Error> {
+        if opts.mode.is_mathematica() {
+            let mut s = String::new();
+            if let Some(p) = opts.precision {
+                if state.in_sum {
+                    s.write_fmt(format_args!("{self:+.p$}"))?
+                } else {
+                    s.write_fmt(format_args!("{self:.p$}"))?
+                }
+            } else if state.in_sum {
+                s.write_fmt(format_args!("{self:+}"))?
+            } else {
+                s.write_fmt(format_args!("{self}"))?
+            }
+
+            f.write_str(&s.replace('e', "*^"))?;
+            return Ok(false);
+        }
+
         if let Some(p) = opts.precision {
             if state.in_sum {
-                f.write_fmt(format_args!("{:+.*}", p, self))?
+                f.write_fmt(format_args!("{self:+.p$}"))?
             } else {
-                f.write_fmt(format_args!("{:.*}", p, self))?
+                f.write_fmt(format_args!("{self:.p$}"))?
             }
         } else if state.in_sum {
-            f.write_fmt(format_args!("{:+}", self))?
+            f.write_fmt(format_args!("{self:+}"))?
         } else {
-            f.write_fmt(format_args!("{}", self))?
+            f.write_fmt(format_args!("{self}"))?
         }
 
         Ok(false)
@@ -243,16 +354,34 @@ impl SelfRing for Float {
         state: crate::printer::PrintState,
         f: &mut W,
     ) -> Result<bool, fmt::Error> {
+        if opts.mode.is_mathematica() {
+            let mut s = String::new();
+            if let Some(p) = opts.precision {
+                if state.in_sum {
+                    s.write_fmt(format_args!("{self:+.p$}"))?
+                } else {
+                    s.write_fmt(format_args!("{self:.p$}"))?
+                }
+            } else if state.in_sum {
+                s.write_fmt(format_args!("{self:+}"))?
+            } else {
+                s.write_fmt(format_args!("{self}"))?
+            }
+
+            f.write_str(&s.replace('e', "*^"))?;
+            return Ok(false);
+        }
+
         if let Some(p) = opts.precision {
             if state.in_sum {
-                f.write_fmt(format_args!("{:+.*}", p, self))?
+                f.write_fmt(format_args!("{self:+.p$}"))?
             } else {
-                f.write_fmt(format_args!("{:.*}", p, self))?
+                f.write_fmt(format_args!("{self:.p$}"))?
             }
         } else if state.in_sum {
-            f.write_fmt(format_args!("{:+}", self))?
+            f.write_fmt(format_args!("{self:+}"))?
         } else {
-            f.write_fmt(format_args!("{}", self))?
+            f.write_fmt(format_args!("{self}"))?
         }
 
         Ok(false)
@@ -279,13 +408,15 @@ impl SelfRing for Complex<Float> {
     ) -> Result<bool, fmt::Error> {
         let re_zero = SingleFloat::is_zero(&self.re);
         let im_zero = SingleFloat::is_zero(&self.im);
-        let add_paren = (state.in_product || state.in_exp) && !re_zero && !im_zero;
+        let add_paren =
+            (state.in_product || state.in_exp || state.in_exp_base) && !re_zero && !im_zero
+                || (state.in_exp || state.in_exp_base) && !im_zero;
         if add_paren {
             f.write_char('(')?;
             state.in_sum = false;
         }
 
-        if !re_zero {
+        if !re_zero || im_zero {
             self.re.format(opts, state, f)?;
         }
 
@@ -296,8 +427,10 @@ impl SelfRing for Complex<Float> {
         if !im_zero {
             self.im.format(opts, state, f)?;
 
-            if opts.color_builtin_symbols {
+            if opts.mode.is_symbolica() && opts.color_builtin_symbols {
                 f.write_str("\u{1b}\u{5b}\u{33}\u{35}\u{6d}\u{1d456}\u{1b}\u{5b}\u{30}\u{6d}")?;
+            } else if opts.mode.is_mathematica() {
+                f.write_char('I')?;
             } else {
                 f.write_char('𝑖')?;
             }
@@ -311,9 +444,7 @@ impl SelfRing for Complex<Float> {
     }
 }
 
-impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> EuclideanDomain
-    for FloatField<T>
-{
+impl<T: SingleFloat + Hash + Eq + InternalOrdering> EuclideanDomain for FloatField<T> {
     #[inline(always)]
     fn rem(&self, a: &Self::Element, _: &Self::Element) -> Self::Element {
         a.zero()
@@ -330,7 +461,7 @@ impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Euclide
     }
 }
 
-impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Field for FloatField<T> {
+impl<T: SingleFloat + Hash + Eq + InternalOrdering> Field for FloatField<T> {
     #[inline(always)]
     fn div(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
         a.clone() / b
@@ -348,7 +479,8 @@ impl<T: NumericalFloatLike + SingleFloat + Hash + Eq + InternalOrdering> Field f
 }
 
 /// A number, that is potentially floating point.
-pub trait NumericalFloatLike:
+/// It must support basic arithmetic operations and has a precision.
+pub trait FloatLike:
     PartialEq
     + Clone
     + Debug
@@ -395,10 +527,13 @@ pub trait NumericalFloatLike:
 
     /// Sample a point on the interval [0, 1].
     fn sample_unit<R: Rng + ?Sized>(&self, rng: &mut R) -> Self;
+
+    /// Return true if the number is exactly equal to zero (in all components).
+    fn is_fully_zero(&self) -> bool;
 }
 
-/// A number that behaves like a single number.
-pub trait SingleFloat: NumericalFloatLike {
+/// A number that behaves like a single number (excluding simd-like types).
+pub trait SingleFloat: FloatLike {
     fn is_zero(&self) -> bool;
     fn is_one(&self) -> bool;
     fn is_finite(&self) -> bool;
@@ -406,15 +541,15 @@ pub trait SingleFloat: NumericalFloatLike {
     fn from_rational(&self, rat: &Rational) -> Self;
 }
 
-/// A number that can be converted to a usize, f64, or rounded to the nearest integer.
-pub trait RealNumberLike: SingleFloat {
+/// A number that can be converted to a `usize`, `f64`, or rounded to the nearest integer (excluding complex numbers).
+pub trait RealLike: SingleFloat {
     fn to_usize_clamped(&self) -> usize;
     fn to_f64(&self) -> f64;
     fn round_to_nearest_integer(&self) -> Integer;
 }
 
-/// A float that can be constructed without any parameters, such as f64.
-pub trait ConstructibleFloat: NumericalFloatLike {
+/// A float that can be constructed without any parameters, such as `f64` (excluding multi-precision floats).
+pub trait Constructible: FloatLike {
     fn new_one() -> Self;
     fn new_from_usize(a: usize) -> Self;
     fn new_from_i64(a: i64) -> Self;
@@ -424,7 +559,9 @@ pub trait ConstructibleFloat: NumericalFloatLike {
 
 /// A number that behaves like a real number, with constants like π and e
 /// and functions like sine and cosine.
-pub trait Real: NumericalFloatLike {
+///
+/// It may also have a notion of an imaginary unit.
+pub trait Real: FloatLike {
     /// The constant π, 3.1415926535...
     fn pi(&self) -> Self;
     /// Euler's number, 2.7182818...
@@ -436,6 +573,7 @@ pub trait Real: NumericalFloatLike {
     /// The imaginary unit, if it exists.
     fn i(&self) -> Option<Self>;
 
+    fn conj(&self) -> Self;
     fn norm(&self) -> Self;
     fn sqrt(&self) -> Self;
     fn log(&self) -> Self;
@@ -455,7 +593,7 @@ pub trait Real: NumericalFloatLike {
     fn powf(&self, e: &Self) -> Self;
 }
 
-impl NumericalFloatLike for f64 {
+impl FloatLike for f64 {
     #[inline(always)]
     fn mul_add(&self, a: &Self, b: &Self) -> Self {
         f64::mul_add(*self, *a, *b)
@@ -521,6 +659,11 @@ impl NumericalFloatLike for f64 {
     fn sample_unit<R: Rng + ?Sized>(&self, rng: &mut R) -> Self {
         rng.random()
     }
+
+    #[inline(always)]
+    fn is_fully_zero(&self) -> bool {
+        *self == 0.
+    }
 }
 
 impl SingleFloat for f64 {
@@ -545,7 +688,7 @@ impl SingleFloat for f64 {
     }
 }
 
-impl RealNumberLike for f64 {
+impl RealLike for f64 {
     fn to_usize_clamped(&self) -> usize {
         *self as usize
     }
@@ -564,7 +707,7 @@ impl RealNumberLike for f64 {
     }
 }
 
-impl ConstructibleFloat for f64 {
+impl Constructible for f64 {
     #[inline(always)]
     fn new_one() -> Self {
         1.
@@ -610,6 +753,11 @@ impl Real for f64 {
     #[inline(always)]
     fn i(&self) -> Option<Self> {
         None
+    }
+
+    #[inline(always)]
+    fn conj(&self) -> Self {
+        *self
     }
 
     #[inline(always)]
@@ -712,10 +860,11 @@ impl From<Rational> for f64 {
 
 /// A wrapper around `f64` that implements `Eq`, `Ord`, and `Hash`.
 /// All `NaN` values are considered equal, and `-0` is considered equal to `0`.
+#[repr(transparent)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
 #[derive(Debug, Copy, Clone)]
-pub struct F64(f64);
+pub struct F64(pub f64);
 
 impl F64 {
     pub fn into_inner(self) -> f64 {
@@ -723,7 +872,7 @@ impl F64 {
     }
 }
 
-impl NumericalFloatLike for F64 {
+impl FloatLike for F64 {
     #[inline(always)]
     fn mul_add(&self, a: &Self, b: &Self) -> Self {
         self.0.mul_add(a.0, b.0).into()
@@ -751,7 +900,7 @@ impl NumericalFloatLike for F64 {
 
     #[inline(always)]
     fn pow(&self, e: u64) -> Self {
-        NumericalFloatLike::pow(&self.0, e).into()
+        FloatLike::pow(&self.0, e).into()
     }
 
     #[inline(always)]
@@ -787,6 +936,11 @@ impl NumericalFloatLike for F64 {
     #[inline(always)]
     fn sample_unit<R: Rng + ?Sized>(&self, rng: &mut R) -> Self {
         self.0.sample_unit(rng).into()
+    }
+
+    #[inline(always)]
+    fn is_fully_zero(&self) -> bool {
+        self.0 == 0.
     }
 }
 
@@ -949,7 +1103,7 @@ impl SingleFloat for F64 {
     }
 }
 
-impl RealNumberLike for F64 {
+impl RealLike for F64 {
     fn to_usize_clamped(&self) -> usize {
         self.0.to_usize_clamped()
     }
@@ -964,7 +1118,7 @@ impl RealNumberLike for F64 {
     }
 }
 
-impl ConstructibleFloat for F64 {
+impl Constructible for F64 {
     #[inline(always)]
     fn new_one() -> Self {
         f64::new_one().into()
@@ -1010,6 +1164,11 @@ impl Real for F64 {
     #[inline(always)]
     fn i(&self) -> Option<Self> {
         None
+    }
+
+    #[inline(always)]
+    fn conj(&self) -> Self {
+        *self
     }
 
     #[inline(always)]
@@ -1306,16 +1465,15 @@ impl Add<&Float> for Float {
 
         let mut r = self.0 + &rhs.0;
 
-        if let Some(e) = r.get_exp() {
-            if let Some(e1) = e1 {
-                if let Some(e2) = rhs.0.get_exp() {
-                    // the max is at most 2 binary digits off
-                    let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
+        if let Some(e) = r.get_exp()
+            && let Some(e1) = e1
+            && let Some(e2) = rhs.0.get_exp()
+        {
+            // the max is at most 2 binary digits off
+            let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
 
-                    // set the min precision to 1, from this point on the result is unreliable
-                    r.set_prec(1.max(max_prec.min(r.prec() as i32)) as u32);
-                }
-            }
+            // set the min precision to 1, from this point on the result is unreliable
+            r.set_prec(1.max(max_prec.min(r.prec() as i32)) as u32);
         }
 
         r.into()
@@ -1349,13 +1507,12 @@ impl Sub<&Float> for Float {
 
         let mut r = self.0 - &rhs.0;
 
-        if let Some(e) = r.get_exp() {
-            if let Some(e1) = e1 {
-                if let Some(e2) = rhs.0.get_exp() {
-                    let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
-                    r.set_prec(1.max(max_prec.min(r.prec() as i32)) as u32);
-                }
-            }
+        if let Some(e) = r.get_exp()
+            && let Some(e1) = e1
+            && let Some(e2) = rhs.0.get_exp()
+        {
+            let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
+            r.set_prec(1.max(max_prec.min(r.prec() as i32)) as u32);
         }
 
         r.into()
@@ -1439,13 +1596,12 @@ impl AddAssign<&Float> for Float {
 
         self.0.add_assign(&rhs.0);
 
-        if let Some(e) = self.0.get_exp() {
-            if let Some(e1) = e1 {
-                if let Some(e2) = rhs.0.get_exp() {
-                    let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
-                    self.set_prec(1.max(max_prec.min(self.prec() as i32)) as u32);
-                }
-            }
+        if let Some(e) = self.0.get_exp()
+            && let Some(e1) = e1
+            && let Some(e2) = rhs.0.get_exp()
+        {
+            let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
+            self.set_prec(1.max(max_prec.min(self.prec() as i32)) as u32);
         }
     }
 }
@@ -1469,13 +1625,12 @@ impl SubAssign<&Float> for Float {
 
         self.0.sub_assign(&rhs.0);
 
-        if let Some(e) = self.0.get_exp() {
-            if let Some(e1) = e1 {
-                if let Some(e2) = rhs.0.get_exp() {
-                    let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
-                    self.set_prec(1.max(max_prec.min(self.prec() as i32)) as u32);
-                }
-            }
+        if let Some(e) = self.0.get_exp()
+            && let Some(e1) = e1
+            && let Some(e2) = rhs.0.get_exp()
+        {
+            let max_prec = e + 1 - (e1 - sp as i32).max(e2 - rhs.prec() as i32);
+            self.set_prec(1.max(max_prec.min(self.prec() as i32)) as u32);
         }
     }
 }
@@ -1531,37 +1686,6 @@ impl DivAssign<Float> for Float {
     }
 }
 
-impl Add<i64> for Float {
-    type Output = Self;
-
-    /// Add an infinite-precision `i64` to the float.
-    #[inline]
-    fn add(mut self, rhs: i64) -> Self::Output {
-        if rhs == 0 {
-            return self;
-        }
-
-        let Some(e1) = self.0.get_exp() else {
-            return self + rhs;
-        };
-
-        let e2 = rhs.unsigned_abs().ilog2() + 1;
-        let old_prec = self.prec();
-
-        if e1.unsigned_abs() <= e2 {
-            self.set_prec(old_prec + (e2 as i32 - e1) as u32 + 1);
-        }
-
-        let mut r = self.0 + rhs;
-
-        if let Some(e) = r.get_exp() {
-            r.set_prec((1.max(old_prec as i32 + 1 - (e1 - e))) as u32);
-        }
-
-        r.into()
-    }
-}
-
 impl Add<Float> for i64 {
     type Output = Float;
 
@@ -1569,16 +1693,6 @@ impl Add<Float> for i64 {
     #[inline]
     fn add(self, rhs: Float) -> Self::Output {
         rhs + self
-    }
-}
-
-impl Sub<i64> for Float {
-    type Output = Self;
-
-    /// Subtract an infinite-precision `i64` from a float.
-    #[inline]
-    fn sub(self, rhs: i64) -> Self::Output {
-        self + -rhs
     }
 }
 
@@ -1592,16 +1706,6 @@ impl Sub<Float> for i64 {
     }
 }
 
-impl Mul<i64> for Float {
-    type Output = Self;
-
-    /// Multiply an infinite-precision `i64` to a float.
-    #[inline]
-    fn mul(self, rhs: i64) -> Self::Output {
-        (self.0 * rhs).into()
-    }
-}
-
 impl Mul<Float> for i64 {
     type Output = Float;
 
@@ -1609,16 +1713,6 @@ impl Mul<Float> for i64 {
     #[inline]
     fn mul(self, rhs: Float) -> Self::Output {
         (self * rhs.0).into()
-    }
-}
-
-impl Div<i64> for Float {
-    type Output = Self;
-
-    /// Divide an infinite-precision `i64` from a float.
-    #[inline]
-    fn div(self, rhs: i64) -> Self::Output {
-        (self.0 / rhs).into()
     }
 }
 
@@ -1632,28 +1726,54 @@ impl Div<Float> for i64 {
     }
 }
 
-impl Add<Rational> for Float {
+impl<R: Into<Rational>> Add<R> for Float {
     type Output = Self;
 
     /// Add an infinite-precision rational to the float.
     #[inline]
-    fn add(mut self, rhs: Rational) -> Self::Output {
+    fn add(mut self, rhs: R) -> Self::Output {
+        fn get_bits(i: &Integer) -> i32 {
+            match i {
+                Integer::Single(n) => n.unsigned_abs().ilog2() as i32 + 1,
+                Integer::Double(n) => n.unsigned_abs().ilog2() as i32 + 1,
+                Integer::Large(r) => r.significant_bits() as i32,
+            }
+        }
+
+        let rhs = rhs.into();
         if rhs.is_zero() {
             return self;
+        }
+
+        if rhs.denominator_ref().is_one() {
+            let Some(e1) = self.0.get_exp() else {
+                return self + rhs;
+            };
+
+            let e2 = get_bits(&rhs.numerator_ref());
+            let old_prec = self.prec();
+
+            if e1 <= e2 {
+                self.set_prec(old_prec + (e2 as i32 - e1) as u32 + 1);
+            }
+
+            let mut r = match rhs.numerator() {
+                Integer::Single(n) => self.0 + n,
+                Integer::Double(n) => self.0 + n,
+                Integer::Large(n) => self.0 + n,
+            };
+
+            if let Some(e) = r.get_exp() {
+                r.set_prec((1.max(old_prec as i32 + 1 - (e1 - e))) as u32);
+            }
+
+            return r.into();
         }
 
         let Some(e1) = self.0.get_exp() else {
             let np = self.prec();
             return (self.0 + rhs.to_multi_prec_float(np).0).into();
         };
-
-        fn get_bits(i: &Integer) -> i32 {
-            match i {
-                Integer::Natural(n) => n.unsigned_abs().ilog2() as i32 + 1,
-                Integer::Double(n) => n.unsigned_abs().ilog2() as i32 + 1,
-                Integer::Large(r) => r.significant_bits() as i32,
-            }
-        }
 
         // TODO: check off-by-one errors
         let e2 = get_bits(rhs.numerator_ref()) - get_bits(rhs.denominator_ref());
@@ -1675,30 +1795,50 @@ impl Add<Rational> for Float {
     }
 }
 
-impl Sub<Rational> for Float {
+impl<R: Into<Rational>> Sub<R> for Float {
     type Output = Self;
 
     #[inline]
-    fn sub(self, rhs: Rational) -> Self::Output {
-        self + -rhs
+    fn sub(self, rhs: R) -> Self::Output {
+        self + -rhs.into()
     }
 }
 
-impl Mul<Rational> for Float {
+impl<R: Into<Rational>> Mul<R> for Float {
     type Output = Self;
 
     #[inline]
-    fn mul(self, rhs: Rational) -> Self::Output {
-        (self.0 * rhs.to_multi_prec()).into()
+    fn mul(self, rhs: R) -> Self::Output {
+        let r = rhs.into();
+        if r.is_integer() {
+            match r.numerator() {
+                Integer::Single(n) => self.0 * n,
+                Integer::Double(n) => self.0 * n,
+                Integer::Large(n) => self.0 * n,
+            }
+            .into()
+        } else {
+            (self.0 * r.to_multi_prec()).into()
+        }
     }
 }
 
-impl Div<Rational> for Float {
+impl<R: Into<Rational>> Div<R> for Float {
     type Output = Self;
 
     #[inline]
-    fn div(self, rhs: Rational) -> Self::Output {
-        (self.0 / rhs.to_multi_prec()).into()
+    fn div(self, rhs: R) -> Self::Output {
+        let r = rhs.into();
+        if r.is_integer() {
+            match r.numerator() {
+                Integer::Single(n) => self.0 / n,
+                Integer::Double(n) => self.0 / n,
+                Integer::Large(n) => self.0 / n,
+            }
+            .into()
+        } else {
+            (self.0 / r.to_multi_prec()).into()
+        }
     }
 }
 
@@ -1740,7 +1880,8 @@ impl Float {
     /// Precision can be specified by a trailing backtick followed by the precision.
     /// For example: ```1.234`20``` for a precision of 20 decimal digits.
     /// The precision is allowed to be a floating point number.
-    ///  If `prec` is `None` and no precision is specified, the precision is derived from the string, with
+    ///  If `prec` is `None` and no precision is specified (either no backtick
+    /// or a backtick without a number following), the precision is derived from the string, with
     /// a minimum of 53 bits (`f64` precision).
     pub fn parse(s: &str, prec: Option<u32>) -> Result<Self, String> {
         if let Some(prec) = prec {
@@ -1750,11 +1891,15 @@ impl Float {
                     .complete(prec),
             ))
         } else if let Some((f, p)) = s.split_once('`') {
-            let prec = (p
-                .parse::<f64>()
-                .map_err(|e| format!("Invalid precision: {}", e))?
-                * LOG2_10)
-                .ceil() as u32;
+            let prec = if p.is_empty() {
+                53
+            } else {
+                (p.parse::<f64>()
+                    .map_err(|e| format!("Invalid precision: {e}"))?
+                    * LOG2_10)
+                    .ceil() as u32
+            };
+
             Ok(Float(
                 MultiPrecisionFloat::parse(f)
                     .map_err(|e| e.to_string())?
@@ -1792,6 +1937,10 @@ impl Float {
         self.0.to_rational().unwrap().into()
     }
 
+    pub fn try_to_rational(&self) -> Option<Rational> {
+        self.0.to_rational().map(|x| x.into())
+    }
+
     pub fn into_inner(self) -> MultiPrecisionFloat {
         self.0
     }
@@ -1803,7 +1952,7 @@ impl From<MultiPrecisionFloat> for Float {
     }
 }
 
-impl NumericalFloatLike for Float {
+impl FloatLike for Float {
     #[inline(always)]
     fn mul_add(&self, a: &Self, b: &Self) -> Self {
         self.clone() * a + b
@@ -1869,6 +2018,10 @@ impl NumericalFloatLike for Float {
         let f: f64 = rng.random();
         Float::with_val(self.prec(), f)
     }
+
+    fn is_fully_zero(&self) -> bool {
+        self.0.is_zero()
+    }
 }
 
 impl SingleFloat for Float {
@@ -1893,7 +2046,7 @@ impl SingleFloat for Float {
     }
 }
 
-impl RealNumberLike for Float {
+impl RealLike for Float {
     fn to_usize_clamped(&self) -> usize {
         self.0
             .to_integer()
@@ -1939,6 +2092,11 @@ impl Real for Float {
     }
 
     #[inline(always)]
+    fn conj(&self) -> Self {
+        self.clone()
+    }
+
+    #[inline(always)]
     fn norm(&self) -> Self {
         self.0.clone().abs().into()
     }
@@ -1951,8 +2109,9 @@ impl Real for Float {
     #[inline(always)]
     fn log(&self) -> Self {
         // Log grows in precision if the input is less than 1/e and more than e
-        let e = self.0.get_exp().unwrap();
-        if !(0..2).contains(&e) {
+        if let Some(e) = self.0.get_exp()
+            && !(0..2).contains(&e)
+        {
             MultiPrecisionFloat::with_val(
                 self.0.prec() + e.unsigned_abs().ilog2() + 1,
                 self.0.ln_ref(),
@@ -2019,14 +2178,14 @@ impl Real for Float {
 
     #[inline(always)]
     fn tanh(&self) -> Self {
-        if let Some(e) = self.0.get_exp() {
-            if e > 0 {
-                return MultiPrecisionFloat::with_val(
-                    self.0.prec() + 3 * e.unsigned_abs() + 1,
-                    self.0.tanh_ref(),
-                )
-                .into();
-            }
+        if let Some(e) = self.0.get_exp()
+            && e > 0
+        {
+            return MultiPrecisionFloat::with_val(
+                self.0.prec() + 3 * e.unsigned_abs() + 1,
+                self.0.tanh_ref(),
+            )
+            .into();
         }
 
         self.0.clone().tanh().into()
@@ -2050,22 +2209,22 @@ impl Real for Float {
     #[inline]
     fn powf(&self, e: &Self) -> Self {
         let mut c = self.0.clone();
-        if let Some(exp) = e.0.get_exp() {
-            if let Some(eb) = self.0.get_exp() {
-                // eb is (over)estimate of ln(self)
-                // TODO: prevent taking the wrong branch when self = 1
-                if eb == 0 {
-                    c.set_prec(1.max((self.0.prec() as i32 - exp + 1) as u32));
-                } else {
-                    c.set_prec(
-                        1.max(
-                            (self.0.prec() as i32)
-                                .min((e.0.prec() as i32) + eb.unsigned_abs().ilog2() as i32)
-                                - exp
-                                + 1,
-                        ) as u32,
-                    );
-                }
+        if let Some(exp) = e.0.get_exp()
+            && let Some(eb) = self.0.get_exp()
+        {
+            // eb is (over)estimate of ln(self)
+            // TODO: prevent taking the wrong branch when self = 1
+            if eb == 0 {
+                c.set_prec(1.max((self.0.prec() as i32 - exp + 1) as u32));
+            } else {
+                c.set_prec(
+                    1.max(
+                        (self.0.prec() as i32)
+                            .min((e.0.prec() as i32) + eb.unsigned_abs().ilog2() as i32)
+                            - exp
+                            + 1,
+                    ) as u32,
+                );
             }
         }
 
@@ -2088,28 +2247,28 @@ impl Rational {
 
 /// A float that does linear error propagation.
 #[derive(Copy, Clone)]
-pub struct ErrorPropagatingFloat<T: NumericalFloatLike> {
+pub struct ErrorPropagatingFloat<T: FloatLike> {
     value: T,
     abs_err: f64,
 }
 
-impl From<f64> for ErrorPropagatingFloat<f64> {
+impl<T: FloatLike + From<f64>> From<f64> for ErrorPropagatingFloat<T> {
     fn from(value: f64) -> Self {
         if value == 0. {
             ErrorPropagatingFloat {
-                value,
+                value: value.into(),
                 abs_err: f64::EPSILON,
             }
         } else {
             ErrorPropagatingFloat {
-                value,
+                value: value.into(),
                 abs_err: f64::EPSILON * value.abs(),
             }
         }
     }
 }
 
-impl<T: NumericalFloatLike> Neg for ErrorPropagatingFloat<T> {
+impl<T: FloatLike> Neg for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2121,7 +2280,7 @@ impl<T: NumericalFloatLike> Neg for ErrorPropagatingFloat<T> {
     }
 }
 
-impl<T: RealNumberLike> Add<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: FloatLike> Add<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2133,7 +2292,7 @@ impl<T: RealNumberLike> Add<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat
     }
 }
 
-impl<T: RealNumberLike> Add<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: FloatLike> Add<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2142,7 +2301,7 @@ impl<T: RealNumberLike> Add<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<
     }
 }
 
-impl<T: RealNumberLike> Sub<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: FloatLike> Sub<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2151,7 +2310,7 @@ impl<T: RealNumberLike> Sub<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat
     }
 }
 
-impl<T: RealNumberLike> Sub<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: FloatLike> Sub<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2160,7 +2319,7 @@ impl<T: RealNumberLike> Sub<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<
     }
 }
 
-impl<T: RealNumberLike> Mul<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> Mul<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2183,32 +2342,39 @@ impl<T: RealNumberLike> Mul<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat
     }
 }
 
-impl<T: RealNumberLike + Add<Rational, Output = T>> Add<Rational> for ErrorPropagatingFloat<T> {
+impl<T: RealLike + Add<Rational, Output = T>, R: Into<Rational>> Add<R>
+    for ErrorPropagatingFloat<T>
+{
     type Output = Self;
 
     #[inline]
-    fn add(self, rhs: Rational) -> Self::Output {
+    fn add(self, rhs: R) -> Self::Output {
         ErrorPropagatingFloat {
             abs_err: self.abs_err,
-            value: self.value + rhs,
+            value: self.value + rhs.into(),
         }
     }
 }
 
-impl<T: RealNumberLike + Add<Rational, Output = T>> Sub<Rational> for ErrorPropagatingFloat<T> {
+impl<T: RealLike + Add<Rational, Output = T>, R: Into<Rational>> Sub<R>
+    for ErrorPropagatingFloat<T>
+{
     type Output = Self;
 
     #[inline]
-    fn sub(self, rhs: Rational) -> Self::Output {
-        self + -rhs
+    fn sub(self, rhs: R) -> Self::Output {
+        self + -rhs.into()
     }
 }
 
-impl<T: RealNumberLike + Mul<Rational, Output = T>> Mul<Rational> for ErrorPropagatingFloat<T> {
+impl<T: RealLike + Mul<Rational, Output = T>, R: Into<Rational>> Mul<R>
+    for ErrorPropagatingFloat<T>
+{
     type Output = Self;
 
     #[inline]
-    fn mul(self, rhs: Rational) -> Self::Output {
+    fn mul(self, rhs: R) -> Self::Output {
+        let rhs = rhs.into();
         ErrorPropagatingFloat {
             abs_err: self.abs_err * rhs.to_f64().abs(),
             value: self.value * rhs,
@@ -2217,11 +2383,14 @@ impl<T: RealNumberLike + Mul<Rational, Output = T>> Mul<Rational> for ErrorPropa
     }
 }
 
-impl<T: RealNumberLike + Div<Rational, Output = T>> Div<Rational> for ErrorPropagatingFloat<T> {
+impl<T: RealLike + Div<Rational, Output = T>, R: Into<Rational>> Div<R>
+    for ErrorPropagatingFloat<T>
+{
     type Output = Self;
 
     #[inline]
-    fn div(self, rhs: Rational) -> Self::Output {
+    fn div(self, rhs: R) -> Self::Output {
+        let rhs = rhs.into();
         ErrorPropagatingFloat {
             abs_err: self.abs_err * rhs.inv().to_f64().abs(),
             value: self.value.clone() / rhs,
@@ -2230,7 +2399,43 @@ impl<T: RealNumberLike + Div<Rational, Output = T>> Div<Rational> for ErrorPropa
     }
 }
 
-impl<T: RealNumberLike> Mul<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: FloatLike + From<f64>> Add<f64> for ErrorPropagatingFloat<T> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: f64) -> Self::Output {
+        self + Self::from(rhs)
+    }
+}
+
+impl<T: FloatLike + From<f64>> Sub<f64> for ErrorPropagatingFloat<T> {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: f64) -> Self::Output {
+        self - Self::from(rhs)
+    }
+}
+
+impl<T: RealLike + From<f64>> Mul<f64> for ErrorPropagatingFloat<T> {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: f64) -> Self::Output {
+        self * Self::from(rhs)
+    }
+}
+
+impl<T: RealLike + From<f64>> Div<f64> for ErrorPropagatingFloat<T> {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: f64) -> Self::Output {
+        self / Self::from(rhs)
+    }
+}
+
+impl<T: RealLike> Mul<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2239,7 +2444,7 @@ impl<T: RealNumberLike> Mul<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<
     }
 }
 
-impl<T: RealNumberLike> Div<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> Div<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2248,7 +2453,7 @@ impl<T: RealNumberLike> Div<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat
     }
 }
 
-impl<T: RealNumberLike> Div<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> Div<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     type Output = Self;
 
     #[inline]
@@ -2257,7 +2462,7 @@ impl<T: RealNumberLike> Div<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<
     }
 }
 
-impl<T: RealNumberLike> AddAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> AddAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn add_assign(&mut self, rhs: &ErrorPropagatingFloat<T>) {
         // TODO: optimize
@@ -2265,14 +2470,14 @@ impl<T: RealNumberLike> AddAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatin
     }
 }
 
-impl<T: RealNumberLike> AddAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> AddAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn add_assign(&mut self, rhs: ErrorPropagatingFloat<T>) {
         self.add_assign(&rhs)
     }
 }
 
-impl<T: RealNumberLike> SubAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> SubAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn sub_assign(&mut self, rhs: &ErrorPropagatingFloat<T>) {
         // TODO: optimize
@@ -2280,14 +2485,14 @@ impl<T: RealNumberLike> SubAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatin
     }
 }
 
-impl<T: RealNumberLike> SubAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> SubAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn sub_assign(&mut self, rhs: ErrorPropagatingFloat<T>) {
         self.sub_assign(&rhs)
     }
 }
 
-impl<T: RealNumberLike> MulAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> MulAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn mul_assign(&mut self, rhs: &ErrorPropagatingFloat<T>) {
         // TODO: optimize
@@ -2295,14 +2500,14 @@ impl<T: RealNumberLike> MulAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatin
     }
 }
 
-impl<T: RealNumberLike> MulAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> MulAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn mul_assign(&mut self, rhs: ErrorPropagatingFloat<T>) {
         self.mul_assign(&rhs)
     }
 }
 
-impl<T: RealNumberLike> DivAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> DivAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn div_assign(&mut self, rhs: &ErrorPropagatingFloat<T>) {
         // TODO: optimize
@@ -2310,14 +2515,14 @@ impl<T: RealNumberLike> DivAssign<&ErrorPropagatingFloat<T>> for ErrorPropagatin
     }
 }
 
-impl<T: RealNumberLike> DivAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
+impl<T: RealLike> DivAssign<ErrorPropagatingFloat<T>> for ErrorPropagatingFloat<T> {
     #[inline]
     fn div_assign(&mut self, rhs: ErrorPropagatingFloat<T>) {
         self.div_assign(&rhs)
     }
 }
 
-impl<T: RealNumberLike> ErrorPropagatingFloat<T> {
+impl<T: RealLike> ErrorPropagatingFloat<T> {
     /// Create a new precision tracking float with a number of precise decimal digits `prec`.
     /// The `prec` must be smaller than the precision of the underlying float.
     ///
@@ -2377,7 +2582,7 @@ impl<T: RealNumberLike> ErrorPropagatingFloat<T> {
     }
 }
 
-impl<T: NumericalFloatLike> ErrorPropagatingFloat<T> {
+impl<T: FloatLike> ErrorPropagatingFloat<T> {
     pub fn new_with_accuracy(value: T, acc: f64) -> Self {
         ErrorPropagatingFloat {
             value,
@@ -2392,7 +2597,7 @@ impl<T: NumericalFloatLike> ErrorPropagatingFloat<T> {
     }
 }
 
-impl<T: RealNumberLike> fmt::Display for ErrorPropagatingFloat<T> {
+impl<T: RealLike> fmt::Display for ErrorPropagatingFloat<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(p) = self.get_precision() {
             if p < 0. {
@@ -2406,38 +2611,38 @@ impl<T: RealNumberLike> fmt::Display for ErrorPropagatingFloat<T> {
     }
 }
 
-impl<T: RealNumberLike> Debug for ErrorPropagatingFloat<T> {
+impl<T: RealLike> Debug for ErrorPropagatingFloat<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Debug::fmt(&self.value, f)?;
 
         if let Some(p) = self.get_precision() {
-            f.write_fmt(format_args!("`{:.2}", p))
+            f.write_fmt(format_args!("`{p:.2}"))
         } else {
             f.write_fmt(format_args!("``{:.2}", -self.abs_err.log10()))
         }
     }
 }
 
-impl<T: RealNumberLike> LowerExp for ErrorPropagatingFloat<T> {
+impl<T: RealLike> LowerExp for ErrorPropagatingFloat<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(self, f)
     }
 }
 
-impl<T: NumericalFloatLike> PartialEq for ErrorPropagatingFloat<T> {
+impl<T: FloatLike> PartialEq for ErrorPropagatingFloat<T> {
     fn eq(&self, other: &Self) -> bool {
         // TODO: ignore precision for partial equality?
         self.value == other.value
     }
 }
 
-impl<T: NumericalFloatLike + PartialOrd> PartialOrd for ErrorPropagatingFloat<T> {
+impl<T: FloatLike + PartialOrd> PartialOrd for ErrorPropagatingFloat<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.value.partial_cmp(&other.value)
     }
 }
 
-impl<T: RealNumberLike> NumericalFloatLike for ErrorPropagatingFloat<T> {
+impl<T: RealLike> FloatLike for ErrorPropagatingFloat<T> {
     fn mul_add(&self, a: &Self, b: &Self) -> Self {
         self.clone() * a + b
     }
@@ -2549,9 +2754,13 @@ impl<T: RealNumberLike> NumericalFloatLike for ErrorPropagatingFloat<T> {
             value: v,
         }
     }
+
+    fn is_fully_zero(&self) -> bool {
+        self.value.is_fully_zero()
+    }
 }
 
-impl<T: RealNumberLike> SingleFloat for ErrorPropagatingFloat<T> {
+impl<T: RealLike> SingleFloat for ErrorPropagatingFloat<T> {
     fn is_zero(&self) -> bool {
         self.value.is_zero()
     }
@@ -2579,7 +2788,7 @@ impl<T: RealNumberLike> SingleFloat for ErrorPropagatingFloat<T> {
     }
 }
 
-impl<T: RealNumberLike> RealNumberLike for ErrorPropagatingFloat<T> {
+impl<T: RealLike> RealLike for ErrorPropagatingFloat<T> {
     fn to_usize_clamped(&self) -> usize {
         self.value.to_usize_clamped()
     }
@@ -2594,7 +2803,7 @@ impl<T: RealNumberLike> RealNumberLike for ErrorPropagatingFloat<T> {
     }
 }
 
-impl<T: Real + RealNumberLike> Real for ErrorPropagatingFloat<T> {
+impl<T: Real + RealLike> Real for ErrorPropagatingFloat<T> {
     fn pi(&self) -> Self {
         let v = self.value.pi();
         ErrorPropagatingFloat {
@@ -2633,6 +2842,13 @@ impl<T: Real + RealNumberLike> Real for ErrorPropagatingFloat<T> {
             value: self.value.i()?,
             abs_err: 2f64.pow(-(self.value.get_precision() as f64)),
         })
+    }
+
+    fn conj(&self) -> Self {
+        ErrorPropagatingFloat {
+            abs_err: self.abs_err,
+            value: self.value.conj(),
+        }
     }
 
     fn norm(&self) -> Self {
@@ -2815,7 +3031,7 @@ impl<T: Real + RealNumberLike> Real for ErrorPropagatingFloat<T> {
 
 macro_rules! simd_impl {
     ($t:ty, $p:ident) => {
-        impl NumericalFloatLike for $t {
+        impl FloatLike for $t {
             #[inline(always)]
             fn mul_add(&self, a: &Self, b: &Self) -> Self {
                 *self * *a + b
@@ -2881,6 +3097,10 @@ macro_rules! simd_impl {
             fn sample_unit<R: Rng + ?Sized>(&self, rng: &mut R) -> Self {
                 Self::from(rng.random::<f64>())
             }
+
+            fn is_fully_zero(&self) -> bool {
+                (*self).eq(&Self::ZERO)
+            }
         }
 
         impl Real for $t {
@@ -2907,6 +3127,11 @@ macro_rules! simd_impl {
             #[inline(always)]
             fn i(&self) -> Option<Self> {
                 None
+            }
+
+            #[inline(always)]
+            fn conj(&self) -> Self {
+                (*self)
             }
 
             #[inline(always)]
@@ -3006,20 +3231,24 @@ macro_rules! simd_impl {
 simd_impl!(f64x2, pow_f64x2);
 simd_impl!(f64x4, pow_f64x4);
 
-impl From<Float> for Rational {
-    fn from(value: Float) -> Self {
-        value.to_rational()
+impl TryFrom<Float> for Rational {
+    type Error = &'static str;
+
+    fn try_from(value: Float) -> Result<Self, Self::Error> {
+        value
+            .try_to_rational()
+            .ok_or("Cannot convert Float to Rational")
     }
 }
 
 impl LowerExp for Rational {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // lower-exp is ignored for integers
-        f.write_fmt(format_args!("{}", self))
+        f.write_fmt(format_args!("{self}"))
     }
 }
 
-impl NumericalFloatLike for Rational {
+impl FloatLike for Rational {
     fn mul_add(&self, a: &Self, b: &Self) -> Self {
         self * a + b
     }
@@ -3081,9 +3310,13 @@ impl NumericalFloatLike for Rational {
             (rng1, rng2).into()
         }
     }
+
+    fn is_fully_zero(&self) -> bool {
+        self.is_zero()
+    }
 }
 
-impl ConstructibleFloat for Rational {
+impl Constructible for Rational {
     fn new_one() -> Self {
         Rational::one()
     }
@@ -3130,7 +3363,7 @@ impl SingleFloat for Rational {
     }
 }
 
-impl RealNumberLike for Rational {
+impl RealLike for Rational {
     fn to_usize_clamped(&self) -> usize {
         f64::from(self).to_usize_clamped()
     }
@@ -3172,7 +3405,13 @@ impl<T: InternalOrdering> InternalOrdering for Complex<T> {
     }
 }
 
-impl<T: ConstructibleFloat> ConstructibleFloat for Complex<T> {
+impl<T> From<(T, T)> for Complex<T> {
+    fn from((re, im): (T, T)) -> Self {
+        Complex { re, im }
+    }
+}
+
+impl<T: Constructible> Constructible for Complex<T> {
     fn new_from_i64(a: i64) -> Self {
         Complex {
             re: T::new_from_i64(a),
@@ -3202,16 +3441,16 @@ impl<T: ConstructibleFloat> ConstructibleFloat for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Complex<T> {
+impl<T: FloatLike> Complex<T> {
     #[inline]
-    pub fn new(re: T, im: T) -> Complex<T> {
+    pub const fn new(re: T, im: T) -> Complex<T> {
         Complex { re, im }
     }
 
     #[inline]
     pub fn new_zero() -> Self
     where
-        T: ConstructibleFloat,
+        T: Constructible,
     {
         Complex {
             re: T::new_zero(),
@@ -3222,7 +3461,7 @@ impl<T: NumericalFloatLike> Complex<T> {
     #[inline]
     pub fn new_i() -> Self
     where
-        T: ConstructibleFloat,
+        T: Constructible,
     {
         Complex {
             re: T::new_zero(),
@@ -3300,7 +3539,7 @@ impl<T: SingleFloat> Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<Complex<T>> for Complex<T> {
+impl<T: FloatLike> Add<Complex<T>> for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3309,7 +3548,7 @@ impl<T: NumericalFloatLike> Add<Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<T> for Complex<T> {
+impl<T: FloatLike> Add<T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3318,7 +3557,7 @@ impl<T: NumericalFloatLike> Add<T> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> Add<&Complex<T>> for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3327,7 +3566,7 @@ impl<T: NumericalFloatLike> Add<&Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<&T> for Complex<T> {
+impl<T: FloatLike> Add<&T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3336,7 +3575,7 @@ impl<T: NumericalFloatLike> Add<&T> for Complex<T> {
     }
 }
 
-impl<'a, T: NumericalFloatLike> Add<&'a Complex<T>> for &Complex<T> {
+impl<'a, T: FloatLike> Add<&'a Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3345,7 +3584,7 @@ impl<'a, T: NumericalFloatLike> Add<&'a Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<&T> for &Complex<T> {
+impl<T: FloatLike> Add<&T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3354,7 +3593,7 @@ impl<T: NumericalFloatLike> Add<&T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<Complex<T>> for &Complex<T> {
+impl<T: FloatLike> Add<Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3363,7 +3602,7 @@ impl<T: NumericalFloatLike> Add<Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Add<T> for &Complex<T> {
+impl<T: FloatLike> Add<T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3372,21 +3611,21 @@ impl<T: NumericalFloatLike> Add<T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> AddAssign for Complex<T> {
+impl<T: FloatLike> AddAssign for Complex<T> {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
         self.add_assign(&rhs)
     }
 }
 
-impl<T: NumericalFloatLike> AddAssign<T> for Complex<T> {
+impl<T: FloatLike> AddAssign<T> for Complex<T> {
     #[inline]
     fn add_assign(&mut self, rhs: T) {
         self.re += rhs;
     }
 }
 
-impl<T: NumericalFloatLike> AddAssign<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> AddAssign<&Complex<T>> for Complex<T> {
     #[inline]
     fn add_assign(&mut self, rhs: &Self) {
         self.re += &rhs.re;
@@ -3394,14 +3633,14 @@ impl<T: NumericalFloatLike> AddAssign<&Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> AddAssign<&T> for Complex<T> {
+impl<T: FloatLike> AddAssign<&T> for Complex<T> {
     #[inline]
     fn add_assign(&mut self, rhs: &T) {
         self.re += rhs;
     }
 }
 
-impl<T: NumericalFloatLike> Sub for Complex<T> {
+impl<T: FloatLike> Sub for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3410,7 +3649,7 @@ impl<T: NumericalFloatLike> Sub for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Sub<T> for Complex<T> {
+impl<T: FloatLike> Sub<T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3419,7 +3658,7 @@ impl<T: NumericalFloatLike> Sub<T> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Sub<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> Sub<&Complex<T>> for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3428,7 +3667,7 @@ impl<T: NumericalFloatLike> Sub<&Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Sub<&T> for Complex<T> {
+impl<T: FloatLike> Sub<&T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3437,7 +3676,7 @@ impl<T: NumericalFloatLike> Sub<&T> for Complex<T> {
     }
 }
 
-impl<'a, T: NumericalFloatLike> Sub<&'a Complex<T>> for &Complex<T> {
+impl<'a, T: FloatLike> Sub<&'a Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3446,7 +3685,7 @@ impl<'a, T: NumericalFloatLike> Sub<&'a Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Sub<&T> for &Complex<T> {
+impl<T: FloatLike> Sub<&T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3455,7 +3694,7 @@ impl<T: NumericalFloatLike> Sub<&T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Sub<Complex<T>> for &Complex<T> {
+impl<T: FloatLike> Sub<Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3464,7 +3703,7 @@ impl<T: NumericalFloatLike> Sub<Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Sub<T> for &Complex<T> {
+impl<T: FloatLike> Sub<T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3473,21 +3712,21 @@ impl<T: NumericalFloatLike> Sub<T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> SubAssign for Complex<T> {
+impl<T: FloatLike> SubAssign for Complex<T> {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
         self.sub_assign(&rhs)
     }
 }
 
-impl<T: NumericalFloatLike> SubAssign<T> for Complex<T> {
+impl<T: FloatLike> SubAssign<T> for Complex<T> {
     #[inline]
     fn sub_assign(&mut self, rhs: T) {
         self.re -= rhs;
     }
 }
 
-impl<T: NumericalFloatLike> SubAssign<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> SubAssign<&Complex<T>> for Complex<T> {
     #[inline]
     fn sub_assign(&mut self, rhs: &Self) {
         self.re -= &rhs.re;
@@ -3495,14 +3734,14 @@ impl<T: NumericalFloatLike> SubAssign<&Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> SubAssign<&T> for Complex<T> {
+impl<T: FloatLike> SubAssign<&T> for Complex<T> {
     #[inline]
     fn sub_assign(&mut self, rhs: &T) {
         self.re -= rhs;
     }
 }
 
-impl<T: NumericalFloatLike> Mul for Complex<T> {
+impl<T: FloatLike> Mul for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3511,7 +3750,7 @@ impl<T: NumericalFloatLike> Mul for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Mul<T> for Complex<T> {
+impl<T: FloatLike> Mul<T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3520,7 +3759,7 @@ impl<T: NumericalFloatLike> Mul<T> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Mul<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> Mul<&Complex<T>> for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3532,7 +3771,7 @@ impl<T: NumericalFloatLike> Mul<&Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Mul<&T> for Complex<T> {
+impl<T: FloatLike> Mul<&T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3541,7 +3780,7 @@ impl<T: NumericalFloatLike> Mul<&T> for Complex<T> {
     }
 }
 
-impl<'a, T: NumericalFloatLike> Mul<&'a Complex<T>> for &Complex<T> {
+impl<'a, T: FloatLike> Mul<&'a Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3550,7 +3789,7 @@ impl<'a, T: NumericalFloatLike> Mul<&'a Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Mul<&T> for &Complex<T> {
+impl<T: FloatLike> Mul<&T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3559,7 +3798,7 @@ impl<T: NumericalFloatLike> Mul<&T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Mul<Complex<T>> for &Complex<T> {
+impl<T: FloatLike> Mul<Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3568,7 +3807,7 @@ impl<T: NumericalFloatLike> Mul<Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Mul<T> for &Complex<T> {
+impl<T: FloatLike> Mul<T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3577,35 +3816,35 @@ impl<T: NumericalFloatLike> Mul<T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> MulAssign for Complex<T> {
+impl<T: FloatLike> MulAssign for Complex<T> {
     #[inline]
     fn mul_assign(&mut self, rhs: Self) {
         *self = self.clone().mul(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> MulAssign<T> for Complex<T> {
+impl<T: FloatLike> MulAssign<T> for Complex<T> {
     #[inline]
     fn mul_assign(&mut self, rhs: T) {
         *self = self.clone().mul(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> MulAssign<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> MulAssign<&Complex<T>> for Complex<T> {
     #[inline]
     fn mul_assign(&mut self, rhs: &Self) {
         *self = self.clone().mul(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> MulAssign<&T> for Complex<T> {
+impl<T: FloatLike> MulAssign<&T> for Complex<T> {
     #[inline]
     fn mul_assign(&mut self, rhs: &T) {
         *self = self.clone().mul(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> Div for Complex<T> {
+impl<T: FloatLike> Div for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3614,7 +3853,7 @@ impl<T: NumericalFloatLike> Div for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Div<T> for Complex<T> {
+impl<T: FloatLike> Div<T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3623,7 +3862,7 @@ impl<T: NumericalFloatLike> Div<T> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Div<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> Div<&Complex<T>> for Complex<T> {
     type Output = Self;
 
     #[inline]
@@ -3635,7 +3874,7 @@ impl<T: NumericalFloatLike> Div<&Complex<T>> for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Div<&T> for Complex<T> {
+impl<T: FloatLike> Div<&T> for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3644,7 +3883,7 @@ impl<T: NumericalFloatLike> Div<&T> for Complex<T> {
     }
 }
 
-impl<'a, T: NumericalFloatLike> Div<&'a Complex<T>> for &Complex<T> {
+impl<'a, T: FloatLike> Div<&'a Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3653,7 +3892,7 @@ impl<'a, T: NumericalFloatLike> Div<&'a Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Div<&T> for &Complex<T> {
+impl<T: FloatLike> Div<&T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3662,7 +3901,7 @@ impl<T: NumericalFloatLike> Div<&T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Div<Complex<T>> for &Complex<T> {
+impl<T: FloatLike> Div<Complex<T>> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3671,7 +3910,7 @@ impl<T: NumericalFloatLike> Div<Complex<T>> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Div<T> for &Complex<T> {
+impl<T: FloatLike> Div<T> for &Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3680,31 +3919,31 @@ impl<T: NumericalFloatLike> Div<T> for &Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> DivAssign for Complex<T> {
+impl<T: FloatLike> DivAssign for Complex<T> {
     fn div_assign(&mut self, rhs: Self) {
         *self = self.clone().div(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> DivAssign<T> for Complex<T> {
+impl<T: FloatLike> DivAssign<T> for Complex<T> {
     fn div_assign(&mut self, rhs: T) {
         *self = self.clone().div(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> DivAssign<&Complex<T>> for Complex<T> {
+impl<T: FloatLike> DivAssign<&Complex<T>> for Complex<T> {
     fn div_assign(&mut self, rhs: &Self) {
         *self = self.clone().div(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> DivAssign<&T> for Complex<T> {
+impl<T: FloatLike> DivAssign<&T> for Complex<T> {
     fn div_assign(&mut self, rhs: &T) {
         *self = self.clone().div(rhs);
     }
 }
 
-impl<T: NumericalFloatLike> Neg for Complex<T> {
+impl<T: FloatLike> Neg for Complex<T> {
     type Output = Complex<T>;
 
     #[inline]
@@ -3713,7 +3952,7 @@ impl<T: NumericalFloatLike> Neg for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Display for Complex<T> {
+impl<T: FloatLike> Display for Complex<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_char('(')?;
         Display::fmt(&self.re, f)?;
@@ -3723,7 +3962,7 @@ impl<T: NumericalFloatLike> Display for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> Debug for Complex<T> {
+impl<T: FloatLike> Debug for Complex<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_char('(')?;
         Debug::fmt(&self.re, f)?;
@@ -3733,7 +3972,7 @@ impl<T: NumericalFloatLike> Debug for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> LowerExp for Complex<T> {
+impl<T: FloatLike> LowerExp for Complex<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_char('(')?;
         LowerExp::fmt(&self.re, f)?;
@@ -3768,7 +4007,7 @@ impl<T: SingleFloat> SingleFloat for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> NumericalFloatLike for Complex<T> {
+impl<T: FloatLike> FloatLike for Complex<T> {
     #[inline]
     fn mul_add(&self, a: &Self, b: &Self) -> Self {
         self.clone() * a + b
@@ -3853,6 +4092,11 @@ impl<T: NumericalFloatLike> NumericalFloatLike for Complex<T> {
             im: self.im.zero(),
         }
     }
+
+    #[inline(always)]
+    fn is_fully_zero(&self) -> bool {
+        self.re.is_fully_zero() && self.im.is_fully_zero()
+    }
 }
 
 /// Following the same conventions and formulas as num::Complex.
@@ -3880,6 +4124,11 @@ impl<T: Real> Real for Complex<T> {
     #[inline(always)]
     fn i(&self) -> Option<Self> {
         Some(self.i())
+    }
+
+    #[inline(always)]
+    fn conj(&self) -> Self {
+        Complex::new(self.re.clone(), -self.im.clone())
     }
 
     #[inline]
@@ -4007,20 +4256,189 @@ impl<T: Real> Real for Complex<T> {
     }
 }
 
-impl<T: NumericalFloatLike> From<T> for Complex<T> {
+impl<T: FloatLike> From<T> for Complex<T> {
     fn from(value: T) -> Self {
         let zero = value.zero();
         Complex::new(value, zero)
     }
 }
 
-impl<'a, T: NumericalFloatLike + From<&'a Rational>> From<&'a Rational> for Complex<T> {
+impl<'a, T: FloatLike + From<&'a Rational>> From<&'a Rational> for Complex<T> {
     fn from(value: &'a Rational) -> Self {
         let c: T = value.into();
         let zero = c.zero();
         Complex::new(c, zero)
     }
 }
+
+impl Complex<Rational> {
+    pub fn gcd(&self, other: &Self) -> Self {
+        if self.is_zero() {
+            return other.clone();
+        }
+        if other.is_zero() {
+            return self.clone();
+        }
+
+        let gcd_re = self.re.gcd(&other.re);
+        let gcd_im = self.im.gcd(&other.im);
+
+        Complex::new(gcd_re, gcd_im)
+    }
+}
+
+#[cfg(feature = "python")]
+use numpy::Complex64;
+#[cfg(feature = "python")]
+use pyo3::{
+    Borrowed, Bound, FromPyObject, IntoPyObject, Py, PyErr, PyResult, Python, exceptions,
+    pybacked::PyBackedStr,
+    sync::PyOnceLock,
+    types::{PyAny, PyAnyMethods, PyComplex, PyComplexMethods, PyType},
+};
+#[cfg(feature = "python_stubgen")]
+use pyo3_stub_gen::{PyStubType, TypeInfo, impl_stub_type};
+
+#[cfg(feature = "python")]
+/// A multi-precision floating point number for Python.
+pub struct PythonMultiPrecisionFloat(pub Float);
+
+#[cfg(feature = "python_stubgen")]
+impl_stub_type!(PythonMultiPrecisionFloat = f64 | Decimal);
+
+#[cfg(feature = "python_stubgen")]
+pub struct Decimal;
+
+#[cfg(feature = "python_stubgen")]
+impl PyStubType for Decimal {
+    fn type_output() -> TypeInfo {
+        TypeInfo {
+            name: "decimal.Decimal".to_string(),
+            import: {
+                let mut h = std::collections::HashSet::default();
+                h.insert("decimal".into());
+                h
+            },
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+impl From<Float> for PythonMultiPrecisionFloat {
+    fn from(f: Float) -> Self {
+        PythonMultiPrecisionFloat(f)
+    }
+}
+
+#[cfg(feature = "python")]
+static PYDECIMAL: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+#[cfg(feature = "python")]
+fn get_decimal(py: Python<'_>) -> &Py<PyType> {
+    PYDECIMAL.get_or_init(py, || {
+        py.import("decimal")
+            .unwrap()
+            .getattr("Decimal")
+            .unwrap()
+            .extract()
+            .unwrap()
+    })
+}
+
+#[cfg(feature = "python")]
+impl<'py> IntoPyObject<'py> for PythonMultiPrecisionFloat {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = std::convert::Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        get_decimal(py)
+            .call1(py, (self.0.to_string(),))
+            .expect("failed to call decimal.Decimal(value)")
+            .into_pyobject(py)
+    }
+}
+
+#[cfg(feature = "python")]
+impl<'py> FromPyObject<'_, 'py> for PythonMultiPrecisionFloat {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, pyo3::PyAny>) -> PyResult<Self> {
+        if ob.is_instance(get_decimal(ob.py()).as_any().bind(ob.py()))? {
+            let a = ob
+                .call_method0("__str__")
+                .unwrap()
+                .extract::<PyBackedStr>()?;
+
+            // get the number of accurate digits
+            let digits = a
+                .chars()
+                .skip_while(|x| *x == '.' || *x == '0' || *x == '-')
+                .filter(|x| *x != '.')
+                .take_while(|x| x.is_ascii_digit())
+                .count();
+
+            Ok(Float::parse(
+                &a,
+                Some((digits as f64 * std::f64::consts::LOG2_10).ceil() as u32),
+            )
+            .map_err(|_| exceptions::PyValueError::new_err("Not a floating point number"))?
+            .into())
+        } else if let Ok(a) = ob.extract::<PyBackedStr>() {
+            Ok(Float::parse(&a, None)
+                .map_err(|_| exceptions::PyValueError::new_err("Not a floating point number"))?
+                .into())
+        } else if let Ok(a) = ob.extract::<f64>() {
+            if a.is_finite() {
+                Ok(Float::with_val(53, a).into())
+            } else {
+                Err(exceptions::PyValueError::new_err(
+                    "Floating point number is not finite",
+                ))
+            }
+        } else {
+            Err(exceptions::PyValueError::new_err(
+                "Not a valid multi-precision float",
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+impl<'py> FromPyObject<'_, 'py> for Complex<f64> {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, pyo3::PyAny>) -> PyResult<Self> {
+        ob.extract::<Complex64>().map(|x| Complex::new(x.re, x.im))
+    }
+}
+
+#[cfg(feature = "python_stubgen")]
+impl_stub_type!(Complex<f64> = Complex64);
+
+#[cfg(feature = "python")]
+impl<'py> FromPyObject<'_, 'py> for Complex<Float> {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, pyo3::PyAny>) -> PyResult<Self> {
+        if let Ok(a) = ob.extract::<PythonMultiPrecisionFloat>() {
+            let zero = Float::new(a.0.prec());
+            Ok(Complex::new(a.0, zero))
+        } else if let Ok(a) = ob.cast::<PyComplex>() {
+            Ok(Complex::new(
+                Float::with_val(53, a.real()),
+                Float::with_val(53, a.imag()),
+            ))
+        } else {
+            Err(exceptions::PyValueError::new_err(
+                "Not a valid complex number",
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "python_stubgen")]
+impl_stub_type!(Complex<Float> = Complex64);
 
 #[cfg(test)]
 mod test {
@@ -4078,7 +4496,7 @@ mod test {
     fn large_cancellation() {
         let a = ErrorPropagatingFloat::new(Float::with_val(200, 1e-50), 60.);
         let r = (a.exp() - a.one()) / a;
-        assert_eq!(format!("{}", r), "1.000000000");
+        assert_eq!(format!("{r}"), "1.000000000");
         assert_eq!(r.get_precision(), Some(10.205999132796238));
     }
 
@@ -4093,7 +4511,7 @@ mod test {
             - a.cosh()
             + b.tanh()
             - a.asinh()
-            + &b.acosh() / a.atanh()
+            + b.acosh() / a.atanh()
             + b.powf(&a);
         assert_eq!(r, Complex::new(0.1924131450685842, -39.83285329561913));
     }

@@ -32,7 +32,7 @@
 //!
 //! ```
 //! use symbolica::{function, parse, symbol};
-//! use symbolica::atom::{Symbol, FunctionAttribute, Atom, AtomCore};
+//! use symbolica::atom::{Symbol, SymbolAttribute, Atom, AtomCore};
 //!
 //! let f = symbol!("f"; Symmetric);
 //! let expr = function!(f, 3, 2) + (1, 4);
@@ -43,16 +43,18 @@ mod coefficient;
 mod core;
 pub mod representation;
 
+use ahash::HashMap;
 use colored::Colorize;
 use smartstring::{LazyCompact, SmartString};
 
 use crate::{
     coefficient::Coefficient,
     domains::{float::Complex, rational::Rational},
-    parser::Token,
+    parser::{ParseSettings, Token},
     printer::{AtomPrinter, PrintFunction, PrintOptions},
-    state::{RecycledAtom, State, Workspace},
+    state::{RecycledAtom, State, SymbolData, Workspace},
     transformer::StatsOptions,
+    utils::{BorrowedOrOwned, Settable},
 };
 
 use std::{borrow::Cow, cmp::Ordering, hash::Hash, ops::DerefMut};
@@ -80,10 +82,7 @@ impl NamespacedSymbol {
     /// Panics if input does not contain a symbol in the format `namespace::symbol`.
     pub fn parse(s: &str) -> NamespacedSymbol {
         let (namespace, _partial_symbol) = s.rsplit_once("::").unwrap_or_else(|| {
-            panic!(
-                "Input {} does not contain a symbol in the format `namespace::symbol`.",
-                s
-            )
+            panic!("Input {s} does not contain a symbol in the format `namespace::symbol`.")
         });
 
         NamespacedSymbol {
@@ -127,6 +126,9 @@ impl TryFrom<&str> for NamespacedSymbol {
     }
 }
 
+/// Wrap a symbol with the current namespace and positional data (file and line).
+/// Use [symbol] or [parse] instead.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! wrap_symbol {
     ($e:literal) => {{
@@ -135,8 +137,6 @@ macro_rules! wrap_symbol {
             s.line = line!() as usize;
             s
         } else {
-
-
             let ns = if $crate::state::State::BUILTIN_SYMBOL_NAMES.contains(&$e) {
                 "symbolica"
             } else {
@@ -173,14 +173,14 @@ macro_rules! wrap_symbol {
 
 /// A string representation of an expression with a namespace, and optional positional data (file and line).
 /// Can be created with the [wrap_input!](crate::wrap_input) macro.
-pub struct DefaultNamespace<'a> {
+pub struct DefaultNamespace<T> {
     pub namespace: Cow<'static, str>,
-    pub data: &'a str,
+    pub data: T,
     pub file: Cow<'static, str>,
     pub line: usize,
 }
 
-impl DefaultNamespace<'_> {
+impl<T> DefaultNamespace<T> {
     /// Parse a string into a namespaced string.
     pub fn attach_namespace(&self, s: &str) -> NamespacedSymbol {
         if let Some(mut s) = NamespacedSymbol::try_parse(s) {
@@ -189,7 +189,7 @@ impl DefaultNamespace<'_> {
             s
         } else if State::BUILTIN_SYMBOL_NAMES.contains(&s) {
             NamespacedSymbol {
-                symbol: format!("symbolica::{}", s).into(),
+                symbol: format!("symbolica::{s}").into(),
                 namespace: "symbolica".into(),
                 file: "".into(),
                 line: 0,
@@ -205,11 +205,12 @@ impl DefaultNamespace<'_> {
     }
 }
 
+#[doc(hidden)]
 #[macro_export]
 macro_rules! wrap_input {
     ($e:expr) => {
         $crate::atom::DefaultNamespace {
-            data: $e.as_ref(),
+            data: $e,
             namespace: $crate::namespace!().into(),
             file: file!().into(),
             line: line!() as usize,
@@ -217,11 +218,12 @@ macro_rules! wrap_input {
     };
 }
 
+#[doc(hidden)]
 #[macro_export]
 macro_rules! with_default_namespace {
     ($e:expr, $namespace: expr) => {
         $crate::atom::DefaultNamespace {
-            data: $e.as_ref(),
+            data: $e,
             namespace: $namespace.into(),
             file: file!().into(),
             line: line!() as usize,
@@ -250,29 +252,77 @@ macro_rules! hide_namespace {
 }
 
 /// A function that is called after normalization of the arguments.
-/// If the input, the first argument, is normalized, the function should return `false`.
-/// Otherwise, the function must return `true` and set the second argument to the normalized value.
+/// Additional modifications on `view` can be made and the result
+/// can be written into `out`.
+/// If no further normalization is needed, `out` must be left untouched.
 ///
 /// # Examples
 ///
 /// ```
 /// use symbolica::atom::{Atom, AtomView, NormalizationFunction};
 ///
-/// let normalize_fn: NormalizationFunction = Box::new(|view, atom| {
+/// let normalize_fn: NormalizationFunction = Box::new(|view, out| {
 ///     // Example normalization logic
 ///     if view.is_zero() {
-///         *atom = Atom::num(0);
-///         true
-///     } else {
-///         false
+///         out.to_num(0.into());
 ///     }
 /// });
 /// ```
-pub type NormalizationFunction = Box<dyn Fn(AtomView, &mut Atom) -> bool + Send + Sync>;
+pub type NormalizationFunction = Box<dyn Fn(AtomView, &mut Settable<Atom>) + Send + Sync>;
 
-/// Attributes that can be assigned to functions.
-#[derive(Clone, Copy, PartialEq)]
-pub enum FunctionAttribute {
+/// A function that is called when a derivative of its arguments gets taken.
+/// The argument index to derive is specified in `arg`.
+/// If the default derivative should be taken, do not modify `out`.
+/// Otherwise, set the `out` argument to the normalized value.
+///
+/// # Examples
+///
+/// ```
+/// use symbolica::atom::{Atom, DerivativeFunction};
+///
+/// let derivative_fn: DerivativeFunction = Box::new(|view, arg, out| {
+///     // Example derivative logic for a transparent function
+///     out.to_num(1.into());
+/// });
+/// ```
+pub type DerivativeFunction = Box<dyn Fn(AtomView, usize, &mut Settable<Atom>) + Send + Sync>;
+
+/// Keys for the extended symbol data map.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UserDataKey {
+    /// A small integer value.
+    Integer(i64),
+    /// A string value.
+    String(String),
+    /// An expression.
+    Atom(Atom),
+}
+
+/// Structured data associated with a symbol that can be used for custom behavior.
+/// For example, for a symbol representing an index, the structure can store the dimension
+/// or representation of the index.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserData {
+    /// No additional data.
+    None,
+    /// A small integer value.
+    Integer(i64),
+    /// A string value.
+    String(String),
+    /// An expression.
+    Atom(Atom),
+    /// A list of extended symbol data.
+    List(Vec<UserData>),
+    /// A map from extended symbol data to extended symbol data.
+    Map(HashMap<UserDataKey, UserData>),
+    /// A serialized byte array.
+    Serialized(Vec<u8>),
+}
+
+/// Attributes that can be assigned to symbols.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolAttribute {
     /// The function is symmetric.
     Symmetric,
     /// The function is antisymmetric.
@@ -281,6 +331,14 @@ pub enum FunctionAttribute {
     Cyclesymmetric,
     /// The function is linear.
     Linear,
+    /// The symbol represents a scalar. It will be moved out of linear functions.
+    Scalar,
+    /// The symbol represents a real number.
+    Real,
+    /// The symbol represents an integer.
+    Integer,
+    /// The symbol represents a positive number.
+    Positive,
 }
 
 /// A symbol, for example the name of a variable or the name of a function,
@@ -312,15 +370,27 @@ pub struct Symbol {
     is_antisymmetric: bool,
     is_cyclesymmetric: bool,
     is_linear: bool,
+    is_scalar: bool,
+    is_real: bool,
+    is_integer: bool,
+    is_positive: bool,
 }
 
 impl std::fmt::Debug for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.id))?;
-        for _ in 0..self.wildcard_level {
-            f.write_str("_")?;
+        if f.alternate() {
+            let data = self.get_global_data();
+            write!(
+                f,
+                "Symbol(name: {}, id: {}, attributes: {:?}, tags: {:?})",
+                data.name,
+                self.id,
+                self.get_attributes(),
+                data.tags
+            )
+        } else {
+            self.format(&PrintOptions::file(), f)
         }
-        Ok(())
     }
 }
 
@@ -330,12 +400,25 @@ impl std::fmt::Display for Symbol {
     }
 }
 
+impl<T: AtomCore> PartialEq<T> for Symbol {
+    fn eq(&self, other: &T) -> bool {
+        match other.as_atom_view() {
+            AtomView::Var(v) => *self == v.get_symbol(),
+            _ => false,
+        }
+    }
+}
+
 /// A builder for creating symbols with optional attributes.
 pub struct SymbolBuilder {
     symbol: NamespacedSymbol,
-    attributes: Option<Cow<'static, [FunctionAttribute]>>,
+    attributes: Option<Cow<'static, [SymbolAttribute]>>,
+    tags: Vec<String>,
     normalization_function: Option<NormalizationFunction>,
     print_function: Option<PrintFunction>,
+    derivative_function: Option<DerivativeFunction>,
+    generator: Option<Box<dyn Fn(&[Symbol], SymbolBuilder) -> SymbolBuilder + Send + Sync>>,
+    user_data: Option<UserData>,
 }
 
 impl SymbolBuilder {
@@ -345,31 +428,43 @@ impl SymbolBuilder {
         SymbolBuilder {
             symbol,
             attributes: None,
+            tags: vec![],
             normalization_function: None,
             print_function: None,
+            derivative_function: None,
+            generator: None,
+            user_data: None,
         }
     }
 
-    /// Get the symbol associated with `name` if it is already registered,
-    /// otherwise define it with the given attributes.
-    ///
-    /// This function will return an error when an existing symbol is redefined
-    /// with different attributes.
-    ///
-    /// Use the [symbol!](crate::symbol) macro instead to define symbols with the current namespace.
+    /// Set symbol attributes.
     ///
     /// # Examples
     ///
     /// ```
-    /// use symbolica::{atom::{Symbol, FunctionAttribute}, wrap_symbol};
+    /// use symbolica::{atom::{Symbol, SymbolAttribute}, wrap_symbol};
     ///
-    /// let f = Symbol::new(wrap_symbol!("f")).with_attributes(&[FunctionAttribute::Symmetric]).build().unwrap();
+    /// let f = Symbol::new(wrap_symbol!("f")).with_attributes(&[SymbolAttribute::Symmetric]).build().unwrap();
     /// ```
     pub fn with_attributes(
         mut self,
-        attributes: impl Into<Cow<'static, [FunctionAttribute]>>,
+        attributes: impl Into<Cow<'static, [SymbolAttribute]>>,
     ) -> Self {
         self.attributes = Some(attributes.into());
+        self
+    }
+
+    /// Set symbol tag. The tag must contain a namespace.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use symbolica::{atom::{Symbol, SymbolAttribute}, wrap_symbol};
+    ///
+    /// let f = Symbol::new(wrap_symbol!("f")).with_tags(["tag::real"]).build().unwrap();
+    /// ```
+    pub fn with_tags<T: AsRef<[U]>, U: AsRef<str>>(mut self, tags: T) -> Self {
+        self.tags = tags.as_ref().iter().map(|x| x.as_ref().into()).collect();
         self
     }
 
@@ -381,9 +476,6 @@ impl SymbolBuilder {
     ///     if let AtomView::Fun(f) = view {
     ///         if f.get_nargs() % 2 == 1 {
     ///             out.to_num(0.into());
-    ///             true // changed
-    ///         } else {
-    ///             false
     ///         }
     ///     } else {
     ///         unreachable!()
@@ -392,7 +484,7 @@ impl SymbolBuilder {
     /// ```
     pub fn with_normalization_function(
         mut self,
-        normalization_function: impl Fn(AtomView, &mut Atom) -> bool + Send + Sync + 'static,
+        normalization_function: impl Fn(AtomView, &mut Settable<Atom>) + Send + Sync + 'static,
     ) -> Self {
         self.normalization_function = Some(Box::new(normalization_function));
         self
@@ -417,28 +509,177 @@ impl SymbolBuilder {
         self
     }
 
+    /// Add a derivative function.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::{Atom, Symbol}, wrap_symbol};
+    ///
+    /// let f = Symbol::new(wrap_symbol!("tag")).with_derivative_function(|view, arg, out| {
+    ///       if arg == 1 {
+    ///          out.to_num(1.into());
+    ///       } else {
+    ///          out.to_num(0.into());
+    ///       }
+    /// }).build().unwrap();
+    /// ```
+    pub fn with_derivative_function(
+        mut self,
+        derivative_function: impl Fn(AtomView, usize, &mut Settable<Atom>) + Send + Sync + 'static,
+    ) -> Self {
+        self.derivative_function = Some(Box::new(derivative_function));
+        self
+    }
+
+    /// Add a custom generator function that receives the list of all jointly defined symbols.
+    /// Can be used to define custom normalization/derivative functions that depend on each other.
+    pub fn with_generator(
+        mut self,
+        f: impl Fn(&[Symbol], SymbolBuilder) -> SymbolBuilder + Send + Sync + 'static,
+    ) -> Self {
+        self.generator = Some(Box::new(f));
+        self
+    }
+
+    /// Create multiple symbols from a list of builders. The symbols can have interdependent generators.
+    pub fn build_group(
+        builders: Vec<SymbolBuilder>,
+    ) -> Result<Vec<Symbol>, SmartString<LazyCompact>> {
+        let state = &mut State::get_state_mut();
+
+        // now that the state is locked, we can build symbol representatives, knowing their index
+        // they are not yet inserted into the state
+        let mut next_index = state.get_next_symbol_index();
+        let mut symbols = vec![];
+        for b in &builders {
+            if state.fetch_symbol(&b.symbol.symbol).is_some() {
+                return Err(format!("Symbol {} is already defined.", b.symbol.symbol).into());
+            }
+
+            if let Some(attr) = b.attributes.as_ref() {
+                symbols.push(Symbol::raw_fn(
+                    next_index,
+                    State::get_wildcard_level(&b.symbol.symbol),
+                    attr.contains(&SymbolAttribute::Symmetric),
+                    attr.contains(&SymbolAttribute::Antisymmetric),
+                    attr.contains(&SymbolAttribute::Cyclesymmetric),
+                    attr.contains(&SymbolAttribute::Linear),
+                    attr.contains(&SymbolAttribute::Scalar),
+                    attr.contains(&SymbolAttribute::Real),
+                    attr.contains(&SymbolAttribute::Integer),
+                    attr.contains(&SymbolAttribute::Positive),
+                ));
+            } else {
+                symbols.push(Symbol::raw_var(
+                    next_index,
+                    State::get_wildcard_level(&b.symbol.symbol),
+                ));
+            }
+
+            next_index += 1;
+        }
+
+        let mut result = Vec::with_capacity(builders.len());
+        for mut b in builders {
+            if let Some(f) = b.generator.take() {
+                b = (f)(&symbols, b);
+            }
+
+            result.push(b.build_with_state(state)?);
+        }
+        Ok(result)
+    }
+
+    /// Add extended structured symbol data.
+    pub fn with_user_data(mut self, data: UserData) -> Self {
+        self.user_data = Some(data);
+        self
+    }
+
     /// Create a new symbol or return the existing symbol with the same name.
     ///
     /// This function will return an error when an existing symbol is redefined
     /// with different attributes.
     pub fn build(self) -> Result<Symbol, SmartString<LazyCompact>> {
+        self.build_with_state(&mut State::get_state_mut())
+    }
+
+    pub(crate) fn build_with_state(
+        self,
+        state: &mut State,
+    ) -> Result<Symbol, SmartString<LazyCompact>> {
+        let (namespace, partial_symbol) =
+            self.symbol.symbol.rsplit_once("::").ok_or_else(|| {
+                SmartString::from(format!(
+                    "Input {} does not contain a symbol in the format `namespace::symbol`.",
+                    self.symbol.symbol,
+                ))
+            })?;
+
+        for tag in &self.tags {
+            if !tag.contains("::") {
+                return Err(format!("Tag {} must contain a namespace", tag).into());
+            }
+        }
+
+        Token::check_symbol_namespace(namespace)?;
+        Token::check_symbol_name(partial_symbol)?;
+
         if self.attributes.is_none()
             && self.normalization_function.is_none()
             && self.print_function.is_none()
+            && self.derivative_function.is_none()
+            && self.tags.is_empty()
+            && self.user_data.is_none()
         {
-            State::get_state_mut().get_symbol(self.symbol)
+            state.get_symbol(self.symbol)
         } else {
-            State::get_state_mut().get_symbol_with_attributes(
+            state.get_symbol_with_attributes(
                 self.symbol,
                 self.attributes.as_ref().map(|x| x.as_ref()).unwrap_or(&[]),
                 self.normalization_function,
                 self.print_function,
+                self.derivative_function,
+                self.tags,
+                self.user_data,
             )
         }
     }
 }
 
 impl Symbol {
+    /// The built-in function represents a list of function arguments.
+    pub const ARG: Symbol = State::ARG;
+    /// The built-in function that converts a rational polynomial to a coefficient.
+    pub const COEFF: Symbol = State::COEFF;
+    /// The exponent function.
+    pub const EXP: Symbol = State::EXP;
+    /// The logarithm function.
+    pub const LOG: Symbol = State::LOG;
+    /// The sine function.
+    pub const SIN: Symbol = State::SIN;
+    /// The cosine function.
+    pub const COS: Symbol = State::COS;
+    /// The square root function.
+    pub const SQRT: Symbol = State::SQRT;
+    /// The complex conjugate function.
+    pub const CONJ: Symbol = State::CONJ;
+    /// The built-in function that represents a logical separator of function arguments.
+    pub const SEP: Symbol = State::SEP;
+    /// The built-in function that represents an abstract derivative.
+    pub const DERIVATIVE: Symbol = State::DERIVATIVE;
+    /// The constant `𝑒`, the base of the natural logarithm.
+    pub const E: Symbol = State::E;
+    /// The mathematical constant `π`.
+    pub const PI: Symbol = State::PI;
+    /// The string representation of the constant `π`.
+    pub const PI_STR: &'static str = "𝜋";
+    /// The string representation of the constant `e`.
+    pub const E_STR: &'static str = "𝑒";
+    /// The string representation of [Symbol::SEP].
+    pub const SEP_STR: &'static str = "‖";
+
     /// Create a builder for a new symbol with the given name and namespace.
     ///
     /// Use the [symbol!](crate::symbol) macro instead to define symbols in the current namespace.
@@ -446,7 +687,33 @@ impl Symbol {
         SymbolBuilder::new(name)
     }
 
-    /// Get the name of the symbol.
+    /// Parse a symbol from a string with optional namespace and attributes.
+    ///
+    /// Use the [symbol!](crate::symbol) macro instead to define symbols in the current namespace.
+    pub fn parse<T: AsRef<str>>(name: DefaultNamespace<T>) -> Result<Self, String> {
+        Token::parse_symbol(
+            name.data.as_ref(),
+            &name,
+            &mut HashMap::default(),
+            &mut State::get_state_mut(),
+        )
+    }
+
+    /// Looks up a symbol by its namespaced name without creating it.
+    /// Use the [get_symbol!](crate::get_symbol) macro instead to define symbols in the current namespace.
+    pub fn get_symbol(name: NamespacedSymbol) -> Option<Symbol> {
+        State::get_global_state()
+            .read()
+            .unwrap()
+            .fetch_symbol(name.symbol.as_ref())
+    }
+
+    /// Create a new variable from the symbol.
+    pub fn to_atom(self) -> Atom {
+        Atom::var(self)
+    }
+
+    /// Get the name of the symbol, which includes its namespace.
     ///
     /// # Examples
     ///
@@ -471,7 +738,7 @@ impl Symbol {
     /// assert_eq!(x.get_stripped_name(), "x");
     /// ```
     pub fn get_stripped_name(&self) -> &str {
-        let d = State::get_symbol_data(*self);
+        let d = self.get_global_data();
         &d.name[d.namespace.len() + 2..]
     }
 
@@ -579,9 +846,152 @@ impl Symbol {
         self.is_linear
     }
 
+    /// Check if the symbol is scalar.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use symbolica::symbol;
+    ///
+    /// let f = symbol!("f"; Scalar);
+    /// assert!(f.is_scalar());
+    /// ```
+    pub fn is_scalar(&self) -> bool {
+        self.is_scalar
+    }
+
+    /// Check if the symbol is real.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use symbolica::symbol;
+    ///
+    /// let f = symbol!("f"; Real);
+    /// assert!(f.is_real());
+    /// ```
+    pub fn is_real(&self) -> bool {
+        self.is_real
+    }
+
+    /// Check if the symbol is integer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use symbolica::symbol;
+    ///
+    /// let f = symbol!("f"; Integer);
+    /// assert!(f.is_integer());
+    /// ```
+    pub fn is_integer(&self) -> bool {
+        self.is_integer
+    }
+
+    /// Check if the symbol is positive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use symbolica::symbol;
+    ///
+    /// let f = symbol!("f"; Positive);
+    /// assert!(f.is_positive());
+    /// ```
+    pub fn is_positive(&self) -> bool {
+        self.is_positive
+    }
+
     /// Returns `true` iff this identifier is defined by Symbolica.
-    pub fn is_builtin(id: Symbol) -> bool {
-        State::is_builtin(id)
+    pub fn is_builtin(self) -> bool {
+        State::is_builtin(self)
+    }
+
+    /// Get all tags of the symbol.
+    pub fn get_tags(&self) -> &[String] {
+        &self.get_global_data().tags
+    }
+
+    /// Check if the symbol has the tag `tag`.
+    pub fn has_tag(&self, tag: impl AsRef<str>) -> bool {
+        let r = tag.as_ref();
+        self.get_global_data().tags.iter().any(|x| x == r)
+    }
+
+    /// Get the custom normalization function of the symbol, if any.
+    pub fn get_normalization_function(&self) -> Option<&'static NormalizationFunction> {
+        self.get_global_data().custom_normalization.as_ref()
+    }
+
+    /// Get the custom derivative function of the symbol, if any.
+    pub fn get_derivative_function(&self) -> Option<&'static DerivativeFunction> {
+        self.get_global_data().custom_derivative.as_ref()
+    }
+
+    /// Get the custom print function of the symbol, if any.
+    pub fn get_print_function(&self) -> Option<&'static PrintFunction> {
+        self.get_global_data().custom_print.as_ref()
+    }
+
+    /// Get all tags of the symbol.
+    pub fn get_attributes(&self) -> Vec<SymbolAttribute> {
+        let mut attrs = vec![];
+        if self.is_symmetric {
+            attrs.push(SymbolAttribute::Symmetric);
+        }
+        if self.is_antisymmetric {
+            attrs.push(SymbolAttribute::Antisymmetric);
+        }
+        if self.is_cyclesymmetric {
+            attrs.push(SymbolAttribute::Cyclesymmetric);
+        }
+        if self.is_linear {
+            attrs.push(SymbolAttribute::Linear);
+        }
+        if self.is_scalar {
+            attrs.push(SymbolAttribute::Scalar);
+        }
+        if self.is_real {
+            attrs.push(SymbolAttribute::Real);
+        }
+        if self.is_integer {
+            attrs.push(SymbolAttribute::Integer);
+        }
+        if self.is_positive {
+            attrs.push(SymbolAttribute::Positive);
+        }
+        attrs
+    }
+
+    /// Test `self` has all the attributes and tags of `s`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use symbolica::{atom::AtomCore, symbol, tag};
+    /// let a = symbol!("symbolica::attr::x"; Linear, Antisymmetric; tags = [tag!("mytag"), "python::test2".to_string()]);
+    /// let b = symbol!("symbolica::attr::y"; Linear; tags = [tag!("mytag")]);
+    /// assert!(a.has_attributes_of(b));
+    /// ```
+    pub fn has_attributes_of(&self, s: Symbol) -> bool {
+        for t in s.get_tags() {
+            if !self.has_tag(t) {
+                return false;
+            }
+        }
+
+        (!s.is_antisymmetric() || self.is_antisymmetric())
+            && (!s.is_symmetric() || self.is_symmetric())
+            && (!s.is_cyclesymmetric() || self.is_cyclesymmetric())
+            && (!s.is_linear() || self.is_linear())
+            && (!s.is_positive() || self.is_positive())
+            && (!s.is_integer() || self.is_integer())
+            && (!s.is_real() || self.is_real())
+            && (!s.is_scalar() || self.is_scalar())
+    }
+
+    /// Get the user data associated with the symbol.
+    pub fn get_data(&self) -> &'static UserData {
+        &self.get_global_data().user_data
     }
 
     /// Expert use: create a new variable symbol. This constructor should be used with care as there are no checks
@@ -594,11 +1004,17 @@ impl Symbol {
             is_antisymmetric: false,
             is_cyclesymmetric: false,
             is_linear: false,
+            is_scalar: false,
+            is_real: false,
+            is_integer: false,
+            is_positive: false,
         }
     }
 
     /// Expert use: create a new function symbol. This constructor should be used with care as there are no checks
     /// about the validity of the identifier.
+    ///
+    /// Sets related attributes automatically, e.g., a symbol that is marked as `integer` is also marked as `real`.
     pub const fn raw_fn(
         id: u32,
         wildcard_level: u8,
@@ -606,6 +1022,10 @@ impl Symbol {
         is_antisymmetric: bool,
         is_cyclesymmetric: bool,
         is_linear: bool,
+        is_scalar: bool,
+        is_real: bool,
+        is_integer: bool,
+        is_positive: bool,
     ) -> Self {
         Symbol {
             id,
@@ -614,7 +1034,38 @@ impl Symbol {
             is_antisymmetric,
             is_cyclesymmetric,
             is_linear,
+            is_scalar,
+            is_real: is_real || is_integer || is_positive,
+            is_integer,
+            is_positive,
         }
+    }
+
+    fn get_attributes_tuple_str(&self) -> [(&'static str, bool); 8] {
+        [
+            ("symmetric", self.is_symmetric),
+            ("antisymmetric", self.is_antisymmetric),
+            ("cyclesymmetric", self.is_cyclesymmetric),
+            ("linear", self.is_linear),
+            ("scalar", self.is_scalar),
+            ("real", self.is_real),
+            ("integer", self.is_integer),
+            ("positive", self.is_positive),
+        ]
+    }
+
+    /// Get the attributes of the symbol as a tuple of (attribute, bool).
+    pub fn get_attributes_tuple(&self) -> [(SymbolAttribute, bool); 8] {
+        [
+            (SymbolAttribute::Symmetric, self.is_symmetric),
+            (SymbolAttribute::Antisymmetric, self.is_antisymmetric),
+            (SymbolAttribute::Cyclesymmetric, self.is_cyclesymmetric),
+            (SymbolAttribute::Linear, self.is_linear),
+            (SymbolAttribute::Scalar, self.is_scalar),
+            (SymbolAttribute::Real, self.is_real),
+            (SymbolAttribute::Integer, self.is_integer),
+            (SymbolAttribute::Positive, self.is_positive),
+        ]
     }
 
     pub fn format<W: std::fmt::Write>(
@@ -622,53 +1073,281 @@ impl Symbol {
         opts: &PrintOptions,
         f: &mut W,
     ) -> Result<(), std::fmt::Error> {
-        let data = State::get_symbol_data(*self);
+        let data = self.get_global_data();
         let (namespace, name) = (&data.namespace, &data.name[data.namespace.len() + 2..]);
 
-        if let Some(custom_print) = &data.custom_print {
-            if let Some(s) = custom_print(InlineVar::new(*self).as_view(), opts) {
-                f.write_str(&s)?;
-                return Ok(());
-            }
+        if let Some(custom_print) = &data.custom_print
+            && let Some(s) = custom_print(InlineVar::new(*self).as_view(), opts)
+        {
+            f.write_str(&s)?;
+            return Ok(());
         }
 
         if opts.mode.is_latex() {
             match *self {
-                Atom::E => f.write_char('e'),
-                Atom::PI => f.write_str("\\pi"),
-                Atom::COS => f.write_str("\\cos"),
-                Atom::SIN => f.write_str("\\sin"),
-                Atom::EXP => f.write_str("\\exp"),
-                Atom::LOG => f.write_str("\\log"),
+                Symbol::E => f.write_char('e'),
+                Symbol::PI => f.write_str("\\pi"),
+                Symbol::COS => f.write_str("\\cos"),
+                Symbol::SIN => f.write_str("\\sin"),
+                Symbol::EXP => f.write_str("\\exp"),
+                Symbol::LOG => f.write_str("\\log"),
                 _ => {
                     f.write_str(name)?;
                     if !opts.hide_all_namespaces {
-                        f.write_fmt(format_args!("_{{\\tiny \text{{{}}}}}", namespace))
+                        f.write_fmt(format_args!("_{{\\tiny \text{{{namespace}}}}}"))
                     } else {
                         Ok(())
                     }
                 }
             }
         } else {
-            if !opts.hide_all_namespaces
+            if (!opts.hide_all_namespaces || opts.include_attributes)
                 && !State::is_builtin(*self)
-                && opts.hide_namespace != Some(namespace)
+                && (opts.hide_namespace != Some(namespace) || opts.include_attributes)
             {
-                if opts.color_namespace {
+                if opts.color_namespace && opts.mode.is_symbolica() {
                     f.write_fmt(format_args!("{}", namespace.dimmed().italic()))?;
+
+                    if opts.include_attributes {
+                        f.write_fmt(format_args!("{}", "::{".dimmed()))?;
+                        let mut first = true;
+                        for (x, t) in self.get_attributes_tuple_str() {
+                            if t {
+                                if !first {
+                                    f.write_fmt(format_args!("{}", ",".dimmed()))?;
+                                }
+                                first = false;
+                                f.write_fmt(format_args!("{}", x.dimmed()))?;
+                            }
+                        }
+
+                        if !self.get_tags().is_empty() {
+                            for tag in self.get_tags() {
+                                if !first {
+                                    f.write_fmt(format_args!("{}", ",".dimmed()))?;
+                                }
+                                first = false;
+                                f.write_fmt(format_args!("{}", tag.dimmed()))?;
+                            }
+                        }
+
+                        f.write_fmt(format_args!("{}", "}".dimmed()))?;
+                    }
+
                     f.write_fmt(format_args!("{}", "::".dimmed()))?;
                 } else {
-                    f.write_fmt(format_args!("{}::", namespace))?;
+                    if opts.mode.is_mathematica() {
+                        for part in namespace.split("::") {
+                            let mut inside_full_form_unicode = false;
+                            for c in part.split(Symbol::SEP_STR) {
+                                if inside_full_form_unicode {
+                                    f.write_fmt(format_args!("\\[{}]", c))?;
+                                } else {
+                                    f.write_str(c)?;
+                                }
+                                inside_full_form_unicode = !inside_full_form_unicode;
+                            }
+
+                            f.write_char('`')?;
+                        }
+                    } else {
+                        f.write_fmt(format_args!("{namespace}::"))?;
+                    }
+
+                    if opts.mode.is_symbolica() && opts.include_attributes {
+                        f.write_str("{")?;
+                        let mut first = true;
+                        for (x, t) in self.get_attributes_tuple_str() {
+                            if t {
+                                if !first {
+                                    f.write_char(',')?;
+                                }
+                                first = false;
+                                f.write_str(x)?;
+                            }
+                        }
+
+                        if !self.get_tags().is_empty() {
+                            for tag in self.get_tags() {
+                                if !first {
+                                    f.write_char(',')?;
+                                }
+                                first = false;
+                                f.write_str(tag)?;
+                            }
+                        }
+
+                        f.write_str("}::")?;
+                    }
                 }
             }
 
-            if opts.color_builtin_symbols && name.ends_with('_') {
+            if opts.mode.is_symbolica() && opts.color_builtin_symbols && name.ends_with('_') {
                 f.write_fmt(format_args!("{}", name.cyan().italic()))
-            } else if opts.color_builtin_symbols && State::is_builtin(*self) {
+            } else if opts.mode.is_symbolica()
+                && opts.color_builtin_symbols
+                && State::is_builtin(*self)
+            {
                 f.write_fmt(format_args!("{}", name.purple()))
+            } else if opts.mode.is_mathematica() {
+                if State::is_builtin(*self) {
+                    match *self {
+                        Symbol::E => f.write_str("E"),
+                        Symbol::PI => f.write_str("Pi"),
+                        Symbol::COS => f.write_str("Cos"),
+                        Symbol::SIN => f.write_str("Sin"),
+                        Symbol::EXP => f.write_str("Exp"),
+                        Symbol::LOG => f.write_str("Log"),
+                        Symbol::SQRT => f.write_str("Sqrt"),
+                        Symbol::CONJ => f.write_str("Conjugate"),
+                        Symbol::DERIVATIVE => f.write_str("Derivative"),
+                        _ => f.write_str(name),
+                    }
+                } else {
+                    let mut inside_full_form_unicode = false;
+                    for c in name.split(Symbol::SEP_STR) {
+                        if inside_full_form_unicode {
+                            f.write_fmt(format_args!("\\[{}]", c))?;
+                        } else {
+                            f.write_str(c)?;
+                        }
+                        inside_full_form_unicode = !inside_full_form_unicode;
+                    }
+                    Ok(())
+                }
             } else {
                 f.write_str(name)
             }
+        }
+    }
+
+    /// Get data related to the symbol.
+    pub(crate) fn get_global_data(self) -> &'static SymbolData {
+        State::get_symbol_data(self)
+    }
+}
+
+/// A symbol or a function.
+///
+/// ```rust
+/// use symbolica::{atom::Indeterminate, parse, symbol};
+/// let x: Indeterminate = symbol!("x").into();
+/// let f: Indeterminate = parse!("f(x)").try_into().unwrap();
+/// ```
+#[derive(Clone, Hash, Eq, PartialOrd, Ord, Debug)]
+#[cfg_attr(
+    feature = "bincode",
+    derive(bincode_trait_derive::Encode),
+    derive(bincode_trait_derive::Decode),
+    derive(bincode_trait_derive::BorrowDecodeFromDecode),
+    trait_decode(trait = crate::state::HasStateMap)
+)]
+pub enum Indeterminate {
+    /// A symbol, for example x, y, z, etc.
+    Symbol(Symbol, InlineVar),
+    /// A function, for example f(x), sin(x), etc.
+    Function(Symbol, Atom),
+}
+
+impl std::fmt::Display for Indeterminate {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Indeterminate::Symbol(v, _) => f.write_str(v.get_stripped_name()),
+            Indeterminate::Function(_, a) => std::fmt::Display::fmt(a, f),
+        }
+    }
+}
+
+impl From<Symbol> for Indeterminate {
+    fn from(i: Symbol) -> Indeterminate {
+        Indeterminate::Symbol(i, i.into())
+    }
+}
+
+impl PartialEq<Symbol> for Indeterminate {
+    fn eq(&self, other: &Symbol) -> bool {
+        match self {
+            Indeterminate::Symbol(s, _) => s == other,
+            _ => false,
+        }
+    }
+}
+
+impl From<Symbol> for BorrowedOrOwned<'_, Indeterminate> {
+    fn from(atom: Symbol) -> Self {
+        BorrowedOrOwned::Owned(Indeterminate::from(atom))
+    }
+}
+
+impl<T: AtomCore> PartialEq<T> for Indeterminate {
+    fn eq(&self, other: &T) -> bool {
+        self.as_view() == other.as_atom_view()
+    }
+}
+
+macro_rules! from_int {
+    ($($t:ty),*) => {
+        $(
+            impl From<$t> for Atom {
+                /// Convert an integer type to an atom. This will allocate memory.
+                fn from(n: $t) -> Atom {
+                    Atom::num(n as u64)
+                }
+            }
+        )*
+    };
+}
+
+from_int!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+);
+
+impl TryFrom<Atom> for Indeterminate {
+    type Error = String;
+
+    fn try_from(a: Atom) -> Result<Indeterminate, Self::Error> {
+        match a {
+            Atom::Var(v) => {
+                let s = v.get_symbol();
+                Ok(Indeterminate::Symbol(s, InlineVar::new(s)))
+            }
+            Atom::Fun(f) => Ok(Indeterminate::Function(f.get_symbol(), Atom::Fun(f))),
+            _ => Err(format!(
+                "Cannot convert {a} to a variable as it can be decomposed into a polynomial part"
+            )),
+        }
+    }
+}
+
+impl TryFrom<Atom> for BorrowedOrOwned<'_, Indeterminate> {
+    type Error = String;
+    fn try_from(atom: Atom) -> Result<Self, Self::Error> {
+        Ok(BorrowedOrOwned::Owned(Indeterminate::try_from(atom)?))
+    }
+}
+
+impl From<Indeterminate> for Atom {
+    fn from(val: Indeterminate) -> Self {
+        match val {
+            Indeterminate::Symbol(s, _) => Atom::var(s),
+            Indeterminate::Function(_, a) => a,
+        }
+    }
+}
+
+impl Indeterminate {
+    /// Get the head symbol of the indeterminate.
+    pub fn get_symbol(&self) -> Symbol {
+        match self {
+            Indeterminate::Symbol(s, _) => *s,
+            Indeterminate::Function(s, _) => *s,
+        }
+    }
+
+    pub fn as_view(&self) -> AtomView<'_> {
+        match self {
+            Indeterminate::Symbol(_, v) => v.as_view(),
+            Indeterminate::Function(_, a) => a.as_view(),
         }
     }
 }
@@ -1119,7 +1798,7 @@ impl AtomView<'_> {
 ///
 /// ```
 /// use symbolica::{function, parse, symbol};
-/// use symbolica::atom::{Symbol, FunctionAttribute, Atom, AtomCore};
+/// use symbolica::atom::{Symbol, Atom, AtomCore};
 ///
 /// let f = symbol!("f"; Symmetric);
 /// let expr = function!(f, 3, 2) + (1, 4);
@@ -1171,61 +1850,13 @@ pub enum Atom {
 }
 
 impl Atom {
-    /// The built-in function represents a list of function arguments.
-    pub const ARG: Symbol = State::ARG;
-    /// The built-in function that converts a rational polynomial to a coefficient.
-    pub const COEFF: Symbol = State::COEFF;
-    /// The exponent function.
-    pub const EXP: Symbol = State::EXP;
-    /// The logarithm function.
-    pub const LOG: Symbol = State::LOG;
-    /// The sine function.
-    pub const SIN: Symbol = State::SIN;
-    /// The cosine function.
-    pub const COS: Symbol = State::COS;
-    /// The square root function.
-    pub const SQRT: Symbol = State::SQRT;
-    /// The built-in function that represents an abstract derivative.
-    pub const DERIVATIVE: Symbol = State::DERIVATIVE;
-    /// The constant e, the base of the natural logarithm.
-    pub const E: Symbol = State::E;
-    /// The mathematical constant `π`.
-    pub const PI: Symbol = State::PI;
-
     /// The number suffix that represents the imaginary unit.
     /// The suffix `i` can also be used for parsing (e.g. `2+3𝑖` or `2+3i`).
     pub const I_STR: &'static str = "𝑖";
-    /// The string representation of the constant `π`.
-    pub const PI_STR: &'static str = "𝜋";
 
     /// The imaginary unit.
     pub fn i() -> Atom {
         Atom::num(Complex::<Rational>::new_i())
-    }
-
-    /// Exponentiate the atom.
-    pub fn exp(&self) -> Atom {
-        FunctionBuilder::new(Atom::EXP).add_arg(self).finish()
-    }
-
-    /// Take the logarithm of the atom.
-    pub fn log(&self) -> Atom {
-        FunctionBuilder::new(Atom::LOG).add_arg(self).finish()
-    }
-
-    /// Take the sine the atom.
-    pub fn sin(&self) -> Atom {
-        FunctionBuilder::new(Atom::SIN).add_arg(self).finish()
-    }
-
-    ///  Take the cosine the atom.
-    pub fn cos(&self) -> Atom {
-        FunctionBuilder::new(Atom::COS).add_arg(self).finish()
-    }
-
-    ///  Take the square root of the atom.
-    pub fn sqrt(&self) -> Atom {
-        FunctionBuilder::new(Atom::SQRT).add_arg(self).finish()
     }
 }
 
@@ -1329,14 +1960,34 @@ impl Atom {
     ///
     /// # Examples
     /// ```rust
-    /// use symbolica::{wrap_input, with_default_namespace};
-    /// use symbolica::atom::Atom;
-    /// let x = Atom::parse(wrap_input!("x")).unwrap();
-    /// let x_2 = Atom::parse(with_default_namespace!("x_2", "b")).unwrap();
+    /// use symbolica::{atom::Atom, wrap_input, with_default_namespace, parser::ParseSettings};
+    /// let x = Atom::parse(wrap_input!("x"), ParseSettings::default()).unwrap();
+    /// let x_2 = Atom::parse(with_default_namespace!("x_2", "b"), ParseSettings::default()).unwrap();
     /// assert!(x != x_2);
     /// ```
-    pub fn parse(input: DefaultNamespace) -> Result<Atom, String> {
-        Workspace::get_local().with(|ws| Token::parse(input.data, false)?.to_atom(&input, ws))
+    pub fn parse<T: AsRef<str>>(
+        input: DefaultNamespace<T>,
+        settings: ParseSettings,
+    ) -> Result<Atom, String> {
+        let mut name_map = HashMap::default();
+        Workspace::get_local().with(|ws| {
+            let t = Token::parse_with_atom_info(
+                input.data.as_ref(),
+                settings,
+                Some((&input, &mut name_map, ws)),
+            )?;
+
+            // drop the input data before parsing further
+            let ns = DefaultNamespace {
+                data: "",
+                namespace: input.namespace,
+                file: input.file,
+                line: input.line,
+            };
+            drop(input.data);
+
+            t.to_atom(&ns, &mut name_map, ws)
+        })
     }
 
     /// Create a new atom that represents a variable.
@@ -1512,7 +2163,7 @@ impl Atom {
     }
 }
 
-/// A constructor of a function. Consider using the [crate::fun!] macro instead.
+/// A constructor of a function. Consider using the [function!](crate::function) macro instead.
 ///
 /// For example:
 /// ```
@@ -1652,9 +2303,30 @@ macro_rules! function {
     };
 }
 
+/// Create a tag in the current project namespace if no explicit namespace is set.
+/// This macro can be used in the `symbol!` macro:
+/// ```
+/// use symbolica::{symbol, tag};
+/// let x = symbol!("tagged_x", tag = tag!("nonzero"));
+/// assert_eq!(x.has_tag("symbolica::nonzero"), true);
+/// ```
+#[macro_export]
+macro_rules! tag {
+    ($name: expr) => {
+        if !$name.contains("::") {
+            let mut s = String::from($crate::namespace!());
+            s.push_str("::");
+            s.push_str($name.as_ref());
+            s
+        } else {
+            String::from($name)
+        }
+    };
+}
+
 /// Create a new symbol or fetch the existing one with the same name.
 /// If no namespace is specified, the symbol is created in the
-/// current namespace.
+/// current namespace. Use [get_symbol!](crate::get_symbol) to only fetch existing symbols.
 ///
 /// For example:
 /// ```no_run
@@ -1669,9 +2341,8 @@ macro_rules! function {
 /// created with the default attributes.
 ///
 /// You can specify attributes for the symbol, using `;` as a separator
-/// between symbol names and attributes. The options
-/// are [Symmetric](FunctionAttribute::Symmetric), [Antisymmetric](FunctionAttribute::Antisymmetric),
-/// [Cyclesymmetric](FunctionAttribute::Cyclesymmetric), and [Linear](FunctionAttribute::Linear).
+/// between symbol names and attributes. See [SymbolAttribute] for all options.
+///
 /// ```no_run
 /// use symbolica::symbol;
 /// let x = symbol!("x"; Symmetric, Linear);
@@ -1684,30 +2355,44 @@ macro_rules! function {
 /// let x = symbol!("x";);
 /// ```
 /// will panic if the symbol was previously defined with attributes. Use
-/// [try_symbol!] for a fallible version.
+/// [try_symbol!](crate::try_symbol) for a fallible version.
 ///
-/// You can specify a normalization function for the symbol, following its
-/// attributes with a `;`.
+/// Special settings can be defined for a single symbol by following
+/// the symbol name with a `,` as shown next.
+///
+/// ### Tags
+/// You can set tags using `tag` or `tags` flags:
+/// ```no_run
+/// use symbolica::{symbol, tag};
+/// let x = symbol!("x", tag = tag!("nonzero"));
+/// let y = symbol!("y", tags = ["test::a", "test::b"]);
+/// let (w, z) = symbol!("w", "z"; tags = ["test::a", "test::b"]);
+/// ```
+/// Tags can be used to create logical groups and can be queried and filtered on.
+///
+/// ### Normalization
+/// You can specify a normalization function for the symbol using `norm` flag:
+///
 /// ```no_run
 /// use symbolica::symbol;
 /// use symbolica::atom::AtomView;
-/// let x = symbol!("f";; |f, out| {
+/// let x = symbol!("f", norm = |f, out| {
 ///     if let AtomView::Fun(ff) = f {
 ///         if ff.get_nargs() % 2 == 1 {
 ///            out.to_num(0.into());
-///            return true;
 ///         }
 ///     }
-///     false
 /// });
 /// ```
+/// See [NormalizationFunction] for more details.
 ///
-/// You can also define a custom printing function by adding another `;`:
+/// ### Printing
+/// You can define a custom printing function using the `print` flag:
 /// ```no_run
 /// use symbolica::symbol;
 /// use symbolica::atom::{AtomCore, AtomView};
 /// use symbolica::printer::PrintState;
-/// let _ = symbol!("mu";;;|a, opt| {
+/// let _ = symbol!("mu", print = |a, opt| {
 ///     if !opt.mode.is_latex() {
 ///         return None; // use default printer
 ///     }
@@ -1729,22 +2414,63 @@ macro_rules! function {
 /// });
 /// ```
 /// which renders the symbol/function as `\mu_{...}` in LaTeX.
+/// See [PrintFunction] for more details.
+///
+/// ### Derivatives
+/// You can define a custom derivative function using the `der` flag:
+/// ```no_run
+/// use symbolica::{atom::Atom, symbol};
+/// let _ = symbol!("tag", der = |a, arg, out| {
+///     out.set_from_view(&a); // function behaves as a tag
+/// });
+/// ```
+/// See [DerivativeFunction] for more details.
+///
+/// ### User data
+///
+/// You can attach custom user data to the symbol using the `data` flag:
+/// ```no_run
+/// use symbolica::{symbol, atom::UserData};
+/// let _ = symbol!("my_symbol", data = UserData::String("custom user data".to_owned()));
+/// ```
+/// It can be retrieved later using [Symbol::get_data]. See [UserData] for more details.
+///
+/// To set special settings together with attributes, separate the attributes with another
+/// `;`:
+///
+/// ```no_run
+/// use symbolica::symbol;
+/// let _ = symbol!("gamma"; Symmetric, Linear; print = |_, _| { None });
+/// ```
 #[macro_export]
 macro_rules! symbol {
     ($id: expr) => {
         $crate::atom::Symbol::new($crate::wrap_symbol!($id)).build().unwrap()
     };
     ($id: expr; $($attr: ident),*) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).build().unwrap()
+        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::SymbolAttribute::$attr,)*]).build().unwrap()
     };
-    ($id: expr; $($attr: ident),*; $norm: expr) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).with_normalization_function($norm).build().unwrap()
+    ($id: expr, $($a: tt = $value: expr),*) => {
+        {
+            let mut b =  $crate::atom::Symbol::new($crate::wrap_symbol!($id));
+
+            $(
+                b = $crate::symbol_set_attr!(b, $a = $value);
+            )+
+
+            b.build().unwrap()
+        }
     };
-    ($id: expr; $($attr: ident),*;; $print: expr) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).with_print_function($print).build().unwrap()
-    };
-    ($id: expr; $($attr: ident),*; $norm: expr; $print: expr) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).with_normalization_function($norm).with_print_function($print).build().unwrap()
+    ($id: expr; $($attr: ident),+; $($a: ident = $value: expr),*) => {
+        {
+            let mut b =  $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::SymbolAttribute::$attr,)*]);
+
+            $(
+                b = $crate::symbol_set_attr!(b, $a = $value);
+            )+
+
+            b.build().unwrap()
+        }
     };
     ($($id: expr),*) => {
         {
@@ -1755,11 +2481,29 @@ macro_rules! symbol {
             )
         }
     };
+    ($($id: expr),*; tag = $tag: expr) => {
+        {
+                (
+                $(
+                    $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_tags(std::slice::from_ref(&$tag)).build().unwrap(),
+                )+
+            )
+        }
+    };
+    ($($id: expr),*; tags = $tags: expr) => {
+        {
+                (
+                $(
+                    $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_tags($tags).build().unwrap(),
+                )+
+            )
+        }
+    };
     ($($id: expr),*; $($attr: ident),*) => {
         {
             macro_rules! gen_attr {
                 () => {
-                    &[$($crate::atom::FunctionAttribute::$attr,)*]
+                    &[$($crate::atom::SymbolAttribute::$attr,)*]
                 };
             }
 
@@ -1770,26 +2514,93 @@ macro_rules! symbol {
             )
         }
     };
+    ($($id: expr),*; $($attr: ident),*; tag = $tag: expr) => {
+        {
+            macro_rules! gen_attr {
+                () => {
+                    &[$($crate::atom::SymbolAttribute::$attr,)*]
+                };
+            }
+
+            (
+                $(
+                    $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(gen_attr!()).with_tags(std::slice::from_ref(&$tag)).build().unwrap(),
+                )+
+            )
+        }
+    };
+    ($($id: expr),*; $($attr: ident),*; tags = $tags: expr) => {
+        {
+            macro_rules! gen_attr {
+                () => {
+                    &[$($crate::atom::SymbolAttribute::$attr,)*]
+                };
+            }
+
+            (
+                $(
+                    $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(gen_attr!()).with_tags($tags).build().unwrap(),
+                )+
+            )
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! symbol_set_attr {
+    () => {{}};
+    ($b: expr, norm = $norm: expr) => {
+        $b.with_normalization_function($norm)
+    };
+    ($b: expr, print = $print: expr) => {
+        $b.with_print_function($print)
+    };
+    ($b: expr, der = $der: expr) => {
+        $b.with_derivative_function($der)
+    };
+    ($b: expr, data = $user_data: expr) => {
+        $b.with_user_data($user_data)
+    };
+    ($b: expr, tag = $tag: expr) => {
+        $b.with_tags(std::slice::from_ref(&$tag))
+    };
+    ($b: expr, tags = $tags: expr) => {
+        $b.with_tags($tags)
+    };
 }
 
 /// Try to create a new symbol or fetch the existing one with the same name.
-/// This is a fallible version of the [symbol!] macro.
+/// This is a fallible version of the [symbol!](crate::symbol) macro.
 #[macro_export]
 macro_rules! try_symbol {
     ($id: expr) => {
         $crate::atom::Symbol::new($crate::wrap_symbol!($id)).build()
     };
     ($id: expr; $($attr: ident),*) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).build()
+        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::SymbolAttribute::$attr,)*]).build()
     };
-    ($id: expr; $($attr: ident),*; $norm: expr) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).with_normalization_function($norm).build()
+    ($id: expr, $($a: tt = $value: expr),*) => {
+        {
+            let mut b =  $crate::atom::Symbol::new($crate::wrap_symbol!($id));
+
+            $(
+                b = $crate::symbol_set_attr!(b, $a = $value);
+            )+
+
+            b.build()
+        }
     };
-    ($id: expr; $($attr: ident),*;; $print: expr) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).with_print_function($print).build()
-    };
-    ($id: expr; $($attr: ident),*; $norm: expr; $print: expr) => {
-        $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::FunctionAttribute::$attr,)*]).with_normalization_function($norm).with_print_function($print).build()
+    ($id: expr; $($attr: ident),+; $($a: ident = $value: expr),*) => {
+        {
+            let mut b =  $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::SymbolAttribute::$attr,)*]);
+
+            $(
+                b = $crate::symbol_set_attr!(b, $a = $value);
+            )+
+
+            b.build()
+        }
     };
     ($($id: expr),*) => {
         {
@@ -1804,7 +2615,7 @@ macro_rules! try_symbol {
         {
             macro_rules! gen_attr {
                 () => {
-                    &[$($crate::atom::FunctionAttribute::$attr,)*]
+                    &[$($crate::atom::SymbolAttribute::$attr,)*]
                 };
             }
 
@@ -1813,6 +2624,92 @@ macro_rules! try_symbol {
                     $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(gen_attr!()).build(),
                 )+
             )
+        }
+    };
+}
+
+/// Looks up a symbol by its name without creating it.
+/// Use [symbol!](crate::symbol) to define new symbols.
+///
+/// Returns `None` if the symbol has not been defined yet.
+/// ```
+/// use symbolica::get_symbol;
+/// let x = symbolica::get_symbol!("newsymbol::x");
+/// assert!(x.is_none());
+/// let sin = symbolica::get_symbol!("sin");
+/// assert!(sin.is_some());
+/// ```
+#[macro_export]
+macro_rules! get_symbol {
+    ($id: expr) => {
+        $crate::atom::Symbol::get_symbol($crate::wrap_symbol!($id))
+    };
+    ($($id: expr),*) => {
+        {
+            (
+                $(
+                    $crate::atom::Symbol::get_symbol($crate::wrap_symbol!($id)),
+                )+
+            )
+        }
+    };
+}
+
+/// Define new symbols that depend on each other for their custom normalization/derivatives etc.
+/// For a fallible version, see [try_symbol_group!](crate::try_symbol_group).
+///
+/// Each symbol specifies a generator function that receives the list of all newly defined symbols
+/// that can be used inside symbol functions (see [SymbolBuilder::with_generator]).
+///
+/// The structure is as follows:
+///
+/// ```no_run
+/// # use symbolica::symbol_group;
+/// symbol_group!("name1"; Linear; |symbols, b| { b },
+///               "name2";; |symbols, b| { b });
+/// ```
+///
+/// For example, to define `tan` and `sec` with custom derivatives that depend on each other:
+/// ```
+/// use symbolica::{atom::AtomCore, function, symbol_group};
+/// let _ = symbol_group!("tan";;
+///     |symbs, b| {
+///         let sec = symbs[1];
+///         b.with_derivative_function(move |f, index, out| {
+///             **out = function!(sec, f.as_fun_view().unwrap().get(index)).npow(2)
+///         })
+///     },
+///     "sec";;
+///     |symbs, b| {
+///         let tan = symbs[0];
+///         b.with_derivative_function(move |f, index, out| {
+///             let sec_f = f.as_fun_view().unwrap();
+///             let arg = sec_f.get(index);
+///             **out = function!(tan, arg) * function!(sec_f.get_symbol(), arg)
+///         })
+///     }
+/// );
+/// ```
+#[macro_export]
+macro_rules! symbol_group {
+    ($($id: expr; $($attr: ident),*; $gen: expr),+) => {
+        $crate::try_symbol_group!($($id; $($attr),*; $gen),+).unwrap()
+    };
+}
+
+/// A fallible version of the [symbol_group!] macro.
+#[macro_export]
+macro_rules! try_symbol_group {
+    ($($id: expr; $($attr: ident),*; $gen: expr),+) => {
+        {
+            let mut v = vec![];
+            $(
+                let b = $crate::atom::Symbol::new($crate::wrap_symbol!($id)).with_attributes(&[$($crate::atom::SymbolAttribute::$attr,)*]).
+                    with_generator($gen);
+                v.push(b);
+            )+
+
+            $crate::atom::SymbolBuilder::build_group(v)
         }
     };
 }
@@ -1840,7 +2737,7 @@ macro_rules! try_symbol {
 /// Parse using another default namespace:
 /// ```
 /// use symbolica::parse;
-/// let a = parse!("test::x + y", "custom");
+/// let a = parse!("test::x + y", default_namespace = "custom");
 /// assert_eq!(a, parse!("test::x + custom::y"));
 /// ```
 ///
@@ -1858,6 +2755,25 @@ macro_rules! try_symbol {
 /// let a = parse!("1.23456e-6`5");
 /// println!("{}", a);
 /// ```
+///
+/// Parse Mathematica code:
+/// ```
+/// use symbolica::parse;
+/// let a = parse!("Cos[x] + Sqrt[Conjugate[x]] + Test`y + Exp[x] + Log[x]", Mathematica);
+/// println!("{}", a);
+/// ```
+///
+/// Conversion from a subset of `InputForm` is supported, excluding certain operators
+/// such as `.` and `->`. For maximal compatibility use `NumberMarks->False`,
+/// or `FullForm` for expressions involving non-supported structures.
+///
+///
+/// Parse with custom settings:
+/// ```
+/// use symbolica::{parse, parser::ParseSettings};
+/// let a = parse!("Cos[x]", settings = ParseSettings::mathematica());
+/// println!("{}", a);
+/// ```
 #[macro_export]
 macro_rules! parse {
     ($($all_args:tt)*) => {
@@ -1865,12 +2781,37 @@ macro_rules! parse {
     };
 }
 
+/// Try to parse an atom from a string.
+/// This is a fallible version of the [parse!](crate::parse) macro.
 #[macro_export]
 macro_rules! try_parse {
     ($s: expr) => {
-        $crate::atom::Atom::parse($crate::wrap_input!($s))
+        $crate::atom::Atom::parse(
+            $crate::wrap_input!($s),
+            $crate::parser::ParseSettings::symbolica(),
+        )
     };
-    ($s: expr, $ns: expr) => {{ $crate::atom::Atom::parse($crate::with_default_namespace!($s, $ns)) }};
+    ($s: expr, Mathematica) => {{
+        $crate::atom::Atom::parse(
+            $crate::wrap_input!($s),
+            $crate::parser::ParseSettings::mathematica(),
+        )
+    }};
+    ($s: expr, settings = $settings: expr) => {{ $crate::atom::Atom::parse($crate::wrap_input!($s), $settings) }};
+
+    ($s: expr, default_namespace = $ns: expr) => {
+        $crate::atom::Atom::parse(
+            $crate::with_default_namespace!($s, $ns),
+            $crate::parser::ParseSettings::symbolica(),
+        )
+    };
+    ($s: expr, Mathematica, default_namespace = $ns: expr) => {{
+        $crate::atom::Atom::parse(
+            $crate::with_default_namespace!($s, $ns),
+            $crate::parser::ParseSettings::mathematica(),
+        )
+    }};
+    ($s: expr, settings = $settings: expr, default_namespace = $ns: expr) => {{ $crate::atom::Atom::parse($crate::with_default_namespace!($s, $ns), $settings) }};
 }
 
 /// Parse an atom from literal code. Use [parse!](crate::parse) to parse from a string.
@@ -1886,20 +2827,42 @@ macro_rules! try_parse {
 /// Parse using another default namespace:
 /// ```
 /// use symbolica::{parse, parse_lit};
-/// let a = parse_lit!(test::x + y, "custom");
+/// let a = parse_lit!(test::x + y, default_namespace = "custom");
 /// assert_eq!(a, parse!("test::x + custom::y"));
 /// ```
 #[macro_export]
 macro_rules! parse_lit {
-    ($s: expr) => {{ $crate::atom::Atom::parse($crate::wrap_input!(stringify!($s))).unwrap() }};
-    ($s: expr, $ns: expr) => {{ $crate::atom::Atom::parse($crate::with_default_namespace!(stringify!($s), $ns)).unwrap() }};
+    ($s: expr) => {{
+        $crate::atom::Atom::parse(
+            $crate::wrap_input!(stringify!($s)),
+            $crate::parser::ParseSettings::symbolica(),
+        )
+        .unwrap()
+    }};
+    ($s: expr, default_namespace = $ns: expr) => {{
+        $crate::atom::Atom::parse(
+            $crate::with_default_namespace!(stringify!($s), $ns),
+            $crate::parser::ParseSettings::symbolica(),
+        )
+        .unwrap()
+    }};
 }
 
 /// Try to parse an atom from literal code. Use [parse_lit!](crate::parse_lit) for parsing that panics on an error.
 #[macro_export]
 macro_rules! try_parse_lit {
-    ($s: expr) => {{ $crate::atom::Atom::parse($crate::wrap_input!(stringify!($s))) }};
-    ($s: expr, $ns: expr) => {{ $crate::atom::Atom::parse($crate::with_default_namespace!(stringify!($s), $ns)) }};
+    ($s: expr) => {{
+        $crate::atom::Atom::parse(
+            $crate::wrap_input!(stringify!($s)),
+            $crate::parser::ParseSettings::symbolica(),
+        )
+    }};
+    ($s: expr, default_namespace = $ns: expr) => {{
+        $crate::atom::Atom::parse(
+            $crate::with_default_namespace!(stringify!($s), $ns),
+            $crate::parser::ParseSettings::symbolica(),
+        )
+    }};
 }
 
 impl Atom {
@@ -1956,7 +2919,7 @@ impl Atom {
     }
 
     /// Multiply the atoms in `args`.
-    pub fn mul_many<T: AtomCore + Copy>(args: &[T]) -> Atom {
+    pub fn mul_many<T: AtomCore>(args: &[T]) -> Atom {
         let mut out = Atom::new();
         Workspace::get_local().with(|ws| {
             let mut t = ws.new_atom();
@@ -1982,7 +2945,7 @@ impl AsRef<Atom> for Atom {
 #[cfg(test)]
 mod test {
     use crate::{
-        atom::{Atom, AtomCore},
+        atom::{Atom, AtomCore, UserData},
         function,
     };
 
@@ -1997,8 +2960,8 @@ mod test {
     fn debug() {
         let x = parse!("v1+f1(v2)");
         assert_eq!(
-            format!("{:?}", x),
-            "AddView { data: [5, 17, 2, 13, 2, 1, 11, 3, 5, 0, 0, 0, 1, 41, 2, 1, 12] }"
+            format!("{x:#?}"),
+            "AddView { data: [5, 17, 2, 13, 2, 1, 13, 3, 5, 0, 0, 0, 1, 43, 2, 1, 14] }"
         );
         assert_eq!(
             x.get_all_symbols(true),
@@ -2028,12 +2991,18 @@ mod test {
         let _ = FunctionBuilder::new(symbol!("a"))
             .add_arg(1)
             .add_args(&[1, 2])
-            .add_arg(&symbol!("a"))
+            .add_arg(symbol!("a"))
             .add_args(&[symbol!("b")])
             .add_args(&[parse!("a")])
-            .add_arg(&parse!("a"))
+            .add_arg(parse!("a"))
             .add_arg(parse!("a"))
             .add_arg(parse!("a").as_view())
             .finish();
+    }
+
+    #[test]
+    fn user_data() {
+        let s = crate::symbol!("user_data::test", data = UserData::Integer(42));
+        assert_eq!(s.get_data(), &UserData::Integer(42));
     }
 }

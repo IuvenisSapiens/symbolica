@@ -11,14 +11,17 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
 
 use crate::domains::algebraic_number::AlgebraicExtension;
+use crate::domains::float::FloatLike;
 use crate::domains::integer::{Integer, IntegerRing};
-use crate::domains::rational::{Q, RationalField};
-use crate::domains::{Derivable, EuclideanDomain, Field, InternalOrdering, Ring, SelfRing};
+use crate::domains::rational::{Fraction, FractionField, FractionNormalization, Q, RationalField};
+use crate::domains::{
+    Derivable, EuclideanDomain, Field, InternalOrdering, Ring, RingOps, SelfRing, Set,
+};
 use crate::printer::{PrintOptions, PrintState};
 
 use super::gcd::PolynomialGCD;
 use super::univariate::UnivariatePolynomial;
-use super::{Exponent, INLINED_EXPONENTS, LexOrder, MonomialOrder, PositiveExponent, Variable};
+use super::{Exponent, INLINED_EXPONENTS, LexOrder, MonomialOrder, PolyVariable, PositiveExponent};
 use smallvec::{SmallVec, smallvec};
 
 const MAX_DENSE_MUL_BUFFER_SIZE: usize = 1 << 24;
@@ -29,6 +32,38 @@ thread_local! { static DENSE_MUL_BUFFER: Cell<Vec<u32>> = const { Cell::new(Vec:
 pub struct PolynomialRing<R: Ring, E: Exponent> {
     pub(crate) ring: R,
     _phantom_exp: PhantomData<E>,
+}
+
+impl<R: Ring + FractionNormalization, E: Exponent> FractionNormalization for PolynomialRing<R, E> {
+    fn get_normalization_factor(&self, a: &Self::Element) -> Self::Element {
+        a.constant(a.ring.get_normalization_factor(&a.lcoeff()))
+    }
+}
+
+impl<R: EuclideanDomain + FractionNormalization, E: Exponent> PolynomialRing<FractionField<R>, E> {
+    pub fn to_rational_polynomial(
+        &self,
+        e: &<Self as Set>::Element,
+    ) -> Fraction<PolynomialRing<R, E>> {
+        let ring = self.ring.ring();
+        let mut lcm = ring.one();
+        for x in &e.coefficients {
+            let g = ring.gcd(&lcm, x.denominator_ref());
+            lcm = ring.mul(&lcm, &ring.quot_rem(x.denominator_ref(), &g).0);
+        }
+
+        let e2 = e.map_coeff(
+            |c| {
+                ring.mul(
+                    c.numerator_ref(),
+                    &ring.quot_rem(&lcm, c.denominator_ref()).0,
+                )
+            },
+            ring.clone(),
+        );
+
+        Fraction::from_unchecked(e2.constant(lcm), e2)
+    }
 }
 
 impl<R: Ring, E: Exponent> PolynomialRing<R, E> {
@@ -58,9 +93,62 @@ impl<R: Ring, E: Exponent> std::fmt::Display for PolynomialRing<R, E> {
     }
 }
 
-impl<R: Ring, E: Exponent> Ring for PolynomialRing<R, E> {
+impl<R: Ring, E: Exponent> Set for PolynomialRing<R, E> {
     type Element = MultivariatePolynomial<R, E>;
 
+    fn size(&self) -> Option<Integer> {
+        None
+    }
+}
+
+impl<R: Ring, E: Exponent> RingOps<MultivariatePolynomial<R, E>> for PolynomialRing<R, E> {
+    #[inline]
+    fn add(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        a + b
+    }
+
+    #[inline]
+    fn sub(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        a - b
+    }
+
+    #[inline]
+    fn mul(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        a * &b
+    }
+
+    #[inline]
+    fn add_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) + b;
+    }
+
+    #[inline]
+    fn sub_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) - b;
+    }
+
+    #[inline]
+    fn mul_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = &*a * &b;
+    }
+
+    #[inline]
+    fn add_mul_assign(&self, a: &mut Self::Element, b: Self::Element, c: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) + b * &c
+    }
+
+    #[inline]
+    fn sub_mul_assign(&self, a: &mut Self::Element, b: Self::Element, c: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) - b * &c
+    }
+
+    #[inline]
+    fn neg(&self, a: Self::Element) -> Self::Element {
+        a.neg()
+    }
+}
+
+impl<R: Ring, E: Exponent> RingOps<&MultivariatePolynomial<R, E>> for PolynomialRing<R, E> {
     #[inline]
     fn add(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
         a + b
@@ -105,7 +193,9 @@ impl<R: Ring, E: Exponent> Ring for PolynomialRing<R, E> {
     fn neg(&self, a: &Self::Element) -> Self::Element {
         a.clone().neg()
     }
+}
 
+impl<R: Ring, E: Exponent> Ring for PolynomialRing<R, E> {
     #[inline]
     fn zero(&self) -> Self::Element {
         MultivariatePolynomial::new(&self.ring, None, Arc::new(vec![]))
@@ -144,8 +234,13 @@ impl<R: Ring, E: Exponent> Ring for PolynomialRing<R, E> {
         self.ring.characteristic()
     }
 
-    fn size(&self) -> Integer {
-        0.into()
+    fn try_inv(&self, a: &Self::Element) -> Option<Self::Element> {
+        if a.is_constant() {
+            let inv = self.ring.try_inv(&a.get_constant())?;
+            Some(a.constant(inv))
+        } else {
+            None
+        }
     }
 
     fn try_div(&self, a: &Self::Element, b: &Self::Element) -> Option<Self::Element> {
@@ -164,6 +259,11 @@ impl<R: Ring, E: Exponent> Ring for PolynomialRing<R, E> {
         f: &mut W,
     ) -> Result<bool, std::fmt::Error> {
         element.format(opts, state, f)
+    }
+
+    fn has_independent_elements(&self) -> bool {
+        // the coefficient ring is stored in the polynomial
+        true
     }
 }
 
@@ -195,7 +295,7 @@ pub struct MultivariatePolynomial<F: Ring, E: Exponent = u16, O: MonomialOrder =
     pub exponents: Vec<E>,
     /// The coefficient ring.
     pub ring: F,
-    pub variables: Arc<Vec<Variable>>,
+    pub variables: Arc<Vec<PolyVariable>>,
     pub(crate) _phantom: PhantomData<O>,
 }
 
@@ -216,7 +316,7 @@ where
 
         let coefficients = Vec::<F::Element>::decode(&mut decoder.with_context(&ring))?;
         let exponents = Vec::<E>::decode(decoder)?;
-        let variables = Arc::<Vec<Variable>>::decode(decoder)?;
+        let variables = Arc::<Vec<PolyVariable>>::decode(decoder)?;
         Ok(MultivariatePolynomial {
             coefficients,
             exponents,
@@ -232,7 +332,7 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
     /// prefer to create new polynomials from existing ones, so that the
     /// variable map and field are inherited.
     #[inline]
-    pub fn new(ring: &F, cap: Option<usize>, variables: Arc<Vec<Variable>>) -> Self {
+    pub fn new(ring: &F, cap: Option<usize>, variables: Arc<Vec<PolyVariable>>) -> Self {
         Self {
             coefficients: Vec::with_capacity(cap.unwrap_or(0)),
             exponents: Vec::with_capacity(cap.unwrap_or(0) * variables.len()),
@@ -344,18 +444,18 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
 
     /// Constructs a polynomial with a single term that is a variable.
     #[inline]
-    pub fn variable(&self, var: &Variable) -> Result<Self, &'static str> {
+    pub fn variable(&self, var: &PolyVariable) -> Result<Self, String> {
         if let Some(pos) = self.variables.iter().position(|v| v == var) {
             let mut exp = vec![E::zero(); self.nvars()];
             exp[pos] = E::one();
             Ok(self.monomial(self.ring.one(), exp))
         } else {
-            Err("Variable not found")
+            Err(format!("Variable {} not found", var))
         }
     }
 
     /// Get the ith monomial
-    pub fn to_monomial_view(&self, i: usize) -> MonomialView<F, E> {
+    pub fn to_monomial_view(&self, i: usize) -> MonomialView<'_, F, E> {
         assert!(i < self.nterms());
 
         MonomialView {
@@ -457,13 +557,13 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
 
     /// Returns an iterator over the exponents of every monomial.
     #[inline]
-    pub fn exponents_iter(&self) -> std::slice::Chunks<E> {
+    pub fn exponents_iter(&self) -> std::slice::Chunks<'_, E> {
         self.exponents.chunks(self.nvars())
     }
 
     /// Returns an iterator over the mutable exponents of every monomial.
     #[inline]
-    pub fn exponents_iter_mut(&mut self) -> std::slice::ChunksMut<E> {
+    pub fn exponents_iter_mut(&mut self) -> std::slice::ChunksMut<'_, E> {
         let nvars = self.nvars();
         self.exponents.chunks_mut(nvars)
     }
@@ -476,17 +576,17 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
     }
 
     /// Get a copy of the variable list.
-    pub fn get_vars(&self) -> Arc<Vec<Variable>> {
+    pub fn get_vars(&self) -> Arc<Vec<PolyVariable>> {
         self.variables.clone()
     }
 
     /// Get a reference to the variables list.
-    pub fn get_vars_ref(&self) -> &[Variable] {
+    pub fn get_vars_ref(&self) -> &[PolyVariable] {
         self.variables.as_ref()
     }
 
     /// Rename a variable.
-    pub fn rename_variable(&mut self, old: &Variable, new: &Variable) {
+    pub fn rename_variable(&mut self, old: &PolyVariable, new: &PolyVariable) {
         if let Some(pos) = self.variables.iter().position(|v| v == old) {
             let mut new_vars = self.variables.as_ref().clone();
             new_vars[pos] = new.clone();
@@ -582,8 +682,36 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
         }
     }
 
+    /// Reverse the coefficients: `1+2x+3x^3` becomes `3+2x^2+x^3`.
+    pub fn reverse(&mut self) {
+        self.coefficients.reverse();
+        let nterms = self.nterms();
+        let nvars = self.nvars();
+        let degs = (0..nvars).map(|i| self.degree(i)).collect::<Vec<_>>();
+
+        for e in self.exponents.chunks_mut(nvars) {
+            for (ee, d) in e.iter_mut().zip(&degs) {
+                *ee = *d - *ee;
+            }
+        }
+
+        let midu = if nterms.is_multiple_of(2) {
+            self.nvars() * (nterms / 2)
+        } else {
+            self.nvars() * (nterms / 2 + 1)
+        };
+
+        let (l, r) = self.exponents.split_at_mut(midu);
+
+        let rend = r.len();
+        for i in 0..nterms / 2 {
+            l[i * nvars..(i + 1) * nvars]
+                .swap_with_slice(&mut r[rend - (i + 1) * nvars..rend - i * nvars]);
+        }
+    }
+
     /// Reverse the monomial ordering in-place.
-    fn reverse(&mut self) {
+    fn reverse_monomials(&mut self) {
         let nterms = self.nterms();
         let nvars = self.nvars();
         if nterms < 2 {
@@ -592,7 +720,7 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
 
         self.coefficients.reverse();
 
-        let midu = if nterms % 2 == 0 {
+        let midu = if nterms.is_multiple_of(2) {
             self.nvars() * (nterms / 2)
         } else {
             self.nvars() * (nterms / 2 + 1)
@@ -608,7 +736,7 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
     }
 
     /// Add a variable to the polynomial if it is not already present.
-    pub fn add_variable(&mut self, var: &Variable) {
+    pub fn add_variable(&mut self, var: &PolyVariable) {
         if self.variables.iter().any(|v| v == var) {
             return;
         }
@@ -636,17 +764,16 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
 
         for c in &self.coefficients {
             if self.ring.is_zero(c) {
-                panic!("Inconsistent polynomial (0 coefficient): {}", self);
+                panic!("Inconsistent polynomial (0 coefficient): {self}");
             }
         }
 
         for t in 1..self.nterms() {
             match O::cmp(self.exponents(t), self.exponents(t - 1)) {
-                Ordering::Equal => panic!("Inconsistent polynomial (equal monomials): {}", self),
-                Ordering::Less => panic!(
-                    "Inconsistent polynomial (wrong monomial ordering): {}",
-                    self
-                ),
+                Ordering::Equal => panic!("Inconsistent polynomial (equal monomials): {self}"),
+                Ordering::Less => {
+                    panic!("Inconsistent polynomial (wrong monomial ordering): {self}")
+                }
                 Ordering::Greater => {}
             }
         }
@@ -766,6 +893,8 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> SelfRing for MultivariatePolynomial
         mut state: PrintState,
         f: &mut W,
     ) -> Result<bool, std::fmt::Error> {
+        let print_ring = opts.print_ring && !self.ring.has_independent_elements();
+
         if self.is_constant() {
             if self.is_zero() {
                 if state.in_sum {
@@ -773,14 +902,15 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> SelfRing for MultivariatePolynomial
                 }
                 f.write_char('0')?;
                 return Ok(false);
-            } else {
+            } else if !print_ring || state.level > 0 {
                 return self.ring.format(&self.coefficients[0], opts, state, f);
             }
         }
 
-        let add_paren = self.nterms() > 1 && state.in_product
+        let add_paren = (self.nterms() > 1 || print_ring) && state.in_product
             || ((state.in_exp || state.in_exp_base)
                 && (self.nterms() > 1
+                    || print_ring
                     || self.exponents(0).iter().filter(|e| **e > E::zero()).count() > 1
                     || !self.ring.is_one(&self.coefficients[0])));
 
@@ -812,10 +942,12 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> SelfRing for MultivariatePolynomial
             })
             .collect();
 
+        state.level += 1;
         for monomial in self {
             let has_var = monomial.exponents.iter().any(|e| !e.is_zero());
             state.in_product = in_product || has_var;
             state.suppress_one = has_var; // any products before should not be considered
+            state.in_exp |= print_ring; // make sure to add parentheses
 
             let mut suppressed_one = self.ring.format(monomial.coefficient, opts, state, f)?;
 
@@ -833,24 +965,25 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> SelfRing for MultivariatePolynomial
 
                 if e.to_i32() != 1 {
                     if opts.mode.is_latex() {
-                        write!(f, "^{{{}}}", e)?;
+                        write!(f, "^{{{e}}}")?;
                     } else if opts.double_star_for_exponentiation {
-                        write!(f, "**{}", e)?;
+                        write!(f, "**{e}")?;
                     } else {
-                        write!(f, "^{}", e)?;
+                        write!(f, "^{e}")?;
                     }
                 }
             }
 
             state.in_sum = true;
         }
+        state.level -= 1;
 
         if self.is_zero() {
             f.write_char('0')?;
         }
 
-        if opts.print_finite_field {
-            f.write_fmt(format_args!("{}", self.ring))?;
+        if print_ring && state.level == 0 {
+            self.ring.format_ring(opts, state, f)?;
         }
 
         if add_paren {
@@ -1137,7 +1270,7 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> Neg for MultivariatePolynomial<F, E
     fn neg(mut self) -> Self::Output {
         // Negate coefficients of all terms.
         for c in &mut self.coefficients {
-            *c = self.ring.neg(c);
+            *c = self.ring.neg(&*c);
         }
         self
     }
@@ -1209,7 +1342,7 @@ impl<'a, F: EuclideanDomain, E: PositiveExponent> Div<&'a MultivariatePolynomial
 
     fn div(self, other: &'a MultivariatePolynomial<F, E, LexOrder>) -> Self::Output {
         self.try_div(other)
-            .unwrap_or_else(|| panic!("No clean division of {} by {}", self, other))
+            .unwrap_or_else(|| panic!("No clean division of {self} by {other}"))
     }
 }
 
@@ -1337,7 +1470,7 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
     }
 
     #[inline]
-    fn mul_monomial(self, coefficient: &F::Element, exponents: &[E]) -> Self {
+    pub fn mul_monomial(self, coefficient: &F::Element, exponents: &[E]) -> Self {
         self.mul_coeff(coefficient.clone()).mul_exp(exponents)
     }
 
@@ -1447,6 +1580,83 @@ impl<F: Ring, E: Exponent, O: MonomialOrder> MultivariatePolynomial<F, E, O> {
 
         res
     }
+
+    /// Get the coefficient of the monomial with the given exponents if it is present.
+    pub fn coefficient(&self, exponents: &[E]) -> Option<F::Element> {
+        if self.is_zero() {
+            if exponents.iter().all(|e| *e == E::zero()) {
+                return Some(self.ring.zero());
+            }
+            return None;
+        }
+
+        let mut low = 0;
+        let mut high = self.coefficients.len();
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+
+            match O::cmp(
+                &self.exponents[mid * self.nvars()..(mid + 1) * self.nvars()],
+                exponents,
+            ) {
+                Ordering::Equal => return Some(self.coefficients[mid].clone()),
+                Ordering::Less => {
+                    low = mid + 1;
+                }
+                Ordering::Greater => {
+                    high = mid;
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn map_exp<E2: Exponent>(&self, f: impl Fn(&E) -> E2) -> MultivariatePolynomial<F, E2, O> {
+        MultivariatePolynomial {
+            coefficients: self.coefficients.clone(),
+            exponents: self.exponents.iter().map(f).collect::<Vec<_>>(),
+            ring: self.ring.clone(),
+            variables: self.variables.clone(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Kronecker map all variables starting from `start_index` using the powers given in `powers`:
+    /// `x_i -> x_{start_index}^powers[i - start_index]` for `i > start_index`.
+    pub fn kronecker_map(&self, powers: &[E], start_index: usize) -> Self {
+        let mut res = self.zero_with_capacity(self.nterms());
+        let mut new_exponents = vec![E::zero(); self.nvars()];
+        for a in self {
+            new_exponents[..(start_index + 1)].copy_from_slice(&a.exponents[..(start_index + 1)]);
+
+            for (i, e) in a.exponents.iter().skip(start_index + 1).enumerate() {
+                new_exponents[start_index] += powers[i] * *e;
+            }
+            res.append_monomial(a.coefficient.clone(), &new_exponents);
+        }
+        res
+    }
+
+    /// Invert a Kronecker map.
+    pub fn kronecker_inv_map(&self, powers: &[E], start_index: usize) -> Self {
+        let mut res = self.zero_with_capacity(self.nterms());
+        let mut new_exponents = vec![E::zero(); self.nvars()];
+        for a in self {
+            new_exponents[..start_index].copy_from_slice(&a.exponents[..start_index]);
+
+            let mut total = a.exponents[start_index];
+            new_exponents[start_index] = total % powers[0];
+            for i in (start_index + 1)..self.nvars() {
+                total = total - new_exponents[i - 1];
+                new_exponents[i] = total % powers[i - start_index];
+                new_exponents[i] = new_exponents[i] / powers[i - start_index - 1];
+            }
+            res.append_monomial(a.coefficient.clone(), &new_exponents);
+        }
+        res
+    }
 }
 
 impl<F: Ring, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
@@ -1519,20 +1729,31 @@ impl<F: Ring, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
     /// Replace the last variable `n` in the polynomial by an element from
     /// the ring `v`.
     pub fn replace_last(&self, n: usize, v: &F::Element) -> MultivariatePolynomial<F, E, LexOrder> {
+        const MAX_EXP_BUF: usize = 100000;
         let mut res = self.zero_with_capacity(self.nterms());
-        let mut e: SmallVec<[E; INLINED_EXPONENTS]> = smallvec![E::zero(); self.nvars()];
+        let mut e = vec![E::zero(); self.nvars()];
+        let mut res_cache =
+            vec![self.ring.zero(); (self.degree(n).to_i32() as usize + 1).min(MAX_EXP_BUF)];
 
-        // TODO: cache power taking?
+        let nvars = self.nvars();
+
         for t in self {
             if t.exponents[n] == E::zero() {
                 res.append_monomial(t.coefficient.clone(), t.exponents);
                 continue;
             }
 
-            let c = self.ring.mul(
-                t.coefficient,
-                &self.ring.pow(v, t.exponents[n].to_i32() as u64),
-            );
+            let ee = t.exponents[n].to_i32() as usize;
+
+            let c = if ee < MAX_EXP_BUF {
+                if self.ring.is_zero(&res_cache[ee]) {
+                    res_cache[ee] = self.ring.pow(v, ee as u64);
+                }
+
+                self.ring.mul(t.coefficient, &res_cache[ee])
+            } else {
+                self.ring.mul(t.coefficient, &self.ring.pow(v, ee as u64))
+            };
 
             if self.ring.is_zero(&c) {
                 continue;
@@ -1541,7 +1762,21 @@ impl<F: Ring, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
             e.copy_from_slice(t.exponents);
             e[n] = E::zero();
 
-            if res.is_zero() || res.last_exponents() != e.as_slice() {
+            let mut different = false;
+            if !res.is_zero() {
+                let start = (res.nterms() - 1) * nvars;
+
+                for i in (0..n).rev() {
+                    if unsafe { e.get_unchecked(i) != res.exponents.get_unchecked(start + i) } {
+                        different = true;
+                        break;
+                    }
+                }
+            } else {
+                different = true;
+            }
+
+            if different {
                 res.coefficients.push(c);
                 res.exponents.extend_from_slice(&e);
             } else {
@@ -1553,6 +1788,49 @@ impl<F: Ring, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
                     res.exponents.truncate(res.exponents.len() - self.nvars());
                 }
             }
+        }
+
+        res
+    }
+
+    pub fn evaluate<T: FloatLike, M: Fn(&F::Element) -> T>(&self, map_coeff: M, point: &[T]) -> T {
+        let mut res = map_coeff(&self.ring.zero());
+
+        for t in self {
+            let mut c = map_coeff(t.coefficient);
+
+            for (i, v) in point.iter().zip(t.exponents) {
+                if v != &E::zero() {
+                    c *= i.pow(v.to_u32() as u64);
+                }
+            }
+
+            res += c;
+        }
+
+        res
+    }
+
+    /// Evaluate the polynomial at the given point, mapping coefficients to the ring `U`.
+    pub fn evaluate_with_coeff_map<U: Ring, T: Fn(&F::Element) -> U::Element>(
+        &self,
+        map_coeff: T,
+        point: &[U::Element],
+        ring: &U,
+    ) -> U::Element {
+        let mut res = map_coeff(&self.ring.zero());
+        assert_eq!(point.len(), self.nvars());
+
+        for t in self {
+            let mut c = map_coeff(t.coefficient);
+
+            for (i, v) in point.iter().zip(t.exponents) {
+                if v != &E::zero() {
+                    ring.mul_assign(&mut c, &ring.pow(i, v.to_u32() as u64));
+                }
+            }
+
+            ring.add_assign(&mut res, &c);
         }
 
         res
@@ -1570,7 +1848,7 @@ impl<F: Ring, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
             for (i, v) in r.iter().zip(t.exponents) {
                 if v != &E::zero() {
                     self.ring
-                        .mul_assign(&mut c, &self.ring.pow(i, v.to_i32() as u64));
+                        .mul_assign(&mut c, &self.ring.pow(i, v.to_u32() as u64));
                 }
             }
 
@@ -1680,6 +1958,23 @@ impl<F: Ring, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
 
         poly
     }
+
+    /// Compute the inverse of the univariate polynomial in `var` up until `pow` using Newton's method.
+    pub fn inverse_univariate(&self, var: usize, pow: E) -> Self {
+        let mut g = self.constant(
+            self.ring
+                .try_div(&self.ring.one(), &self.get_constant())
+                .unwrap(),
+        );
+        let mut exp = E::one();
+        while exp < pow {
+            exp = exp * E::from_u32(2);
+            let h =
+                g.clone().mul_coeff(self.ring.nth(2.into())) - self * &(&g * &g).mod_var(var, exp);
+            g = h.mod_var(var, exp);
+        }
+        g
+    }
 }
 
 impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
@@ -1741,6 +2036,35 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
             if t.exponents[x] == d {
                 e.copy_from_slice(t.exponents);
                 e[x] = E::zero();
+                lcoeff.append_monomial(t.coefficient.clone(), &e);
+            }
+        }
+
+        lcoeff
+    }
+
+    /// Get the leading coefficient of a multivariate polynomial viewed as a bivariate polynomial in the first two variables.
+    pub fn bivariate_lcoeff(&self) -> MultivariatePolynomial<F, E, LexOrder> {
+        let mut lcoeff = self.zero();
+
+        if self.coefficients.is_empty() {
+            return lcoeff;
+        }
+
+        let d = self.degree(0);
+        let mut d1 = E::zero();
+        for t in self {
+            if t.exponents[0] == d && t.exponents[1] > d1 {
+                d1 = t.exponents[1];
+            }
+        }
+
+        let mut e = vec![E::zero(); self.nvars()];
+        for t in self {
+            if t.exponents[0] == d && t.exponents[1] == d1 {
+                e.copy_from_slice(t.exponents);
+                e[0] = E::zero();
+                e[1] = E::zero();
                 lcoeff.append_monomial(t.coefficient.clone(), &e);
             }
         }
@@ -1885,7 +2209,7 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
     /// allows the polynomial to grow in size.
     pub fn rearrange_with_growth(
         &self,
-        order: &[Variable],
+        order: &[PolyVariable],
     ) -> Result<MultivariatePolynomial<F, E, LexOrder>, String> {
         let new_order: Vec<_> = order
             .iter()
@@ -1894,7 +2218,7 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
 
         for (i, v) in self.variables.iter().enumerate() {
             if !new_order.contains(&Some(i)) && self.contains(i) {
-                return Err(format!("Variable {} is not in the new order", v));
+                return Err(format!("Variable {v} is not in the new order"));
             }
         }
 
@@ -2115,27 +2439,25 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
 
     pub(crate) fn mul_univariate_dense(&self, rhs: &Self, max_pow: Option<usize>) -> Self {
         if self.is_constant() {
-            if let Some(m) = max_pow {
-                if let Some(var) = rhs.last_exponents().iter().position(|e| *e != E::zero()) {
-                    if rhs.degree(var).to_i32() > m as i32 {
-                        return rhs
-                            .mod_var(var, E::from_i32(m as i32 + 1))
-                            .mul_coeff(self.lcoeff());
-                    }
-                }
+            if let Some(m) = max_pow
+                && let Some(var) = rhs.last_exponents().iter().position(|e| *e != E::zero())
+                && rhs.degree(var).to_i32() > m as i32
+            {
+                return rhs
+                    .mod_var(var, E::from_i32(m as i32 + 1))
+                    .mul_coeff(self.lcoeff());
             }
             return rhs.clone().mul_coeff(self.lcoeff());
         }
 
         if rhs.is_constant() {
-            if let Some(m) = max_pow {
-                if let Some(var) = self.last_exponents().iter().position(|e| *e != E::zero()) {
-                    if self.degree(var).to_i32() > m as i32 {
-                        return self
-                            .mod_var(var, E::from_i32(m as i32 + 1))
-                            .mul_coeff(rhs.lcoeff());
-                    }
-                }
+            if let Some(m) = max_pow
+                && let Some(var) = self.last_exponents().iter().position(|e| *e != E::zero())
+                && self.degree(var).to_i32() > m as i32
+            {
+                return self
+                    .mod_var(var, E::from_i32(m as i32 + 1))
+                    .mul_coeff(rhs.lcoeff());
             }
             return self.clone().mul_coeff(rhs.lcoeff());
         }
@@ -2271,13 +2593,13 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
             pow = pow - E::one();
         }
 
-        q.reverse();
-        r.reverse();
+        q.reverse_monomials();
+        r.reverse_monomials();
 
         #[cfg(debug_assertions)]
         {
             if !(&q * div + r.clone() - self.clone()).is_zero() {
-                panic!("Division failed: ({})/({}): q={}, r={}", self, div, q, r);
+                panic!("Division failed: ({self})/({div}): q={q}, r={r}");
             }
         }
 
@@ -3167,36 +3489,26 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
             }
 
             // check if one is a multiple of the other
-            if let Some(q) = self.ring.try_div(&self.lcoeff(), &div.lcoeff()) {
-                if self
+            if let Some(q) = self.ring.try_div(&self.lcoeff(), &div.lcoeff())
+                && self
                     .into_iter()
                     .zip(div)
                     .all(|(t1, t2)| t1.exponents == t2.exponents)
-                    && self
-                        .into_iter()
-                        .zip(div)
-                        .all(|(t1, t2)| &self.ring.mul(t2.coefficient, &q) == t1.coefficient)
-                {
-                    return (self.constant(q), self.zero());
-                }
+                && self
+                    .into_iter()
+                    .zip(div)
+                    .all(|(t1, t2)| &self.ring.mul(t2.coefficient, &q) == t1.coefficient)
+            {
+                return (self.constant(q), self.zero());
             }
         }
 
-        if div.nterms() == 1 {
+        if div.is_constant() {
             let mut q = self.clone();
             let dive = div.to_monomial_view(0);
 
-            let nvars = q.nvars();
-            if nvars > 0 {
-                for ee in q.exponents.chunks_mut(nvars) {
-                    for (e1, e2) in ee.iter_mut().zip(dive.exponents) {
-                        if *e1 >= *e2 {
-                            *e1 = *e1 - *e2;
-                        } else {
-                            return (self.zero(), self.clone());
-                        }
-                    }
-                }
+            if let Some(i) = div.ring.try_inv(dive.coefficient) {
+                return (q.mul_coeff(i), self.zero());
             }
 
             for c in &mut q.coefficients {
@@ -3280,20 +3592,69 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
                 c = self.ring.zero();
             }
 
-            if let Some(monomial) = h.peek() {
-                if &m == monomial {
-                    h.pop().unwrap();
+            if let Some(monomial) = h.peek()
+                && &m == monomial
+            {
+                h.pop().unwrap();
 
-                    let mut qs = cache.remove(&m).unwrap();
-                    for (i, j, next_in_divisor) in qs.drain(..) {
-                        self.ring.sub_mul_assign(
-                            &mut c,
-                            &q.coefficients[i],
-                            div.coefficient_back(j),
-                        );
+                let mut qs = cache.remove(&m).unwrap();
+                for (i, j, next_in_divisor) in qs.drain(..) {
+                    self.ring
+                        .sub_mul_assign(&mut c, &q.coefficients[i], div.coefficient_back(j));
 
-                        if next_in_divisor && j + 1 < div.nterms() {
-                            // quotient heap product
+                    if next_in_divisor && j + 1 < div.nterms() {
+                        // quotient heap product
+                        for ((m, e1), e2) in m_cache
+                            .iter_mut()
+                            .zip(q.exponents(i))
+                            .zip(div.exponents_back(j + 1))
+                        {
+                            *m = *e1 + *e2;
+                        }
+
+                        // TODO: make macro
+                        if let Some(e) = cache.get_mut(&m_cache) {
+                            e.push((i, j + 1, true));
+                        } else {
+                            h.push(m_cache.clone()); // only add when new
+                            if let Some(mut qq) = q_cache.pop() {
+                                qq.push((i, j + 1, true));
+                                cache.insert(m_cache.clone(), qq);
+                            } else {
+                                cache.insert(m_cache.clone(), vec![(i, j + 1, true)]);
+                            }
+                        }
+                    } else if !next_in_divisor {
+                        merged_index_of_div_monomial_in_quotient[j] = i + 1;
+
+                        if i + 1 < q.nterms()
+                            && (j == 1 // the divisor starts with the sub-leading term in the heap
+                                    || merged_index_of_div_monomial_in_quotient[j - 1] > i + 1)
+                        {
+                            for ((m, e1), e2) in m_cache
+                                .iter_mut()
+                                .zip(q.exponents(i + 1))
+                                .zip(div.exponents_back(j))
+                            {
+                                *m = *e1 + *e2;
+                            }
+
+                            if let Some(e) = cache.get_mut(&m_cache) {
+                                e.push((i + 1, j, false));
+                            } else {
+                                h.push(m_cache.clone()); // only add when new
+                                if let Some(mut qq) = q_cache.pop() {
+                                    qq.push((i + 1, j, false));
+                                    cache.insert(m_cache.clone(), qq);
+                                } else {
+                                    cache.insert(m_cache.clone(), vec![(i + 1, j, false)]);
+                                }
+                            }
+                        } else {
+                            div_monomial_in_heap[j] = false;
+                        }
+
+                        if j + 1 < div.nterms() && !div_monomial_in_heap[j + 1] {
                             for ((m, e1), e2) in m_cache
                                 .iter_mut()
                                 .zip(q.exponents(i))
@@ -3302,77 +3663,25 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
                                 *m = *e1 + *e2;
                             }
 
-                            // TODO: make macro
                             if let Some(e) = cache.get_mut(&m_cache) {
-                                e.push((i, j + 1, true));
+                                e.push((i, j + 1, false));
                             } else {
                                 h.push(m_cache.clone()); // only add when new
+
                                 if let Some(mut qq) = q_cache.pop() {
-                                    qq.push((i, j + 1, true));
+                                    qq.push((i, j + 1, false));
                                     cache.insert(m_cache.clone(), qq);
                                 } else {
-                                    cache.insert(m_cache.clone(), vec![(i, j + 1, true)]);
+                                    cache.insert(m_cache.clone(), vec![(i, j + 1, false)]);
                                 }
                             }
-                        } else if !next_in_divisor {
-                            merged_index_of_div_monomial_in_quotient[j] = i + 1;
 
-                            if i + 1 < q.nterms()
-                                && (j == 1 // the divisor starts with the sub-leading term in the heap
-                                    || merged_index_of_div_monomial_in_quotient[j - 1] > i + 1)
-                            {
-                                for ((m, e1), e2) in m_cache
-                                    .iter_mut()
-                                    .zip(q.exponents(i + 1))
-                                    .zip(div.exponents_back(j))
-                                {
-                                    *m = *e1 + *e2;
-                                }
-
-                                if let Some(e) = cache.get_mut(&m_cache) {
-                                    e.push((i + 1, j, false));
-                                } else {
-                                    h.push(m_cache.clone()); // only add when new
-                                    if let Some(mut qq) = q_cache.pop() {
-                                        qq.push((i + 1, j, false));
-                                        cache.insert(m_cache.clone(), qq);
-                                    } else {
-                                        cache.insert(m_cache.clone(), vec![(i + 1, j, false)]);
-                                    }
-                                }
-                            } else {
-                                div_monomial_in_heap[j] = false;
-                            }
-
-                            if j + 1 < div.nterms() && !div_monomial_in_heap[j + 1] {
-                                for ((m, e1), e2) in m_cache
-                                    .iter_mut()
-                                    .zip(q.exponents(i))
-                                    .zip(div.exponents_back(j + 1))
-                                {
-                                    *m = *e1 + *e2;
-                                }
-
-                                if let Some(e) = cache.get_mut(&m_cache) {
-                                    e.push((i, j + 1, false));
-                                } else {
-                                    h.push(m_cache.clone()); // only add when new
-
-                                    if let Some(mut qq) = q_cache.pop() {
-                                        qq.push((i, j + 1, false));
-                                        cache.insert(m_cache.clone(), qq);
-                                    } else {
-                                        cache.insert(m_cache.clone(), vec![(i, j + 1, false)]);
-                                    }
-                                }
-
-                                div_monomial_in_heap[j + 1] = true;
-                            }
+                            div_monomial_in_heap[j + 1] = true;
                         }
                     }
-
-                    q_cache.push(qs);
                 }
+
+                q_cache.push(qs);
             }
 
             if self.ring.is_zero(&c) {
@@ -3469,13 +3778,13 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
         }
 
         // q and r have the highest monomials first
-        q.reverse();
-        r.reverse();
+        q.reverse_monomials();
+        r.reverse_monomials();
 
         #[cfg(debug_assertions)]
         {
             if !(&q * div + r.clone() - self.clone()).is_zero() {
-                panic!("Division failed: ({})/({}): q={}, r={}", self, div, q, r);
+                panic!("Division failed: ({self})/({div}): q={q}, r={r}");
             }
         }
 
@@ -3552,82 +3861,79 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
                 c = self.ring.zero();
             }
 
-            if let Some(monomial) = h.peek() {
-                if &m == monomial {
-                    h.pop().unwrap();
+            if let Some(monomial) = h.peek()
+                && &m == monomial
+            {
+                h.pop().unwrap();
 
-                    let mut qs = cache.remove(&m).unwrap();
-                    for (i, j, next_in_divisor) in qs.drain(..) {
-                        // TODO: use fraction-free routines
-                        self.ring.sub_mul_assign(
-                            &mut c,
-                            &q.coefficients[i],
-                            div.coefficient_back(j),
-                        );
+                let mut qs = cache.remove(&m).unwrap();
+                for (i, j, next_in_divisor) in qs.drain(..) {
+                    // TODO: use fraction-free routines
+                    self.ring
+                        .sub_mul_assign(&mut c, &q.coefficients[i], div.coefficient_back(j));
 
-                        if next_in_divisor && j + 1 < div.nterms() {
-                            // quotient heap product
-                            m_cache = q_exp[i] + pack_div[div.nterms() - (j + 1) - 1];
+                    if next_in_divisor && j + 1 < div.nterms() {
+                        // quotient heap product
+                        m_cache = q_exp[i] + pack_div[div.nterms() - (j + 1) - 1];
 
-                            // TODO: make macro
+                        // TODO: make macro
+                        if let Some(e) = cache.get_mut(&m_cache) {
+                            e.push((i, j + 1, true));
+                        } else {
+                            h.push(m_cache); // only add when new
+                            if let Some(mut qq) = q_cache.pop() {
+                                qq.push((i, j + 1, true));
+                                cache.insert(m_cache, qq);
+                            } else {
+                                cache.insert(m_cache, vec![(i, j + 1, true)]);
+                            }
+                        }
+                    } else if !next_in_divisor {
+                        merged_index_of_div_monomial_in_quotient[j] = i + 1;
+
+                        if i + 1 < q.nterms()
+                            && (j == 1 // the divisor starts with the sub-leading term in the heap
+                                    || merged_index_of_div_monomial_in_quotient[j - 1] > i + 1)
+                        {
+                            m_cache = q_exp[i + 1] + pack_div[div.nterms() - j - 1];
+
                             if let Some(e) = cache.get_mut(&m_cache) {
-                                e.push((i, j + 1, true));
+                                e.push((i + 1, j, false));
                             } else {
                                 h.push(m_cache); // only add when new
                                 if let Some(mut qq) = q_cache.pop() {
-                                    qq.push((i, j + 1, true));
+                                    qq.push((i + 1, j, false));
                                     cache.insert(m_cache, qq);
                                 } else {
-                                    cache.insert(m_cache, vec![(i, j + 1, true)]);
+                                    cache.insert(m_cache, vec![(i + 1, j, false)]);
                                 }
                             }
-                        } else if !next_in_divisor {
-                            merged_index_of_div_monomial_in_quotient[j] = i + 1;
+                        } else {
+                            div_monomial_in_heap[j] = false;
+                        }
 
-                            if i + 1 < q.nterms()
-                                && (j == 1 // the divisor starts with the sub-leading term in the heap
-                                    || merged_index_of_div_monomial_in_quotient[j - 1] > i + 1)
-                            {
-                                m_cache = q_exp[i + 1] + pack_div[div.nterms() - j - 1];
+                        if j + 1 < div.nterms() && !div_monomial_in_heap[j + 1] {
+                            m_cache = q_exp[i] + pack_div[div.nterms() - (j + 1) - 1];
 
-                                if let Some(e) = cache.get_mut(&m_cache) {
-                                    e.push((i + 1, j, false));
-                                } else {
-                                    h.push(m_cache); // only add when new
-                                    if let Some(mut qq) = q_cache.pop() {
-                                        qq.push((i + 1, j, false));
-                                        cache.insert(m_cache, qq);
-                                    } else {
-                                        cache.insert(m_cache, vec![(i + 1, j, false)]);
-                                    }
-                                }
+                            if let Some(e) = cache.get_mut(&m_cache) {
+                                e.push((i, j + 1, false));
                             } else {
-                                div_monomial_in_heap[j] = false;
-                            }
+                                h.push(m_cache); // only add when new
 
-                            if j + 1 < div.nterms() && !div_monomial_in_heap[j + 1] {
-                                m_cache = q_exp[i] + pack_div[div.nterms() - (j + 1) - 1];
-
-                                if let Some(e) = cache.get_mut(&m_cache) {
-                                    e.push((i, j + 1, false));
+                                if let Some(mut qq) = q_cache.pop() {
+                                    qq.push((i, j + 1, false));
+                                    cache.insert(m_cache, qq);
                                 } else {
-                                    h.push(m_cache); // only add when new
-
-                                    if let Some(mut qq) = q_cache.pop() {
-                                        qq.push((i, j + 1, false));
-                                        cache.insert(m_cache, qq);
-                                    } else {
-                                        cache.insert(m_cache, vec![(i, j + 1, false)]);
-                                    }
+                                    cache.insert(m_cache, vec![(i, j + 1, false)]);
                                 }
-
-                                div_monomial_in_heap[j + 1] = true;
                             }
+
+                            div_monomial_in_heap[j + 1] = true;
                         }
                     }
-
-                    q_cache.push(qs);
                 }
+
+                q_cache.push(qs);
             }
 
             if self.ring.is_zero(&c) {
@@ -3729,13 +4035,13 @@ impl<F: Ring, E: Exponent> MultivariatePolynomial<F, E, LexOrder> {
         }
 
         // q and r have the highest monomials first
-        q.reverse();
-        r.reverse();
+        q.reverse_monomials();
+        r.reverse_monomials();
 
         #[cfg(debug_assertions)]
         {
             if !(&q * div + r.clone() - self.clone()).is_zero() {
-                panic!("Division failed: ({})/({}): q={}, r={}", self, div, q, r);
+                panic!("Division failed: ({self})/({div}): q={q}, r={r}");
             }
         }
 
@@ -3864,7 +4170,7 @@ impl<F: Field, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
         let mut x = self.quot_rem_univariate(m).1;
         let mut y = self.one();
         while !n.is_one() {
-            if (&n % &Integer::Natural(2)).is_one() {
+            if (&n % &Integer::Single(2)).is_one() {
                 y = (&y * &x).quot_rem_univariate(m).1;
                 n -= &Integer::one();
             }
@@ -3874,6 +4180,69 @@ impl<F: Field, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
         }
 
         (x * &y).quot_rem_univariate(m).1
+    }
+
+    /// Perform a fast univariate division of `self` by `div`, using a precomputed inverse of `div` reversed.
+    pub fn quot_rem_univariate_fast(&self, div: &Self, var: usize, inv_div: &Self) -> (Self, Self) {
+        if div.is_zero() {
+            panic!("Cannot divide by 0 polynomial");
+        }
+
+        if self.is_zero() {
+            return (self.clone(), self.clone());
+        }
+
+        let deg_a = *self.last_exponents().iter().max().unwrap();
+        let deg_b = *div.last_exponents().iter().max().unwrap();
+        if deg_a < deg_b {
+            return (self.zero(), self.clone());
+        }
+
+        let m = deg_a - deg_b;
+
+        let mut self_i = self.clone();
+        self_i.reverse();
+        let mut q = (&self_i * &inv_div.mod_var(var, m + E::one())).mod_var(var, m + E::one());
+
+        q.reverse();
+
+        if q.degree(var) < m {
+            let mut exp = vec![E::zero(); self.nvars()];
+            exp[var] = m - q.degree(var);
+            q = q.mul_exp(&exp);
+        }
+
+        let r = self - &(div * &q);
+
+        (q, r)
+    }
+
+    /// Compute `self^n % m` where `m` is a polynomial, using a precomputed inverse of `m` reversed.
+    pub fn exp_mod_univariate_fast(
+        &mut self,
+        var: usize,
+        mut n: Integer,
+        m: &Self,
+        m_inv: &Self,
+    ) -> Self {
+        if n.is_zero() {
+            return self.one();
+        }
+
+        // use binary exponentiation and mod at every stage
+        let mut x = self.quot_rem_univariate_fast(m, var, m_inv).1;
+        let mut y = self.one();
+        while !n.is_one() {
+            if (&n % &Integer::Single(2)).is_one() {
+                y = (&y * &x).quot_rem_univariate_fast(m, var, m_inv).1;
+                n -= &Integer::one();
+            }
+
+            x = (&x * &x).quot_rem_univariate_fast(m, var, m_inv).1;
+            n /= 2;
+        }
+
+        (x * &y).quot_rem_univariate_fast(m, var, m_inv).1
     }
 
     /// Compute `(g, s, t)` where `self * s + other * t = g`
@@ -4009,10 +4378,12 @@ impl<F: Field, E: PositiveExponent> MultivariatePolynomial<F, E, LexOrder> {
 }
 
 impl<R: Ring, E: Exponent> Derivable for PolynomialRing<R, E> {
+    type Variable = PolyVariable;
+
     fn derivative(
         &self,
         p: &MultivariatePolynomial<R, E>,
-        x: &Variable,
+        x: &PolyVariable,
     ) -> MultivariatePolynomial<R, E> {
         if let Some(pos) = p.get_vars_ref().iter().position(|v| v == x) {
             p.derivative(pos)
@@ -4119,9 +4490,28 @@ impl<'a, F: Ring, E: Exponent, O: MonomialOrder> IntoIterator
     }
 }
 
+// General implementation for F::Element blocked on https://github.com/rust-lang/rust/issues/20400
+impl<E: Exponent, O: MonomialOrder> PartialEq<Integer>
+    for MultivariatePolynomial<IntegerRing, E, O>
+{
+    #[inline]
+    fn eq(&self, other: &Integer) -> bool {
+        self.is_constant() && self.get_constant() == *other
+    }
+}
+
+impl<R: Ring + FractionNormalization + EuclideanDomain, E: Exponent, O: MonomialOrder>
+    PartialEq<Fraction<R>> for MultivariatePolynomial<FractionField<R>, E, O>
+{
+    #[inline]
+    fn eq(&self, other: &Fraction<R>) -> bool {
+        self.is_constant() && self.get_constant() == *other
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::{atom::AtomCore, domains::integer::Z, parse, symbol};
+    use crate::{atom::AtomCore, domains::integer::Z, domains::rational::Q, parse, symbol};
 
     #[test]
     fn mul_packed() {
@@ -4185,12 +4575,18 @@ mod test {
 
         assert_eq!(
             r.get_vars_ref(),
-            &[
-                symbol!("v1").into(),
-                symbol!("v2").into(),
-                symbol!("v4").into(),
-                symbol!("v3").into()
-            ]
+            &[symbol!("v1"), symbol!("v2"), symbol!("v4"), symbol!("v3")]
         );
+    }
+
+    #[test]
+    fn fast_exp_mod() {
+        let mut a = parse!("x^3 + 2*x + 3").to_polynomial::<_, u8>(&Q, None);
+        let b = parse!("x^2 + x + 2").to_polynomial::<_, u8>(&Q, None);
+        let mut b_rev = b.clone();
+        b_rev.reverse();
+        let c = b_rev.inverse_univariate(0, 2.into());
+        let d = a.exp_mod_univariate_fast(0, 4.into(), &b, &c);
+        assert_eq!(d.to_expression(), parse!("367+333*x"));
     }
 }

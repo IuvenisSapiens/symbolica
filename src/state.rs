@@ -19,9 +19,11 @@ use byteorder::LittleEndian;
 use once_cell::sync::Lazy;
 use smartstring::alias::String;
 
-use crate::atom::{FunctionAttribute, NamespacedSymbol, NormalizationFunction};
+use crate::atom::{
+    DerivativeFunction, NamespacedSymbol, NormalizationFunction, SymbolAttribute, UserData,
+};
 use crate::domains::finite_field::Zp64;
-use crate::poly::Variable;
+use crate::poly::PolyVariable;
 use crate::printer::PrintFunction;
 use crate::wrap_symbol;
 use crate::{
@@ -32,7 +34,7 @@ use crate::{
 };
 
 pub(crate) const SYMBOLICA_MAGIC: u32 = 0x37871367;
-pub(crate) const EXPORT_FORMAT_VERSION: u16 = 1;
+pub(crate) const EXPORT_FORMAT_VERSION: u16 = 2;
 
 /// An id for a given finite field in a registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,7 +48,7 @@ pub(crate) struct VariableListIndex(pub(crate) usize);
 pub struct StateMap {
     pub(crate) symbols: HashMap<u32, Symbol>,
     pub(crate) finite_fields: HashMap<FiniteFieldIndex, FiniteFieldIndex>,
-    pub(crate) variables_lists: HashMap<u64, Arc<Vec<Variable>>>,
+    pub(crate) variables_lists: HashMap<u64, Arc<Vec<PolyVariable>>>,
 }
 
 ///Trait for anything that contains a StateMap
@@ -73,12 +75,15 @@ pub(crate) struct SymbolData {
     pub(crate) line: usize,
     pub(crate) custom_normalization: Option<NormalizationFunction>,
     pub(crate) custom_print: Option<PrintFunction>,
+    pub(crate) custom_derivative: Option<DerivativeFunction>,
+    pub(crate) tags: Vec<std::string::String>,
+    pub(crate) user_data: UserData,
 }
 
 static STATE: Lazy<RwLock<State>> = Lazy::new(|| RwLock::new(State::new()));
 static ID_TO_STR: AppendOnlyVec<(Symbol, SymbolData)> = AppendOnlyVec::new();
 static FINITE_FIELDS: AppendOnlyVec<Zp64> = AppendOnlyVec::new();
-static VARIABLE_LISTS: AppendOnlyVec<Arc<Vec<Variable>>> = AppendOnlyVec::new();
+static VARIABLE_LISTS: AppendOnlyVec<Arc<Vec<PolyVariable>>> = AppendOnlyVec::new();
 static SYMBOL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 thread_local!(
@@ -98,20 +103,61 @@ impl Default for State {
 }
 
 impl State {
-    pub(crate) const ARG: Symbol = Symbol::raw_fn(0, 0, false, false, false, false);
-    pub(crate) const COEFF: Symbol = Symbol::raw_fn(1, 0, false, false, false, false);
-    pub(crate) const EXP: Symbol = Symbol::raw_fn(2, 0, false, false, false, false);
-    pub(crate) const LOG: Symbol = Symbol::raw_fn(3, 0, false, false, false, false);
-    pub(crate) const SIN: Symbol = Symbol::raw_fn(4, 0, false, false, false, false);
-    pub(crate) const COS: Symbol = Symbol::raw_fn(5, 0, false, false, false, false);
-    pub(crate) const SQRT: Symbol = Symbol::raw_fn(6, 0, false, false, false, false);
-    pub(crate) const DERIVATIVE: Symbol = Symbol::raw_fn(7, 0, false, false, false, false);
-    pub(crate) const E: Symbol = Symbol::raw_var(8, 0);
-    pub(crate) const PI: Symbol = Symbol::raw_var(9, 0);
+    pub(crate) const ARG: Symbol =
+        Symbol::raw_fn(0, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const COEFF: Symbol =
+        Symbol::raw_fn(1, 0, false, false, false, false, true, false, false, false);
+    pub(crate) const EXP: Symbol =
+        Symbol::raw_fn(2, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const LOG: Symbol =
+        Symbol::raw_fn(3, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const SIN: Symbol =
+        Symbol::raw_fn(4, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const COS: Symbol =
+        Symbol::raw_fn(5, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const SQRT: Symbol =
+        Symbol::raw_fn(6, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const CONJ: Symbol =
+        Symbol::raw_fn(7, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const DERIVATIVE: Symbol =
+        Symbol::raw_fn(8, 0, false, false, false, false, false, false, false, false);
+    pub(crate) const E: Symbol =
+        Symbol::raw_fn(9, 0, false, false, false, false, true, true, false, true);
+    pub(crate) const PI: Symbol =
+        Symbol::raw_fn(10, 0, false, false, false, false, true, true, false, true);
+    pub(crate) const SEP: Symbol =
+        Symbol::raw_fn(11, 0, false, false, false, false, true, true, true, true);
 
     /// The list of built-in symbols.
-    pub const BUILTIN_SYMBOL_NAMES: [&'static str; 10] = [
-        "arg", "coeff", "exp", "log", "sin", "cos", "sqrt", "der", "𝑒", "𝜋",
+    pub const BUILTIN_SYMBOL_NAMES: [&'static str; 12] = [
+        "arg",
+        "coeff",
+        "exp",
+        "log",
+        "sin",
+        "cos",
+        "sqrt",
+        "conj",
+        "der",
+        Symbol::E_STR,
+        Symbol::PI_STR,
+        Symbol::SEP_STR,
+    ];
+
+    /// The list of built-in symbols.
+    pub const BUILTIN_SYMBOLS: [Symbol; 12] = [
+        Self::ARG,
+        Self::COEFF,
+        Self::EXP,
+        Self::LOG,
+        Self::SIN,
+        Self::COS,
+        Self::SQRT,
+        Self::CONJ,
+        Self::DERIVATIVE,
+        Self::E,
+        Self::PI,
+        Self::SEP,
     ];
 
     pub fn is_builtin_name<S: AsRef<str>>(str: S) -> bool {
@@ -125,8 +171,29 @@ impl State {
             str_to_id: HashMap::new(),
         };
 
-        for x in Self::BUILTIN_SYMBOL_NAMES {
-            state.get_symbol(wrap_symbol!(x)).unwrap();
+        for (name, symbol) in Self::BUILTIN_SYMBOL_NAMES
+            .iter()
+            .zip(&Self::BUILTIN_SYMBOLS)
+        {
+            let r = wrap_symbol!(name);
+
+            let index = ID_TO_STR.push((
+                *symbol,
+                SymbolData {
+                    name: r.symbol.clone().into(),
+                    file: r.file,
+                    namespace: r.namespace,
+                    line: r.line,
+                    custom_normalization: None,
+                    custom_print: None,
+                    custom_derivative: None,
+                    tags: vec![],
+                    user_data: UserData::None,
+                },
+            ));
+            assert_eq!(symbol.get_id() as usize, index);
+
+            state.str_to_id.insert(r.symbol.into(), *symbol);
         }
 
         #[cfg(test)]
@@ -148,7 +215,7 @@ impl State {
     /// that can be used in concurrently run unit tests without interference.
     #[cfg(test)]
     fn initialize_test(&mut self) {
-        use crate::atom::FunctionAttribute;
+        use crate::atom::SymbolAttribute;
 
         for i in 0..30 {
             let _ = self.get_symbol(wrap_symbol!(format!("v{}", i)));
@@ -159,40 +226,55 @@ impl State {
         for i in 0..5 {
             let _ = self.get_symbol_with_attributes(
                 wrap_symbol!(format!("fs{}", i)),
-                &[FunctionAttribute::Symmetric],
+                &[SymbolAttribute::Symmetric],
                 None,
+                None,
+                None,
+                vec![],
                 None,
             );
         }
         for i in 0..5 {
             let _ = self.get_symbol_with_attributes(
                 wrap_symbol!(format!("fc{}", i)),
-                &[FunctionAttribute::Cyclesymmetric],
+                &[SymbolAttribute::Cyclesymmetric],
                 None,
+                None,
+                None,
+                vec![],
                 None,
             );
         }
         for i in 0..5 {
             let _ = self.get_symbol_with_attributes(
                 wrap_symbol!(format!("fa{}", i)),
-                &[FunctionAttribute::Antisymmetric],
+                &[SymbolAttribute::Antisymmetric],
                 None,
+                None,
+                None,
+                vec![],
                 None,
             );
         }
         for i in 0..5 {
             let _ = self.get_symbol_with_attributes(
                 wrap_symbol!(format!("fl{}", i)),
-                &[FunctionAttribute::Linear],
+                &[SymbolAttribute::Linear],
                 None,
+                None,
+                None,
+                vec![],
                 None,
             );
         }
         for i in 0..5 {
             let _ = self.get_symbol_with_attributes(
                 wrap_symbol!(format!("fsl{}", i)),
-                &[FunctionAttribute::Symmetric, FunctionAttribute::Linear],
+                &[SymbolAttribute::Symmetric, SymbolAttribute::Linear],
                 None,
+                None,
+                None,
+                vec![],
                 None,
             );
         }
@@ -215,8 +297,31 @@ impl State {
         state.str_to_id.clear();
         SYMBOL_OFFSET.store(ID_TO_STR.len(), Ordering::Relaxed);
 
-        for x in Self::BUILTIN_SYMBOL_NAMES {
-            state.get_symbol(wrap_symbol!(x)).unwrap();
+        let offset = SYMBOL_OFFSET.load(Ordering::Relaxed);
+
+        for (name, symbol) in Self::BUILTIN_SYMBOL_NAMES
+            .iter()
+            .zip(&Self::BUILTIN_SYMBOLS)
+        {
+            let r = wrap_symbol!(name);
+
+            let index = ID_TO_STR.push((
+                *symbol,
+                SymbolData {
+                    name: r.symbol.clone().into(),
+                    file: r.file,
+                    namespace: r.namespace,
+                    line: r.line,
+                    custom_normalization: None,
+                    custom_print: None,
+                    custom_derivative: None,
+                    tags: vec![],
+                    user_data: UserData::None,
+                },
+            ));
+            assert_eq!(symbol.get_id() as usize, index - offset);
+
+            state.str_to_id.insert(r.symbol.into(), *symbol);
         }
 
         #[cfg(test)]
@@ -252,27 +357,27 @@ impl State {
         id.get_id() < Self::BUILTIN_SYMBOL_NAMES.len() as u32
     }
 
-    pub(crate) fn check_symbol_name(name: &str) -> Result<(), String> {
-        if name.is_empty() {
-            return Err("Identifier cannot be empty.".into());
-        }
+    /// Get the symbol for a certain name if the name is already registered,
+    pub(crate) fn fetch_symbol(&self, name: &str) -> Option<Symbol> {
+        self.str_to_id.get(name).cloned()
+    }
 
-        let illegal_chars = [
-            '\0', '^', '+', '*', '-', '(', ')', '/', ',', '[', ']', ' ', '\t', '\n', '\r', '\\',
-            ';', '&', '!', '%', '.',
-        ];
+    /// Get the next symbol index that will be assigned.
+    pub(crate) fn get_next_symbol_index(&self) -> u32 {
+        let offset = SYMBOL_OFFSET.load(Ordering::Relaxed);
+        (ID_TO_STR.len() - offset) as u32
+    }
 
-        for c in illegal_chars {
-            if name.contains(c) {
-                return Err(format!("Illegal character '{}' in identifier.", c).into());
+    /// Get the wildcard level of a symbol name.
+    pub(crate) fn get_wildcard_level(str: &str) -> u8 {
+        let mut wildcard_level = 0;
+        for x in str.chars().rev() {
+            if x != '_' {
+                break;
             }
+            wildcard_level += 1;
         }
-
-        if name.chars().next().unwrap().is_numeric() {
-            return Err("Identifier cannot start with a number.".into());
-        }
-
-        Ok(())
+        wildcard_level
     }
 
     /// Get the symbol for a certain name if the name is already registered,
@@ -281,20 +386,12 @@ impl State {
         match self.str_to_id.entry(name.symbol.into()) {
             Entry::Occupied(o) => Ok(*o.get()),
             Entry::Vacant(v) => {
-                State::check_symbol_name(&v.key())?;
-
                 let offset = SYMBOL_OFFSET.load(Ordering::Relaxed);
                 if ID_TO_STR.len() - offset == u32::MAX as usize - 1 {
                     panic!("Too many variables defined");
                 }
 
-                let mut wildcard_level = 0;
-                for x in v.key().chars().rev() {
-                    if x != '_' {
-                        break;
-                    }
-                    wildcard_level += 1;
-                }
+                let wildcard_level = State::get_wildcard_level(v.key());
 
                 // there is no synchronization issue since only one thread can insert at a time
                 // as the state itself is behind a mutex
@@ -309,6 +406,9 @@ impl State {
                         line: name.line,
                         custom_normalization: None,
                         custom_print: None,
+                        custom_derivative: None,
+                        tags: vec![],
+                        user_data: UserData::None,
                     },
                 )) - offset;
                 assert_eq!(id, id_ret);
@@ -332,9 +432,12 @@ impl State {
     pub(crate) fn get_symbol_with_attributes(
         &mut self,
         name: NamespacedSymbol,
-        attributes: &[FunctionAttribute],
+        attributes: &[SymbolAttribute],
         normalization_function: Option<NormalizationFunction>,
         print_function: Option<PrintFunction>,
+        derivative_function: Option<DerivativeFunction>,
+        tags: Vec<std::string::String>,
+        user_data: Option<UserData>,
     ) -> Result<Symbol, String> {
         match self.str_to_id.entry(name.symbol.into()) {
             Entry::Occupied(o) => {
@@ -343,26 +446,119 @@ impl State {
                 let new_id = Symbol::raw_fn(
                     r.get_id(),
                     r.get_wildcard_level(),
-                    attributes.contains(&FunctionAttribute::Symmetric),
-                    attributes.contains(&FunctionAttribute::Antisymmetric),
-                    attributes.contains(&FunctionAttribute::Cyclesymmetric),
-                    attributes.contains(&FunctionAttribute::Linear),
+                    attributes.contains(&SymbolAttribute::Symmetric),
+                    attributes.contains(&SymbolAttribute::Antisymmetric),
+                    attributes.contains(&SymbolAttribute::Cyclesymmetric),
+                    attributes.contains(&SymbolAttribute::Linear),
+                    attributes.contains(&SymbolAttribute::Scalar),
+                    attributes.contains(&SymbolAttribute::Real),
+                    attributes.contains(&SymbolAttribute::Integer),
+                    attributes.contains(&SymbolAttribute::Positive),
                 );
 
-                if r == new_id && normalization_function.is_none() {
+                if r == new_id
+                    && normalization_function.is_none()
+                    && print_function.is_none()
+                    && derivative_function.is_none()
+                    && tags == r.get_tags()
+                    && user_data.as_ref().unwrap_or(&UserData::None)
+                        == &ID_TO_STR[r.get_id() as usize].1.user_data
+                {
                     Ok(r)
                 } else {
                     let data = &ID_TO_STR[r.get_id() as usize].1;
+
+                    let mut diff_attr = String::new();
+                    if r.is_antisymmetric() != new_id.is_antisymmetric() {
+                        diff_attr.push_str(&format!(
+                            "\tAntisymmetric: {} vs {}\n",
+                            r.is_antisymmetric(),
+                            new_id.is_antisymmetric()
+                        ));
+                    }
+                    if r.is_symmetric() != new_id.is_symmetric() {
+                        diff_attr.push_str(&format!(
+                            "\tSymmetric: {} vs {}\n",
+                            r.is_symmetric(),
+                            new_id.is_symmetric()
+                        ));
+                    }
+                    if r.is_cyclesymmetric() != new_id.is_cyclesymmetric() {
+                        diff_attr.push_str(&format!(
+                            "\tCyclesymmetric: {} vs {}\n",
+                            r.is_cyclesymmetric(),
+                            new_id.is_cyclesymmetric()
+                        ));
+                    }
+                    if r.is_linear() != new_id.is_linear() {
+                        diff_attr.push_str(&format!(
+                            "\tLinear: {} vs {}\n",
+                            r.is_linear(),
+                            new_id.is_linear()
+                        ));
+                    }
+                    if r.is_scalar() != new_id.is_scalar() {
+                        diff_attr.push_str(&format!(
+                            "\tScalar: {} vs {}\n",
+                            r.is_scalar(),
+                            new_id.is_scalar()
+                        ));
+                    }
+                    if r.is_real() != new_id.is_real() {
+                        diff_attr.push_str(&format!(
+                            "\tReal: {} vs {}\n",
+                            r.is_real(),
+                            new_id.is_real()
+                        ));
+                    }
+                    if r.is_integer() != new_id.is_integer() {
+                        diff_attr.push_str(&format!(
+                            "\tInteger: {} vs {}\n",
+                            r.is_integer(),
+                            new_id.is_integer()
+                        ));
+                    }
+                    if r.is_positive() != new_id.is_positive() {
+                        diff_attr.push_str(&format!(
+                            "\tPositive: {} vs {}\n",
+                            r.is_positive(),
+                            new_id.is_positive()
+                        ));
+                    }
+
+                    if tags != r.get_tags() {
+                        diff_attr.push_str(&format!("\tTags: {:?} vs {:?}\n", r.get_tags(), tags));
+                    }
+
+                    if normalization_function.is_some() {
+                        diff_attr.push_str("\tNew normalization function specified.\n");
+                    }
+                    if print_function.is_some() {
+                        diff_attr.push_str("\tNew print function specified.\n");
+                    }
+                    if derivative_function.is_some() {
+                        diff_attr.push_str("\tNew derivative function specified.\n");
+                    }
+
+                    if user_data.as_ref().unwrap_or(&UserData::None) != &data.user_data {
+                        diff_attr.push_str(&format!(
+                            "\tNew user data specified: {:?} vs {:?}\n",
+                            data.user_data, user_data
+                        ));
+                    }
+
                     if data.file.is_empty() {
-                        Err(format!("Symbol {} redefined with new attributes.", data.name).into())
+                        Err(format!(
+                            "Symbol {} redefined with new attributes:\n{}",
+                            data.name, diff_attr
+                        )
+                        .into())
                     } else {
-                        Err(format!("Symbol {} redefined with new attributes. The first definition occurred here: {}:{}.", data.name, data.file, data.line).into())
+                        Err(format!("Symbol {} redefined with new attributes: {}The first definition occurred here: {}:{}.", data.name, diff_attr, data.file, data.line).into())
                     }
                 }
             }
             Entry::Vacant(v) => {
-                State::check_symbol_name(&v.key())?;
-
                 let offset = SYMBOL_OFFSET.load(Ordering::Relaxed);
                 if ID_TO_STR.len() - offset == u32::MAX as usize - 1 {
                     panic!("Too many variables defined");
@@ -372,21 +568,19 @@ impl State {
                 // as the state itself is behind a mutex
                 let id = ID_TO_STR.len() - offset;
 
-                let mut wildcard_level = 0;
-                for x in v.key().chars().rev() {
-                    if x != '_' {
-                        break;
-                    }
-                    wildcard_level += 1;
-                }
+                let wildcard_level = State::get_wildcard_level(v.key());
 
                 let new_symbol = Symbol::raw_fn(
                     id as u32,
                     wildcard_level,
-                    attributes.contains(&FunctionAttribute::Symmetric),
-                    attributes.contains(&FunctionAttribute::Antisymmetric),
-                    attributes.contains(&FunctionAttribute::Cyclesymmetric),
-                    attributes.contains(&FunctionAttribute::Linear),
+                    attributes.contains(&SymbolAttribute::Symmetric),
+                    attributes.contains(&SymbolAttribute::Antisymmetric),
+                    attributes.contains(&SymbolAttribute::Cyclesymmetric),
+                    attributes.contains(&SymbolAttribute::Linear),
+                    attributes.contains(&SymbolAttribute::Scalar),
+                    attributes.contains(&SymbolAttribute::Real),
+                    attributes.contains(&SymbolAttribute::Integer),
+                    attributes.contains(&SymbolAttribute::Positive),
                 );
 
                 let id_ret = ID_TO_STR.push((
@@ -398,6 +592,9 @@ impl State {
                         line: name.line,
                         custom_normalization: normalization_function,
                         custom_print: print_function,
+                        custom_derivative: derivative_function,
+                        tags,
+                        user_data: user_data.unwrap_or(UserData::None),
                     },
                 )) - offset;
                 assert_eq!(id, id_ret);
@@ -476,17 +673,17 @@ impl State {
         FiniteFieldIndex(index)
     }
 
-    pub(crate) fn get_variable_list(fi: VariableListIndex) -> Arc<Vec<Variable>> {
+    pub(crate) fn get_variable_list(fi: VariableListIndex) -> Arc<Vec<PolyVariable>> {
         VARIABLE_LISTS[fi.0].clone()
     }
 
-    pub(crate) fn get_or_insert_variable_list(f: Arc<Vec<Variable>>) -> VariableListIndex {
+    pub(crate) fn get_or_insert_variable_list(f: Arc<Vec<PolyVariable>>) -> VariableListIndex {
         STATE.write().unwrap().get_or_insert_variable_list_impl(f)
     }
 
     pub(crate) fn get_or_insert_variable_list_impl(
         &mut self,
-        f: Arc<Vec<Variable>>,
+        f: Arc<Vec<PolyVariable>>,
     ) -> VariableListIndex {
         for (i, f2) in VARIABLE_LISTS.iter().enumerate() {
             if f2 == &f {
@@ -520,11 +717,17 @@ impl State {
             dest.write_u32::<LittleEndian>(namespace.len() as u32)?;
             dest.write_all(namespace.as_bytes())?;
 
-            dest.write_u8(s.get_wildcard_level())?;
-            dest.write_u8(s.is_symmetric() as u8)?;
-            dest.write_u8(s.is_antisymmetric() as u8)?;
-            dest.write_u8(s.is_cyclesymmetric() as u8)?;
-            dest.write_u8(s.is_linear() as u8)?;
+            let (flags, extra_flags) = s.encode_flags();
+            dest.write_u8(flags)?;
+            dest.write_u32::<LittleEndian>(extra_flags)?;
+
+            dest.write_u16::<LittleEndian>(s.get_tags().len() as u16)?;
+            for t in s.get_tags() {
+                dest.write_u32::<LittleEndian>(t.len() as u32)?;
+                dest.write_all(t.as_bytes())?;
+            }
+
+            s.get_data().write(dest)?;
         }
 
         dest.write_u64::<LittleEndian>(FINITE_FIELDS.len() as u64)?;
@@ -537,20 +740,20 @@ impl State {
             dest.write_u64::<LittleEndian>(x.len() as u64)?;
             for y in x.iter() {
                 match y {
-                    Variable::Symbol(s) => {
+                    PolyVariable::Symbol(s) => {
                         dest.write_u8(0)?;
                         dest.write_u32::<LittleEndian>(s.get_id())?;
                     }
-                    Variable::Temporary(u) => {
+                    PolyVariable::Temporary(u) => {
                         dest.write_u8(1)?;
                         dest.write_u64::<LittleEndian>(*u as u64)?;
                     }
-                    Variable::Function(v, t) => {
+                    PolyVariable::Function(v, t) => {
                         dest.write_u8(2)?;
                         dest.write_u32::<LittleEndian>(v.get_id())?;
                         t.as_view().write(dest.by_ref())?;
                     }
-                    Variable::Other(t) => {
+                    PolyVariable::Power(t) => {
                         dest.write_u8(3)?;
                         t.as_view().write(dest.by_ref())?;
                     }
@@ -583,7 +786,10 @@ impl State {
         if version != EXPORT_FORMAT_VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid export format version",
+                format!(
+                    "Invalid export format version: expected {} but got {}",
+                    EXPORT_FORMAT_VERSION, version
+                ),
             ));
         }
 
@@ -600,32 +806,64 @@ impl State {
             let mut v = vec![0; l as usize];
             source.read_exact(&mut v)?;
 
-            let mut str: String = std::string::String::from_utf8(v).unwrap().into();
+            let mut str: String = std::string::String::from_utf8(v)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .into();
 
             let l = source.read_u32::<LittleEndian>()?;
             let mut v = vec![0; l as usize];
             source.read_exact(&mut v)?;
 
-            let namespace: String = std::string::String::from_utf8(v).unwrap().into();
+            let namespace: String = std::string::String::from_utf8(v)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .into();
 
-            let wildcard_level = source.read_u8()?;
-            let is_symmetric = source.read_u8()? != 0;
-            let is_antisymmetric = source.read_u8()? != 0;
-            let is_cyclesymmetric = source.read_u8()? != 0;
-            let is_linear = source.read_u8()? != 0;
+            let flags = source.read_u8()?;
+            let extra_flags = source.read_u32::<LittleEndian>()?;
+
+            let s = Symbol::decode_flags(0, flags, extra_flags);
+
+            let mut tags = vec![];
+            let num_tags = source.read_u16::<LittleEndian>()?;
+
+            for _ in 0..num_tags {
+                let l = source.read_u32::<LittleEndian>()?;
+                let mut v = vec![0; l as usize];
+                source.read_exact(&mut v)?;
+
+                let tag: String = std::string::String::from_utf8(v)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                    .into();
+
+                tags.push(tag);
+            }
+
+            let extra_data = UserData::read(&mut *source)?;
 
             attributes.clear();
-            if is_antisymmetric {
-                attributes.push(FunctionAttribute::Antisymmetric);
+            if s.is_antisymmetric() {
+                attributes.push(SymbolAttribute::Antisymmetric);
             }
-            if is_symmetric {
-                attributes.push(FunctionAttribute::Symmetric);
+            if s.is_symmetric() {
+                attributes.push(SymbolAttribute::Symmetric);
             }
-            if is_cyclesymmetric {
-                attributes.push(FunctionAttribute::Cyclesymmetric);
+            if s.is_cyclesymmetric() {
+                attributes.push(SymbolAttribute::Cyclesymmetric);
             }
-            if is_linear {
-                attributes.push(FunctionAttribute::Linear);
+            if s.is_linear() {
+                attributes.push(SymbolAttribute::Linear);
+            }
+            if s.is_scalar() {
+                attributes.push(SymbolAttribute::Scalar);
+            }
+            if s.is_real() {
+                attributes.push(SymbolAttribute::Real);
+            }
+            if s.is_integer() {
+                attributes.push(SymbolAttribute::Integer);
+            }
+            if s.is_positive() {
+                attributes.push(SymbolAttribute::Positive);
             }
 
             loop {
@@ -636,6 +874,8 @@ impl State {
                     line: 0,
                 })
                 .with_attributes(attributes.clone())
+                .with_tags(tags.clone())
+                .with_user_data(extra_data.clone())
                 .build()
                 {
                     Ok(id) => {
@@ -644,7 +884,7 @@ impl State {
                         }
                         break;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         if let Some(f) = &conflict_fn {
                             let new_name = f(&str);
 
@@ -656,13 +896,13 @@ impl State {
                                 new_wildcard_level += 1;
                             }
 
-                            if wildcard_level == new_wildcard_level {
+                            if s.get_wildcard_level() == new_wildcard_level {
                                 str = new_name;
                             }
                         } else {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                format!("Symbol conflict for {}::{}", namespace, str),
+                                format!("Symbol conflict: {e}"),
                             ));
                         }
                     }
@@ -690,14 +930,14 @@ impl State {
                     0 => {
                         let id = source.read_u32::<LittleEndian>()?;
                         if let Some(new_id) = state_map.symbols.get(&id) {
-                            variables.push(Variable::Symbol(*new_id));
+                            variables.push(PolyVariable::Symbol(*new_id));
                         } else {
-                            variables.push(Variable::Symbol(ID_TO_STR[id as usize].0))
+                            variables.push(PolyVariable::Symbol(ID_TO_STR[id as usize].0))
                         }
                     }
                     1 => {
                         let u = source.read_u64::<LittleEndian>()?;
-                        variables.push(Variable::Temporary(u as usize))
+                        variables.push(PolyVariable::Temporary(u as usize))
                     }
                     2 => {
                         let id = source.read_u32::<LittleEndian>()?;
@@ -711,14 +951,14 @@ impl State {
                         f.read(&mut *source)?;
 
                         let f_r = f.as_view().rename(&state_map);
-                        variables.push(Variable::Function(symb, Arc::new(f_r)));
+                        variables.push(PolyVariable::Function(symb, f_r));
                     }
                     3 => {
                         let mut f = Atom::new();
                         f.read(&mut *source)?;
 
                         let f_r = f.as_view().rename(&state_map);
-                        variables.push(Variable::Other(Arc::new(f_r)));
+                        variables.push(PolyVariable::Power(f_r));
                     }
                     _ => {
                         return Err(std::io::Error::new(
@@ -893,10 +1133,10 @@ impl Drop for RecycledAtom {
         let _ = WORKSPACE.try_with(
             #[inline(always)]
             |ws| {
-                if let Ok(mut a) = ws.atom_buffer.try_borrow_mut() {
-                    if a.len() < Workspace::ATOM_BUFFER_MAX {
-                        a.push(std::mem::replace(&mut self.0, Atom::Zero));
-                    }
+                if let Ok(mut a) = ws.atom_buffer.try_borrow_mut()
+                    && a.len() < Workspace::ATOM_BUFFER_MAX
+                {
+                    a.push(std::mem::replace(&mut self.0, Atom::Zero));
                 }
             },
         );
@@ -905,10 +1145,8 @@ impl Drop for RecycledAtom {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use crate::{
-        atom::{Atom, AtomView},
+        atom::{Atom, AtomCore, AtomView, Symbol},
         parse, symbol,
     };
 
@@ -919,28 +1157,43 @@ mod tests {
         let mut export = vec![];
         State::export(&mut export).unwrap();
 
-        let i = State::import(&mut Cursor::new(&export), None).unwrap();
+        let i = State::import(&mut export.as_slice(), None).unwrap();
         assert!(i.is_empty());
+    }
+
+    #[test]
+    fn export_symbol_data() {
+        let s = symbol!(
+            "symbolica::symbol_data::a",
+            data = crate::state::UserData::Atom(parse!("z"))
+        );
+
+        let s1 = s.to_atom();
+        let mut export = vec![];
+        s1.export(&mut export).unwrap();
+
+        let a = Atom::import(&mut export.as_slice(), None)
+            .unwrap()
+            .get_symbol()
+            .unwrap();
+        assert_eq!(a.get_data(), &crate::state::UserData::Atom(parse!("z")));
     }
 
     #[test]
     fn custom_normalization() {
         let _real_log = symbol!(
-            "custom_normalization_real_log";;
-            |input, out| {
+            "custom_normalization_real_log",
+            norm = |input, out| {
                 if let AtomView::Fun(f) = input {
                     if f.get_nargs() == 1 {
                         let arg = f.iter().next().unwrap();
                         if let AtomView::Fun(f2) = arg {
-                            if f2.get_symbol() == Atom::EXP && f2.get_nargs() == 1 {
+                            if f2.get_symbol() == Symbol::EXP && f2.get_nargs() == 1 {
                                 out.set_from_view(&f2.iter().next().unwrap());
-                                return true;
                             }
                         }
                     }
                 }
-
-                false
             }
         );
 

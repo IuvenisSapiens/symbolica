@@ -1,6 +1,7 @@
 //! Low-level representation of expressions.
 
-use byteorder::{LittleEndian, WriteBytesExt};
+use ahash::HashMap;
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, BufMut};
 use smartstring::alias::String;
 use std::{
@@ -11,6 +12,7 @@ use std::{
 };
 
 use crate::{
+    atom::{UserData, UserDataKey},
     coefficient::{Coefficient, CoefficientView},
     state::{State, StateMap, Workspace},
 };
@@ -26,17 +28,22 @@ const FUN_ID: u8 = 3;
 const MUL_ID: u8 = 4;
 const ADD_ID: u8 = 5;
 const POW_ID: u8 = 6;
-const TYPE_MASK: u8 = 0b00000111;
-const NOT_NORMALIZED: u8 = 0b10000000;
-const VAR_WILDCARD_LEVEL_MASK: u8 = 0b00011000;
-const VAR_WILDCARD_LEVEL_1: u8 = 0b00001000;
-const VAR_WILDCARD_LEVEL_2: u8 = 0b00010000;
-const VAR_WILDCARD_LEVEL_3: u8 = 0b00011000;
-const FUN_SYMMETRIC_FLAG: u8 = 0b00100000;
-const FUN_LINEAR_FLAG: u8 = 0b01000000;
-const VAR_ANTISYMMETRIC_FLAG: u8 = 0b10000000;
-const VAR_CYCLESYMMETRIC_FLAG: u8 = 0b10100000; // coded as symmetric | antisymmetric
-const FUN_ANTISYMMETRIC_FLAG: u64 = 1 << 32; // stored in the function id
+const TYPE_MASK: u8 = 0b00000_111;
+const NOT_NORMALIZED: u8 = 0b10000_000;
+const SYM_LINEAR_FLAG: u8 = 0b01000_000;
+const SYM_SYMMETRIC_FLAG: u8 = 0b00100_000;
+const SYM_ANTISYMMETRIC_FLAG: u8 = 0b00010_000;
+/// Coded as symmetric | antisymmetric
+const SYM_CYCLESYMMETRIC_FLAG: u8 = 0b00110_000;
+const SYM_SCALAR_FLAG: u8 = 0b00001_000;
+const SYM_EXTRA_REAL_FLAG: u32 = 0b01;
+const SYM_EXTRA_INTEGER_FLAG: u32 = 0b10;
+const SYM_EXTRA_POSITIVE_FLAG: u32 = 0b100;
+const SYM_EXTRA_WILDCARD_LEVEL_MASK: u32 = 0b11_000;
+const SYM_EXTRA_WILDCARD_LEVEL_1: u32 = 0b01_000;
+const SYM_EXTRA_WILDCARD_LEVEL_2: u32 = 0b10_000;
+const SYM_EXTRA_WILDCARD_LEVEL_3: u32 = 0b11_000;
+
 const MUL_HAS_COEFF_FLAG: u8 = 0b01000000;
 
 const ZERO_DATA: [u8; 3] = [NUM_ID, 1, 0];
@@ -64,42 +71,277 @@ pub trait KeyLookup: Borrow<BorrowedRawAtom> + Eq + Hash {}
 impl KeyLookup for Atom {}
 impl KeyLookup for AtomView<'_> {}
 
+impl Symbol {
+    #[inline]
+    pub(crate) fn encode_flags(&self) -> (u8, u32) {
+        let mut flags = 0u8;
+        if self.is_symmetric {
+            flags |= SYM_SYMMETRIC_FLAG;
+        }
+        if self.is_linear {
+            flags |= SYM_LINEAR_FLAG;
+        }
+        if self.is_cyclesymmetric {
+            flags |= SYM_CYCLESYMMETRIC_FLAG;
+        }
+        if self.is_antisymmetric {
+            flags |= SYM_ANTISYMMETRIC_FLAG;
+        }
+        if self.is_scalar {
+            flags |= SYM_SCALAR_FLAG;
+        }
+
+        let mut extra = 0;
+
+        if self.is_real {
+            extra |= SYM_EXTRA_REAL_FLAG;
+        }
+
+        if self.is_integer {
+            extra |= SYM_EXTRA_INTEGER_FLAG;
+        }
+
+        if self.is_positive {
+            extra |= SYM_EXTRA_POSITIVE_FLAG;
+        }
+
+        match self.wildcard_level {
+            0 => {}
+            1 => extra |= SYM_EXTRA_WILDCARD_LEVEL_1,
+            2 => extra |= SYM_EXTRA_WILDCARD_LEVEL_2,
+            _ => extra |= SYM_EXTRA_WILDCARD_LEVEL_3,
+        }
+
+        (flags, extra)
+    }
+
+    #[inline]
+    pub(crate) fn decode_flags(id: u32, flags: u8, extra: u32) -> Symbol {
+        let is_cyclesymmetric = (flags & SYM_CYCLESYMMETRIC_FLAG) == SYM_CYCLESYMMETRIC_FLAG;
+        let is_symmetric = !is_cyclesymmetric && (flags & SYM_SYMMETRIC_FLAG) != 0;
+        let is_antisymmetric = !is_cyclesymmetric && (flags & SYM_ANTISYMMETRIC_FLAG) != 0;
+        let is_linear = (flags & SYM_LINEAR_FLAG) != 0;
+        let is_scalar = (flags & SYM_SCALAR_FLAG) != 0;
+
+        let is_real = (extra & SYM_EXTRA_REAL_FLAG) != 0;
+        let is_integer = (extra & SYM_EXTRA_INTEGER_FLAG) != 0;
+        let is_positive = (extra & SYM_EXTRA_POSITIVE_FLAG) != 0;
+        let wildcard_level = match extra & SYM_EXTRA_WILDCARD_LEVEL_MASK {
+            SYM_EXTRA_WILDCARD_LEVEL_1 => 1,
+            SYM_EXTRA_WILDCARD_LEVEL_2 => 2,
+            SYM_EXTRA_WILDCARD_LEVEL_3 => 3,
+            _ => 0,
+        };
+
+        Symbol {
+            id,
+            is_symmetric,
+            is_linear,
+            is_antisymmetric,
+            is_cyclesymmetric,
+            is_scalar,
+            is_real,
+            is_integer,
+            is_positive,
+            wildcard_level,
+        }
+    }
+}
+
+impl UserDataKey {
+    pub fn read<R: Read>(source: &mut R) -> Result<UserDataKey, std::io::Error> {
+        let tag = source.read_u8()?;
+        match tag {
+            1 => {
+                let value = source.read_i64::<LittleEndian>()?;
+                Ok(UserDataKey::Integer(value))
+            }
+            2 => {
+                let len = source.read_u32::<LittleEndian>()? as usize;
+                let mut buf = vec![0u8; len];
+                source.read_exact(&mut buf)?;
+                let s = std::string::String::from_utf8(buf)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(UserDataKey::String(s))
+            }
+            3 => {
+                let data = Atom::import(source, None)?;
+                Ok(UserDataKey::Atom(data))
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid UserDataKey tag",
+            )),
+        }
+    }
+
+    pub fn write<W: std::io::Write>(&self, target: &mut W) -> Result<(), std::io::Error> {
+        match self {
+            UserDataKey::Integer(value) => {
+                target.write_u8(1)?;
+                target.write_i64::<LittleEndian>(*value)
+            }
+            UserDataKey::String(s) => {
+                target.write_u8(2)?;
+                target.write_u32::<LittleEndian>(s.len() as u32)?;
+                target.write_all(s.as_bytes())
+            }
+            UserDataKey::Atom(a) => {
+                target.write_u8(3)?;
+                a.as_view().write(target) // export without the state
+            }
+        }
+    }
+}
+
+impl UserData {
+    pub fn read<R: Read>(source: &mut R) -> Result<UserData, std::io::Error> {
+        let tag = source.read_u8()?;
+        match tag {
+            0 => Ok(UserData::None),
+            1 => {
+                let value = source.read_i64::<LittleEndian>()?;
+                Ok(UserData::Integer(value))
+            }
+            2 => {
+                let len = source.read_u32::<LittleEndian>()? as usize;
+                let mut buf = vec![0u8; len];
+                source.read_exact(&mut buf)?;
+                let s = std::string::String::from_utf8(buf)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(UserData::String(s))
+            }
+            3 => {
+                let mut a = Atom::Zero;
+                a.read(source)?;
+                Ok(UserData::Atom(a))
+            }
+            4 => {
+                let len = source.read_u32::<LittleEndian>()? as usize;
+                let mut list = Vec::with_capacity(len);
+                for _ in 0..len {
+                    list.push(UserData::read(source)?);
+                }
+                Ok(UserData::List(list))
+            }
+            5 => {
+                let len = source.read_u32::<LittleEndian>()? as usize;
+                let mut map = HashMap::default();
+                for _ in 0..len {
+                    let key = UserDataKey::read(source)?;
+                    let value = UserData::read(source)?;
+                    map.insert(key, value);
+                }
+                Ok(UserData::Map(map))
+            }
+            6 => {
+                let len = source.read_u32::<LittleEndian>()? as usize;
+                let mut buf = vec![0u8; len];
+                source.read_exact(&mut buf)?;
+                Ok(UserData::Serialized(buf))
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid ExtendedUserData tag",
+            )),
+        }
+    }
+
+    pub fn write<W: std::io::Write>(&self, target: &mut W) -> Result<(), std::io::Error> {
+        match self {
+            UserData::None => target.write_u8(0),
+            UserData::Integer(value) => {
+                target.write_u8(1)?;
+                target.write_i64::<LittleEndian>(*value)
+            }
+            UserData::String(s) => {
+                target.write_u8(2)?;
+                target.write_u32::<LittleEndian>(s.len() as u32)?;
+                target.write_all(s.as_bytes())
+            }
+            UserData::Atom(a) => {
+                target.write_u8(3)?;
+                a.as_view().write(target) // export without the state
+            }
+            UserData::List(list) => {
+                target.write_u8(4)?;
+                target.write_u32::<LittleEndian>(list.len() as u32)?;
+                for item in list {
+                    item.write(target)?;
+                }
+                Ok(())
+            }
+            UserData::Map(map) => {
+                target.write_u8(5)?;
+                target.write_u32::<LittleEndian>(map.len() as u32)?;
+                for (key, value) in map {
+                    key.write(target)?;
+                    value.write(target)?;
+                }
+                Ok(())
+            }
+            UserData::Serialized(buf) => {
+                target.write_u8(6)?;
+                target.write_u32::<LittleEndian>(buf.len() as u32)?;
+                target.write_all(buf)
+            }
+        }
+    }
+}
+
 /// An inline variable.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "bincode",
+    derive(bincode_trait_derive::Encode),
+    derive(bincode_trait_derive::Decode),
+    derive(bincode_trait_derive::BorrowDecodeFromDecode),
+    trait_decode(trait = crate::state::HasStateMap)
+)]
 pub struct InlineVar {
     data: [u8; 16],
     size: u8,
+}
+
+impl Hash for InlineVar {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_view().hash(state);
+    }
+}
+
+impl PartialOrd for InlineVar {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.as_view().cmp(&other.as_view()))
+    }
+}
+
+impl Ord for InlineVar {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_view().cmp(&other.as_view())
+    }
+}
+
+impl std::fmt::Display for InlineVar {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_view().fmt(fmt)
+    }
+}
+
+impl std::fmt::Debug for InlineVar {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_view().fmt(fmt)
+    }
 }
 
 impl InlineVar {
     /// Create a new inline variable.
     pub fn new(symbol: Symbol) -> InlineVar {
         let mut data = [0; 16];
-        let mut flags = VAR_ID;
-        match symbol.wildcard_level {
-            0 => {}
-            1 => flags |= VAR_WILDCARD_LEVEL_1,
-            2 => flags |= VAR_WILDCARD_LEVEL_2,
-            _ => flags |= VAR_WILDCARD_LEVEL_3,
-        }
+        let (flags, extra) = symbol.encode_flags();
+        data[0] = flags | VAR_ID;
 
-        if symbol.is_symmetric {
-            flags |= FUN_SYMMETRIC_FLAG;
-        }
-        if symbol.is_linear {
-            flags |= FUN_LINEAR_FLAG;
-        }
-        if symbol.is_antisymmetric {
-            flags |= VAR_ANTISYMMETRIC_FLAG;
-        }
-        if symbol.is_cyclesymmetric {
-            flags |= VAR_CYCLESYMMETRIC_FLAG;
-        }
-
-        data[0] = flags;
-
-        let size = 1 + (symbol.id as u64, 1).get_packed_size() as u8;
-        (symbol.id as u64, 1).write_packed_fixed(&mut data[1..]);
+        let size = 1 + (symbol.id as u64, (extra * 2) as u64 + 1).get_packed_size() as u8;
+        (symbol.id as u64, (extra * 2) as u64 + 1).write_packed_fixed(&mut data[1..]);
         InlineVar { data, size }
     }
 
@@ -107,13 +349,13 @@ impl InlineVar {
         &self.data[..self.size as usize]
     }
 
-    pub fn as_var_view(&self) -> VarView {
+    pub fn as_var_view(&self) -> VarView<'_> {
         VarView {
             data: &self.data[..self.size as usize],
         }
     }
 
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Var(VarView {
             data: &self.data[..self.size as usize],
         })
@@ -127,10 +369,47 @@ impl From<Symbol> for InlineVar {
 }
 
 /// An inline rational number that has 64-bit components.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "bincode",
+    derive(bincode_trait_derive::Encode),
+    derive(bincode_trait_derive::Decode),
+    derive(bincode_trait_derive::BorrowDecodeFromDecode),
+    trait_decode(trait = crate::state::HasStateMap)
+)]
 pub struct InlineNum {
     data: [u8; 24],
     size: u8,
+}
+
+impl Hash for InlineNum {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_view().hash(state);
+    }
+}
+
+impl PartialOrd for InlineNum {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.as_view().cmp(&other.as_view()))
+    }
+}
+
+impl Ord for InlineNum {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_view().cmp(&other.as_view())
+    }
+}
+
+impl std::fmt::Display for InlineNum {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_view().fmt(fmt)
+    }
+}
+
+impl std::fmt::Debug for InlineNum {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_view().fmt(fmt)
+    }
 }
 
 impl InlineNum {
@@ -148,13 +427,13 @@ impl InlineNum {
         &self.data[..self.size as usize]
     }
 
-    pub fn as_num_view(&self) -> NumView {
+    pub fn as_num_view(&self) -> NumView<'_> {
         NumView {
             data: &self.data[..self.size as usize],
         }
     }
 
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Num(NumView {
             data: &self.data[..self.size as usize],
         })
@@ -247,7 +526,7 @@ impl<C: crate::state::HasStateMap> bincode::Decode<C> for Atom {
 impl Atom {
     /// Read from a binary stream. The format is the byte-length first
     /// followed by the data.
-    pub(crate) fn read<R: Read>(&mut self, mut source: R) -> Result<(), std::io::Error> {
+    pub(crate) fn read<R: Read>(&mut self, source: &mut R) -> Result<(), std::io::Error> {
         let mut dest = std::mem::replace(self, Atom::Zero).into_raw();
 
         // should also set whether rat poly coefficient needs to be converted
@@ -284,10 +563,10 @@ impl Atom {
     ///
     /// Expressions can be exported using [Atom::export](crate::atom::core::AtomCore::export).
     pub fn import<R: Read>(
-        mut source: R,
+        source: &mut R,
         conflict_fn: Option<Box<dyn Fn(&str) -> String>>,
     ) -> Result<Atom, std::io::Error> {
-        let state_map = State::import(&mut source, conflict_fn)?;
+        let state_map = State::import(source, conflict_fn)?;
 
         let mut n_terms_buf = [0; 8];
         source.read_exact(&mut n_terms_buf)?;
@@ -304,7 +583,7 @@ impl Atom {
             let mut tmp = Atom::new();
 
             for _ in 0..n_terms {
-                tmp.read(&mut source)?;
+                tmp.read(&mut *source)?;
                 a.extend(tmp.as_view());
             }
 
@@ -314,7 +593,7 @@ impl Atom {
 
     /// Read a stateless expression from a binary stream, renaming the symbols using the provided state map.
     pub fn import_with_map<R: Read>(
-        source: R,
+        source: &mut R,
         state_map: &StateMap,
     ) -> Result<Atom, std::io::Error> {
         let mut a = Atom::new();
@@ -424,12 +703,12 @@ impl Num {
     }
 
     #[inline]
-    pub fn to_num_view(&self) -> NumView {
+    pub fn to_num_view(&self) -> NumView<'_> {
         NumView { data: &self.data }
     }
 
     #[inline(always)]
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Num(self.to_num_view())
     }
 
@@ -474,34 +753,15 @@ impl Var {
     pub fn set_from_symbol(&mut self, symbol: Symbol) {
         self.data.clear();
 
-        let mut flags = VAR_ID;
-        match symbol.wildcard_level {
-            0 => {}
-            1 => flags |= VAR_WILDCARD_LEVEL_1,
-            2 => flags |= VAR_WILDCARD_LEVEL_2,
-            _ => flags |= VAR_WILDCARD_LEVEL_3,
-        }
+        let (flags, extra) = symbol.encode_flags();
+        self.data.put_u8(flags | VAR_ID);
 
-        if symbol.is_symmetric {
-            flags |= FUN_SYMMETRIC_FLAG;
-        }
-        if symbol.is_linear {
-            flags |= FUN_LINEAR_FLAG;
-        }
-        if symbol.is_antisymmetric {
-            flags |= VAR_ANTISYMMETRIC_FLAG;
-        }
-        if symbol.is_cyclesymmetric {
-            flags |= VAR_CYCLESYMMETRIC_FLAG;
-        }
-
-        self.data.put_u8(flags);
-
-        (symbol.id as u64, 1).write_packed(&mut self.data);
+        // shift by 1, so that the no-flag case does not take up extra space
+        (symbol.id as u64, (extra * 2) as u64 + 1).write_packed(&mut self.data);
     }
 
     #[inline]
-    pub fn to_var_view(&self) -> VarView {
+    pub fn to_var_view(&self) -> VarView<'_> {
         VarView { data: &self.data }
     }
 
@@ -512,7 +772,7 @@ impl Var {
     }
 
     #[inline(always)]
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Var(self.to_var_view())
     }
 
@@ -557,34 +817,14 @@ impl Fun {
     pub(crate) fn set_from_symbol(&mut self, symbol: Symbol) {
         self.data.clear();
 
-        let mut flags = FUN_ID | NOT_NORMALIZED;
-        match symbol.wildcard_level {
-            0 => {}
-            1 => flags |= VAR_WILDCARD_LEVEL_1,
-            2 => flags |= VAR_WILDCARD_LEVEL_2,
-            _ => flags |= VAR_WILDCARD_LEVEL_3,
-        }
-
-        if symbol.is_symmetric || symbol.is_cyclesymmetric {
-            flags |= FUN_SYMMETRIC_FLAG;
-        }
-        if symbol.is_linear {
-            flags |= FUN_LINEAR_FLAG;
-        }
-
-        self.data.put_u8(flags);
+        let (flags, extra) = symbol.encode_flags();
+        self.data.put_u8(flags | FUN_ID | NOT_NORMALIZED);
 
         self.data.put_u32_le(0_u32);
 
         let buf_pos = self.data.len();
 
-        let id = if symbol.is_antisymmetric || symbol.is_cyclesymmetric {
-            symbol.id as u64 | FUN_ANTISYMMETRIC_FLAG
-        } else {
-            symbol.id as u64
-        };
-
-        (id, 0).write_packed(&mut self.data);
+        ((extra as u64) << 32 | symbol.id as u64, 0).write_packed(&mut self.data);
 
         let new_buf_pos = self.data.len();
         let mut cursor = &mut self.data[1..];
@@ -648,7 +888,7 @@ impl Fun {
     }
 
     #[inline(always)]
-    pub fn to_fun_view(&self) -> FunView {
+    pub fn to_fun_view(&self) -> FunView<'_> {
         FunView { data: &self.data }
     }
 
@@ -658,7 +898,7 @@ impl Fun {
     }
 
     #[inline(always)]
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Fun(self.to_fun_view())
     }
 
@@ -722,7 +962,7 @@ impl Pow {
     }
 
     #[inline(always)]
-    pub fn to_pow_view(&self) -> PowView {
+    pub fn to_pow_view(&self) -> PowView<'_> {
         PowView { data: &self.data }
     }
 
@@ -733,7 +973,7 @@ impl Pow {
     }
 
     #[inline(always)]
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Pow(self.to_pow_view())
     }
 
@@ -904,7 +1144,7 @@ impl Mul {
     }
 
     #[inline]
-    pub fn to_mul_view(&self) -> MulView {
+    pub fn to_mul_view(&self) -> MulView<'_> {
         MulView { data: &self.data }
     }
 
@@ -917,7 +1157,7 @@ impl Mul {
     }
 
     #[inline(always)]
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Mul(self.to_mul_view())
     }
 
@@ -1028,7 +1268,7 @@ impl Add {
     }
 
     #[inline(always)]
-    pub fn to_add_view(&self) -> AddView {
+    pub fn to_add_view(&self) -> AddView<'_> {
         AddView { data: &self.data }
     }
 
@@ -1039,7 +1279,7 @@ impl Add {
     }
 
     #[inline(always)]
-    pub fn as_view(&self) -> AtomView {
+    pub fn as_view(&self) -> AtomView<'_> {
         AtomView::Add(self.to_add_view())
     }
 
@@ -1086,27 +1326,15 @@ impl<'a> VarView<'a> {
 
     #[inline(always)]
     pub fn get_symbol(&self) -> Symbol {
-        let is_cyclesymmetric = self.data[0] & VAR_CYCLESYMMETRIC_FLAG == VAR_CYCLESYMMETRIC_FLAG;
+        let (id, attrs, _) = self.data[1..].get_frac_u64();
 
-        Symbol::raw_fn(
-            self.data[1..].get_frac_u64().0 as u32,
-            self.get_wildcard_level(),
-            !is_cyclesymmetric && self.data[0] & FUN_SYMMETRIC_FLAG == FUN_SYMMETRIC_FLAG,
-            !is_cyclesymmetric && self.data[0] & VAR_ANTISYMMETRIC_FLAG == VAR_ANTISYMMETRIC_FLAG,
-            is_cyclesymmetric,
-            self.data[0] & FUN_LINEAR_FLAG == FUN_LINEAR_FLAG,
-        )
+        // attrs are shifted to improve the packing efficiency
+        Symbol::decode_flags(id as u32, self.data[0], (attrs >> 1) as u32)
     }
 
     #[inline(always)]
     pub fn get_wildcard_level(&self) -> u8 {
-        match self.data[0] & VAR_WILDCARD_LEVEL_MASK {
-            0 => 0,
-            VAR_WILDCARD_LEVEL_1 => 1,
-            VAR_WILDCARD_LEVEL_2 => 2,
-            VAR_WILDCARD_LEVEL_3 => 3,
-            _ => 0,
-        }
+        self.get_symbol().get_wildcard_level()
     }
 
     #[inline]
@@ -1180,65 +1408,50 @@ impl<'a> FunView<'a> {
 
     #[inline(always)]
     pub fn get_symbol(&self) -> Symbol {
-        let id = self.data[1 + 4..].get_frac_u64().0;
-
-        let is_cyclesymmetric = self.data[0] & FUN_SYMMETRIC_FLAG == FUN_SYMMETRIC_FLAG
-            && id & FUN_ANTISYMMETRIC_FLAG == FUN_ANTISYMMETRIC_FLAG;
-
-        Symbol::raw_fn(
-            id as u32,
-            self.get_wildcard_level(),
-            !is_cyclesymmetric && self.data[0] & FUN_SYMMETRIC_FLAG == FUN_SYMMETRIC_FLAG,
-            !is_cyclesymmetric && id & FUN_ANTISYMMETRIC_FLAG == FUN_ANTISYMMETRIC_FLAG,
-            is_cyclesymmetric,
-            self.is_linear(),
+        let (id_and_attrs, _, _) = self.data[1 + 4..].get_frac_u64();
+        Symbol::decode_flags(
+            id_and_attrs as u32,
+            self.data[0],
+            (id_and_attrs >> 32) as u32,
         )
+    }
+
+    /// Get the argument at the given index.
+    pub fn get(&self, index: usize) -> AtomView<'a> {
+        if let Some(v) = self.iter().nth(index) {
+            v
+        } else {
+            panic!(
+                "Index {} out of bounds for function {}",
+                index,
+                self.as_view()
+            );
+        }
     }
 
     #[inline(always)]
     pub fn is_symmetric(&self) -> bool {
-        if self.data[0] & FUN_SYMMETRIC_FLAG == 0 {
-            return false;
-        }
-
-        let id = self.data[1 + 4..].get_frac_u64().0;
-        id & FUN_ANTISYMMETRIC_FLAG == 0
+        self.data[0] & SYM_CYCLESYMMETRIC_FLAG == SYM_SYMMETRIC_FLAG
     }
 
     #[inline(always)]
     pub fn is_antisymmetric(&self) -> bool {
-        if self.data[0] & FUN_SYMMETRIC_FLAG == FUN_SYMMETRIC_FLAG {
-            return false;
-        }
-
-        let id = self.data[1 + 4..].get_frac_u64().0;
-        id & FUN_ANTISYMMETRIC_FLAG == FUN_ANTISYMMETRIC_FLAG
+        self.data[0] & SYM_CYCLESYMMETRIC_FLAG == SYM_ANTISYMMETRIC_FLAG
     }
 
     #[inline(always)]
     pub fn is_cyclesymmetric(&self) -> bool {
-        if self.data[0] & FUN_SYMMETRIC_FLAG == 0 {
-            return false;
-        }
-
-        let id = self.data[1 + 4..].get_frac_u64().0;
-        id & FUN_ANTISYMMETRIC_FLAG == FUN_ANTISYMMETRIC_FLAG
+        self.data[0] & SYM_CYCLESYMMETRIC_FLAG == SYM_CYCLESYMMETRIC_FLAG
     }
 
     #[inline(always)]
     pub fn is_linear(&self) -> bool {
-        self.data[0] & FUN_LINEAR_FLAG == FUN_LINEAR_FLAG
+        self.data[0] & SYM_LINEAR_FLAG == SYM_LINEAR_FLAG
     }
 
     #[inline(always)]
     pub fn get_wildcard_level(&self) -> u8 {
-        match self.data[0] & VAR_WILDCARD_LEVEL_MASK {
-            0 => 0,
-            VAR_WILDCARD_LEVEL_1 => 1,
-            VAR_WILDCARD_LEVEL_2 => 2,
-            VAR_WILDCARD_LEVEL_3 => 3,
-            _ => 0,
-        }
+        self.get_symbol().get_wildcard_level()
     }
 
     #[inline(always)]
@@ -1327,12 +1540,20 @@ impl<'a> NumView<'a> {
 
     #[inline]
     pub fn is_zero(&self) -> bool {
-        self.data.is_zero_rat()
+        if self.data.is_small_int() {
+            self.data.is_zero_rat()
+        } else {
+            self.get_coeff_view().is_zero()
+        }
     }
 
     #[inline]
     pub fn is_one(&self) -> bool {
-        self.data.is_one_rat()
+        if self.data.is_small_int() {
+            self.data.is_one_rat()
+        } else {
+            self.get_coeff_view().is_one()
+        }
     }
 
     #[inline]
@@ -1657,8 +1878,8 @@ impl<'a> AtomView<'a> {
     /// Export the atom and state to a binary stream. It can be loaded
     /// with [Atom::import].
     #[inline(always)]
-    pub fn export<W: Write>(&self, mut dest: W) -> Result<(), std::io::Error> {
-        State::export(&mut dest)?;
+    pub fn export<W: Write>(&self, dest: &mut W) -> Result<(), std::io::Error> {
+        State::export(dest)?;
 
         dest.write_u64::<LittleEndian>(1)?; // export a single expression
 
@@ -1673,7 +1894,7 @@ impl<'a> AtomView<'a> {
     ///
     /// Most users will want to use [AtomView::export] instead.
     #[inline(always)]
-    pub fn write<W: Write>(&self, mut dest: W) -> Result<(), std::io::Error> {
+    pub fn write<W: Write>(&self, dest: &mut W) -> Result<(), std::io::Error> {
         let d = self.get_data();
         dest.write_u8(0)?;
         dest.write_u64::<LittleEndian>(d.len() as u64)?;
@@ -1894,7 +2115,7 @@ impl<'a> ListSlice<'a> {
         }
     }
 
-    fn get_entry(start: &[u8]) -> (AtomView, &[u8]) {
+    fn get_entry(start: &[u8]) -> (AtomView<'_>, &[u8]) {
         let start_id = start[0] & TYPE_MASK;
         let end = Self::skip(start, 1);
         let len = unsafe { end.as_ptr().offset_from(start.as_ptr()) } as usize;

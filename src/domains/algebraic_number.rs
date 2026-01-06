@@ -8,9 +8,10 @@ use crate::{
     atom::Atom,
     coefficient::ConvertToRing,
     combinatorics::CombinationIterator,
+    domains::{RingOps, Set, rational::Q},
     poly::{
-        PositiveExponent, Variable, factor::Factorize, gcd::PolynomialGCD,
-        polynomial::MultivariatePolynomial,
+        PolyVariable, PositiveExponent, factor::Factorize, gcd::PolynomialGCD,
+        polynomial::MultivariatePolynomial, univariate::UnivariatePolynomial,
     },
     symbol,
     tensors::matrix::Matrix,
@@ -18,12 +19,119 @@ use crate::{
 
 use super::{
     EuclideanDomain, Field, InternalOrdering, Ring, SelfRing,
-    finite_field::{
-        FiniteField, FiniteFieldCore, FiniteFieldWorkspace, GaloisField, ToFiniteField,
-    },
+    finite_field::{FiniteField, FiniteFieldCore, FiniteFieldWorkspace, ToFiniteField},
     integer::Integer,
     rational::Rational,
 };
+
+/// Information about a specific root of a polynomial.
+/// The roots are sorted in the following way: first
+/// all real roots in ascending order, then complex roots
+/// sorted by their real part and then by their imaginary part.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RootInfo {
+    pub index: u16,
+    pub is_real: bool,
+    pub isolating_interval: Option<(Rational, Rational)>,
+    pub complex_interval: Option<(Rational, Rational)>,
+}
+
+impl RootInfo {
+    /// Create root information for the `index`-th root of the polynomial `poly`.
+    pub fn from_index(index: usize, poly: &UnivariatePolynomial<Q>) -> Self {
+        if index > poly.degree() {
+            panic!(
+                "Index {} is out of bounds for polynomial of degree {}",
+                index,
+                poly.degree(),
+            );
+        }
+
+        let roots = poly.isolate_roots(None);
+
+        let mut counter = 0;
+        for (a, b, pow) in roots {
+            if counter + pow > index {
+                return RootInfo {
+                    index: index as u16,
+                    is_real: true,
+                    isolating_interval: Some((a, b)),
+                    complex_interval: None,
+                };
+            } else {
+                counter += pow;
+            }
+        }
+
+        // TODO: complex root isolation?
+        RootInfo {
+            index: index as u16,
+            is_real: false,
+            isolating_interval: None,
+            complex_interval: None,
+        }
+    }
+}
+
+/// A Galois field `GF(p,n)` is a finite field with `p^n` elements.
+/// It provides methods to upgrade and downgrade to Galois fields with the
+/// same prime but with a different power.
+pub trait GaloisField: Field {
+    type Base: Field;
+
+    fn get_extension_degree(&self) -> u64;
+
+    /// Upgrade the field to `GF(p,new_pow)`.
+    fn upgrade(&self, new_pow: usize) -> AlgebraicExtension<Self::Base>
+    where
+        Self::Base: PolynomialGCD<u16>,
+        <Self::Base as Set>::Element: Copy;
+
+    fn upgrade_element(
+        &self,
+        e: &Self::Element,
+        larger_field: &AlgebraicExtension<Self::Base>,
+    ) -> <AlgebraicExtension<Self::Base> as Set>::Element;
+
+    fn downgrade_element(
+        &self,
+        e: &<AlgebraicExtension<Self::Base> as Set>::Element,
+    ) -> Self::Element;
+}
+
+impl<UField: FiniteFieldWorkspace> GaloisField for FiniteField<UField>
+where
+    FiniteField<UField>: Field + FiniteFieldCore<UField>,
+{
+    type Base = Self;
+
+    fn get_extension_degree(&self) -> u64 {
+        1
+    }
+
+    fn upgrade(&self, new_pow: usize) -> AlgebraicExtension<FiniteField<UField>>
+    where
+        Self::Base: PolynomialGCD<u16>,
+        <Self::Base as Set>::Element: Copy,
+    {
+        AlgebraicExtension::galois_field(self.clone(), new_pow, PolyVariable::Temporary(0))
+    }
+
+    fn upgrade_element(
+        &self,
+        e: &Self::Element,
+        larger_field: &AlgebraicExtension<Self::Base>,
+    ) -> <AlgebraicExtension<Self::Base> as Set>::Element {
+        larger_field.constant(e.clone())
+    }
+
+    fn downgrade_element(
+        &self,
+        e: &<AlgebraicExtension<Self::Base> as Set>::Element,
+    ) -> Self::Element {
+        e.poly.get_constant()
+    }
+}
 
 /// An algebraic number ring, with a monic, irreducible defining polynomial.
 ///
@@ -32,7 +140,7 @@ use super::{
 /// ```
 /// use symbolica::{
 ///     atom::{Atom, AtomCore},
-///     domains::{algebraic_number::AlgebraicExtension, rational::Q, Ring},
+///     domains::{algebraic_number::AlgebraicExtension, rational::Q, Ring, RingOps},
 ///     parse,
 /// };
 ///
@@ -62,6 +170,27 @@ use super::{
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AlgebraicExtension<R: Ring> {
     poly: Arc<MultivariatePolynomial<R, u16>>, // TODO: convert to univariate polynomial
+    embedding: Option<Arc<RootInfo>>,
+}
+
+impl<T: FiniteFieldWorkspace> AlgebraicExtension<FiniteField<T>>
+where
+    FiniteField<T>: FiniteFieldCore<T>,
+{
+    pub fn to_integer(&self, a: &<Self as Set>::Element) -> Integer {
+        let mut p = Integer::zero();
+        for x in a.poly.into_iter() {
+            p += &(self.poly.ring.to_integer(x.coefficient)
+                * &self.characteristic().pow(x.exponents[0] as u64));
+        }
+        p
+    }
+
+    pub fn to_symmetric_integer(&self, a: &<Self as Set>::Element) -> Integer {
+        let r = self.to_integer(a);
+        let s = self.size().unwrap();
+        if &r * 2 <= s { r } else { &r - &s }
+    }
 }
 
 impl<T: FiniteFieldWorkspace> GaloisField for AlgebraicExtension<FiniteField<T>>
@@ -74,25 +203,10 @@ where
         self.poly.degree(0) as u64
     }
 
-    fn to_integer(&self, a: &Self::Element) -> Integer {
-        let mut p = Integer::zero();
-        for x in a.poly.into_iter() {
-            p += &(self.poly.ring.to_integer(x.coefficient)
-                * &self.characteristic().pow(x.exponents[0] as u64));
-        }
-        p
-    }
-
-    fn to_symmetric_integer(&self, a: &Self::Element) -> Integer {
-        let r = self.to_integer(a);
-        let s = self.size();
-        if &r * &2.into() > s { &r - &s } else { r }
-    }
-
     fn upgrade(&self, new_pow: usize) -> AlgebraicExtension<Self::Base>
     where
         Self::Base: PolynomialGCD<u16>,
-        <Self::Base as Ring>::Element: Copy,
+        <Self::Base as Set>::Element: Copy,
     {
         AlgebraicExtension::galois_field(
             self.poly.ring.clone(),
@@ -105,13 +219,13 @@ where
         &self,
         e: &Self::Element,
         larger_field: &AlgebraicExtension<Self::Base>,
-    ) -> <AlgebraicExtension<Self::Base> as Ring>::Element {
+    ) -> <AlgebraicExtension<Self::Base> as Set>::Element {
         larger_field.to_element(e.poly.clone())
     }
 
     fn downgrade_element(
         &self,
-        e: &<AlgebraicExtension<Self::Base> as Ring>::Element,
+        e: &<AlgebraicExtension<Self::Base> as Set>::Element,
     ) -> Self::Element {
         self.to_element(e.poly.clone())
     }
@@ -123,11 +237,11 @@ where
     Integer: ToFiniteField<UField>,
 {
     fn element_from_integer(&self, number: Integer) -> Self::Element {
-        let mut q = &number % &self.size();
+        let mut q = &number % &self.size().unwrap();
         let mut pow = 0;
         let mut poly = self.poly.zero();
         while !q.is_zero() {
-            let (qn, r) = q.quot_rem(&self.poly.ring.size());
+            let (qn, r) = q.quot_rem(&self.poly.ring.size().unwrap());
             poly.append_monomial(r.to_finite_field(&self.poly.ring), &[pow]);
             pow += 1;
             q = qn;
@@ -136,61 +250,139 @@ where
         AlgebraicNumber { poly }
     }
 
-    fn element_from_coefficient(&self, number: crate::coefficient::Coefficient) -> Self::Element {
+    fn try_element_from_coefficient(
+        &self,
+        number: crate::coefficient::Coefficient,
+    ) -> Result<Self::Element, String> {
         match number {
+            crate::coefficient::Coefficient::Indeterminate => {
+                Err("Cannot convert indeterminate to rational".to_string())
+            }
+            crate::coefficient::Coefficient::Infinity(_) => {
+                Err("Cannot convert infinity to rational".to_string())
+            }
             crate::coefficient::Coefficient::Complex(r) => {
                 if r.is_real() {
                     let n = self.element_from_integer(r.re.numerator());
                     let d = self.element_from_integer(r.re.denominator());
-                    self.div(&n, &d)
+                    Ok(self.div(&n, &d))
+                } else if self.poly().exponents == [0, 2]
+                    && self.poly().ring.is_one(&self.poly().get_constant())
+                {
+                    let ring = &self.poly().ring;
+                    let re = {
+                        let n = ring.element_from_integer(r.re.numerator());
+                        let d = ring.element_from_integer(r.re.denominator());
+                        ring.div(&n, &d)
+                    };
+
+                    let im = {
+                        let n = ring.element_from_integer(r.im.numerator());
+                        let d = ring.element_from_integer(r.im.denominator());
+                        ring.div(&n, &d)
+                    };
+
+                    Ok(self
+                        .to_element(self.poly().monomial(re, vec![1]) + self.poly().constant(im)))
                 } else {
-                    // TODO: check if i is a root of the minimal polynomial
-                    panic!("Cannot convert complex coefficient to algebraic number")
+                    Err(
+                        "Cannot directly convert complex number to this extension. First create a polynomial with extension x^2+1 and then upgrade.".to_string()
+                    )
                 }
             }
             crate::coefficient::Coefficient::Float(_) => {
-                panic!("Cannot convert float coefficient to algebraic number")
+                Err("Cannot convert float coefficient to algebraic number".to_string())
             }
             crate::coefficient::Coefficient::FiniteField(_, _) => {
-                panic!("Cannot convert finite field coefficient to algebraic number")
+                // TODO: check if the field is the same? how?
+                Err("Cannot convert finite field coefficient to algebraic number".to_string())
             }
-            crate::coefficient::Coefficient::RationalPolynomial(_) => {
-                panic!("Cannot convert rational polynomial coefficient to algebraic number")
-            }
+            crate::coefficient::Coefficient::RationalPolynomial(_) => Err(
+                "Cannot convert rational polynomial coefficient to algebraic number".to_string(),
+            ),
         }
     }
 
-    fn element_from_coefficient_view(
+    fn try_element_from_coefficient_view(
         &self,
         number: crate::coefficient::CoefficientView<'_>,
-    ) -> Self::Element {
+    ) -> Result<Self::Element, String> {
         match number {
-            crate::coefficient::CoefficientView::Natural(n, d, ni, _di) => {
-                if ni != 0 {
-                    panic!("Cannot convert complex coefficient to algebraic number")
-                }
+            crate::coefficient::CoefficientView::Natural(r, d, cr, cd) => {
+                if cr == 0 {
+                    let n = self.element_from_integer(r.into());
+                    let d = self.element_from_integer(d.into());
+                    Ok(self.div(&n, &d))
+                } else if self.poly().exponents == [0, 2]
+                    && self.poly().ring.is_one(&self.poly().get_constant())
+                {
+                    let ring = &self.poly().ring;
+                    let re = {
+                        let n = ring.element_from_integer(r.into());
+                        let d = ring.element_from_integer(d.into());
+                        ring.div(&n, &d)
+                    };
 
-                let n = self.element_from_integer(n.into());
-                let d = self.element_from_integer(d.into());
-                self.div(&n, &d)
-            }
-            crate::coefficient::CoefficientView::Large(l, i) => {
-                if !i.is_zero() {
-                    panic!("Cannot convert complex coefficient to algebraic number")
+                    let im = {
+                        let n = ring.element_from_integer(cr.into());
+                        let d = ring.element_from_integer(cd.into());
+                        ring.div(&n, &d)
+                    };
+
+                    Ok(self
+                        .to_element(self.poly().monomial(re, vec![1]) + self.poly().constant(im)))
+                } else {
+                    Err(
+                        "Cannot directly convert complex number to this extension. First create a polynomial with extension x^2+1 and then upgrade.".to_string(),
+                    )
                 }
-                let r: Rational = l.to_rat();
-                let n = self.element_from_integer(r.numerator());
-                let d = self.element_from_integer(r.denominator());
-                self.div(&n, &d)
+            }
+            crate::coefficient::CoefficientView::Large(r, i) => {
+                if i.is_zero() {
+                    let r: Rational = r.to_rat();
+                    let n = self.element_from_integer(r.numerator());
+                    let d = self.element_from_integer(r.denominator());
+                    Ok(self.div(&n, &d))
+                } else if self.poly().exponents == [0, 2]
+                    && self.poly().ring.is_one(&self.poly().get_constant())
+                {
+                    let ring = &self.poly().ring;
+                    let re = {
+                        let r = r.to_rat();
+                        let n = ring.element_from_integer(r.numerator());
+                        let d = ring.element_from_integer(r.denominator());
+                        ring.div(&n, &d)
+                    };
+
+                    let im = {
+                        let cr = i.to_rat();
+                        let n = ring.element_from_integer(cr.numerator());
+                        let d = ring.element_from_integer(cr.denominator());
+                        ring.div(&n, &d)
+                    };
+
+                    Ok(self
+                        .to_element(self.poly().monomial(re, vec![1]) + self.poly().constant(im)))
+                } else {
+                    Err(
+                        "Cannot directly convert complex number to this extension. First create a polynomial with extension x^2+1 and then upgrade.".to_string(),
+                    )
+                }
             }
             crate::coefficient::CoefficientView::Float(_, _) => {
-                panic!("Cannot convert float coefficient to algebraic number")
+                Err("Cannot convert float coefficient to algebraic number".to_string())
             }
             crate::coefficient::CoefficientView::FiniteField(_, _) => {
-                panic!("Cannot convert finite field coefficient to algebraic number")
+                Err("Cannot convert finite field coefficient to algebraic number".to_string())
             }
-            crate::coefficient::CoefficientView::RationalPolynomial(_) => {
-                panic!("Cannot convert rational polynomial coefficient to algebraic number")
+            crate::coefficient::CoefficientView::RationalPolynomial(_) => Err(
+                "Cannot convert rational polynomial coefficient to algebraic number".to_string(),
+            ),
+            crate::coefficient::CoefficientView::Indeterminate => {
+                Err("Cannot convert indeterminate to algebraic number".to_string())
+            }
+            crate::coefficient::CoefficientView::Infinity(_) => {
+                Err("Cannot convert infinity to algebraic number".to_string())
             }
         }
     }
@@ -199,11 +391,11 @@ where
 impl<UField: FiniteFieldWorkspace> AlgebraicExtension<FiniteField<UField>>
 where
     FiniteField<UField>: FiniteFieldCore<UField> + PolynomialGCD<u16>,
-    <FiniteField<UField> as Ring>::Element: Copy,
+    <FiniteField<UField> as Set>::Element: Copy,
 {
     /// Construct the Galois field GF(prime^exp).
     /// The irreducible polynomial is determined automatically.
-    pub fn galois_field(prime: FiniteField<UField>, exp: usize, var: Variable) -> Self {
+    pub fn galois_field(prime: FiniteField<UField>, exp: usize, var: PolyVariable) -> Self {
         assert!(exp > 0);
 
         if exp == 1 {
@@ -219,7 +411,7 @@ where
         ) -> bool
         where
             FiniteField<UField>: FiniteFieldCore<UField> + PolynomialGCD<u16>,
-            <FiniteField<UField> as Ring>::Element: Copy,
+            <FiniteField<UField> as Set>::Element: Copy,
             AlgebraicExtension<FiniteField<UField>>: PolynomialGCD<u16>,
         {
             poly.clear();
@@ -309,6 +501,7 @@ impl<R: EuclideanDomain> AlgebraicExtension<R> {
         if poly.nvars() == 1 {
             return AlgebraicExtension {
                 poly: Arc::new(poly),
+                embedding: None,
             };
         }
 
@@ -318,6 +511,17 @@ impl<R: EuclideanDomain> AlgebraicExtension<R> {
 
         AlgebraicExtension {
             poly: Arc::new(uni.to_multivariate()),
+            embedding: None,
+        }
+    }
+
+    pub fn new_with_embedding(
+        poly: MultivariatePolynomial<R, u16>,
+        embedding: RootInfo,
+    ) -> AlgebraicExtension<R> {
+        AlgebraicExtension {
+            poly: Arc::new(poly),
+            embedding: Some(Arc::new(embedding)),
         }
     }
 
@@ -345,24 +549,48 @@ impl<R: EuclideanDomain> AlgebraicExtension<R> {
                 self.poly
                     .map_coeff(|c| c.to_finite_field(field), field.clone()),
             ),
+            embedding: None,
         }
     }
 
-    pub fn to_element(&self, mut poly: MultivariatePolynomial<R, u16>) -> <Self as Ring>::Element {
+    pub fn try_to_element(
+        &self,
+        poly: MultivariatePolynomial<R, u16>,
+    ) -> Result<<Self as Set>::Element, String> {
         if poly.nvars() == 0 {
-            poly.variables = self.poly.variables.clone();
-            poly.exponents = vec![0; poly.coefficients.len()];
+            let mut new_poly = poly;
+            new_poly.variables = self.poly.variables.clone();
+            new_poly.exponents = vec![0; new_poly.coefficients.len()];
+
+            return Ok(AlgebraicNumber { poly: new_poly });
         }
 
-        assert!(poly.nvars() == 1);
+        if poly.nvars() != 1 {
+            return Err(format!(
+                "Polynomial has {} variables, expected 1",
+                poly.nvars()
+            ));
+        }
+
+        if poly.get_vars_ref()[0] != self.poly.get_vars_ref()[0] {
+            return Err(format!(
+                "Polynomial variable {:?} does not match extension variable {:?}",
+                poly.get_vars_ref()[0],
+                self.poly.get_vars_ref()[0]
+            ));
+        }
 
         if poly.degree(0) >= self.poly.degree(0) {
-            AlgebraicNumber {
+            Ok(AlgebraicNumber {
                 poly: poly.quot_rem_univariate_monic(&self.poly).1,
-            }
+            })
         } else {
-            AlgebraicNumber { poly }
+            Ok(AlgebraicNumber { poly })
         }
+    }
+
+    pub fn to_element(&self, poly: MultivariatePolynomial<R, u16>) -> <Self as Set>::Element {
+        self.try_to_element(poly).unwrap()
     }
 }
 
@@ -378,7 +606,7 @@ impl<R: Ring> AlgebraicExtension<R> {
     /// use symbolica::{parse, atom::AtomCore, domains::{algebraic_number::AlgebraicExtension, rational::Q}, poly::factor::Factorize};
     /// let Q_i = AlgebraicExtension::new_complex(Q);
     /// let poly = parse!("(-1+6𝑖)*x+(4+2𝑖)*x^2+3𝑖").to_polynomial::<_, u8>(&Q_i, None);
-    /// assert_eq!(poly.factor().len(), 2);
+    /// assert_eq!(poly.factor().len(), 3);
     /// ```
     pub fn new_complex(ring: R) -> Self {
         let poly = MultivariatePolynomial::new(
@@ -391,6 +619,12 @@ impl<R: Ring> AlgebraicExtension<R> {
 
         AlgebraicExtension {
             poly: Arc::new(poly),
+            embedding: Some(Arc::new(RootInfo {
+                index: 1, // positive imaginary part
+                is_real: false,
+                isolating_interval: Some((0.into(), 0.into())),
+                complex_interval: Some((1.into(), 1.into())),
+            })),
         }
     }
 }
@@ -414,7 +648,7 @@ impl<R: Ring> std::fmt::Display for AlgebraicExtension<R> {
 /// ```
 /// use symbolica::{
 ///     atom::{Atom, AtomCore},
-///     domains::{algebraic_number::AlgebraicExtension, rational::Q, Ring},
+///     domains::{algebraic_number::AlgebraicExtension, rational::Q, Ring, RingOps},
 ///     parse,
 /// };
 ///
@@ -431,6 +665,9 @@ impl<R: Ring> std::fmt::Display for AlgebraicExtension<R> {
 pub struct AlgebraicNumber<R: Ring> {
     pub(crate) poly: MultivariatePolynomial<R, u16>,
 }
+
+// can we use AlgebraicNumber directly the same as Root?
+// index specifies the index of the root of the minimal polynomial
 
 impl<R: Ring> InternalOrdering for AlgebraicNumber<R> {
     fn internal_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -475,11 +712,68 @@ impl<R: Ring> AlgebraicNumber<R> {
     pub fn into_poly(self) -> MultivariatePolynomial<R, u16> {
         self.poly
     }
+
+    pub fn poly(&self) -> &MultivariatePolynomial<R, u16> {
+        &self.poly
+    }
 }
 
-impl<R: EuclideanDomain> Ring for AlgebraicExtension<R> {
+impl<R: EuclideanDomain> Set for AlgebraicExtension<R> {
     type Element = AlgebraicNumber<R>;
 
+    fn size(&self) -> Option<Integer> {
+        self.poly
+            .ring
+            .size()
+            .map(|s| s.pow(self.poly.degree(0) as u64))
+    }
+}
+
+impl<R: EuclideanDomain> RingOps<AlgebraicNumber<R>> for AlgebraicExtension<R> {
+    fn add(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        AlgebraicNumber {
+            poly: a.poly + b.poly,
+        }
+    }
+
+    fn sub(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        AlgebraicNumber {
+            poly: a.poly - b.poly,
+        }
+    }
+
+    fn mul(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        AlgebraicNumber {
+            poly: (&a.poly * &b.poly).quot_rem_univariate_monic(&self.poly).1,
+        }
+    }
+
+    fn add_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = self.add(&*a, &b);
+    }
+
+    fn sub_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = self.sub(&*a, &b);
+    }
+
+    fn mul_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = self.mul(&*a, &b);
+    }
+
+    fn add_mul_assign(&self, a: &mut Self::Element, b: Self::Element, c: Self::Element) {
+        *a = self.add(&*a, &self.mul(b, c));
+    }
+
+    fn sub_mul_assign(&self, a: &mut Self::Element, b: Self::Element, c: Self::Element) {
+        *a = self.sub(&*a, &self.mul(b, c));
+    }
+
+    fn neg(&self, a: Self::Element) -> Self::Element {
+        AlgebraicNumber { poly: -a.poly }
+    }
+}
+
+impl<R: EuclideanDomain> RingOps<&AlgebraicNumber<R>> for AlgebraicExtension<R> {
     fn add(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
         AlgebraicNumber {
             poly: &a.poly + &b.poly,
@@ -499,23 +793,23 @@ impl<R: EuclideanDomain> Ring for AlgebraicExtension<R> {
     }
 
     fn add_assign(&self, a: &mut Self::Element, b: &Self::Element) {
-        *a = self.add(a, b);
+        *a = self.add(&*a, b);
     }
 
     fn sub_assign(&self, a: &mut Self::Element, b: &Self::Element) {
-        *a = self.sub(a, b);
+        *a = self.sub(&*a, b);
     }
 
     fn mul_assign(&self, a: &mut Self::Element, b: &Self::Element) {
-        *a = self.mul(a, b);
+        *a = self.mul(&*a, b);
     }
 
     fn add_mul_assign(&self, a: &mut Self::Element, b: &Self::Element, c: &Self::Element) {
-        *a = self.add(a, &self.mul(b, c));
+        *a = self.add(&*a, &self.mul(b, c));
     }
 
     fn sub_mul_assign(&self, a: &mut Self::Element, b: &Self::Element, c: &Self::Element) {
-        *a = self.sub(a, &self.mul(b, c));
+        *a = self.sub(&*a, &self.mul(b, c));
     }
 
     fn neg(&self, a: &Self::Element) -> Self::Element {
@@ -523,7 +817,9 @@ impl<R: EuclideanDomain> Ring for AlgebraicExtension<R> {
             poly: -a.poly.clone(),
         }
     }
+}
 
+impl<R: EuclideanDomain> Ring for AlgebraicExtension<R> {
     fn zero(&self) -> Self::Element {
         AlgebraicNumber {
             poly: self.poly.zero(),
@@ -566,11 +862,15 @@ impl<R: EuclideanDomain> Ring for AlgebraicExtension<R> {
         self.poly.ring.characteristic()
     }
 
-    fn size(&self) -> Integer {
-        self.poly.ring.size().pow(self.poly.degree(0) as u64)
+    fn try_inv(&self, a: &Self::Element) -> Option<Self::Element> {
+        self.try_div(&self.one(), a)
     }
 
     fn try_div(&self, a: &Self::Element, b: &Self::Element) -> Option<Self::Element> {
+        if self.is_zero(b) {
+            return None;
+        }
+
         // solve the linear system (c_0 + c_1*x + c_(d-1)*x^(d-1)) * b % self = a
         // TODO: use the inverse if R is a field (requires specialization)
         let d = self.poly.degree(0) as usize;
@@ -732,20 +1032,24 @@ impl<R: Field> AlgebraicExtension<R> {
 }
 
 impl<R: Field + PolynomialGCD<u16>> AlgebraicExtension<R> {
-    /// Extend the current algebraic extension `R[a]` with `b`, whose minimal polynomial
+    /// Adjoin the current algebraic extension `R[a]` with `b`, whose minimal polynomial
     /// is `R[a][b]` and form `R[b]`. Also return the new representation of `a` and `b`.
     ///
     /// `b` must be irreducible over `R` and `R[a]`; this is not checked.
-    pub fn extend(
+    ///
+    /// If `new_symbol` is provided, the variable of the new extension will be renamed to it.
+    /// Otherwise, the variable of the new extension will be the same as that of `b`.
+    pub fn adjoin(
         &self,
         b: &MultivariatePolynomial<AlgebraicExtension<R>>,
+        new_symbol: Option<PolyVariable>,
     ) -> (
         AlgebraicExtension<R>,
-        <AlgebraicExtension<R> as Ring>::Element,
-        <AlgebraicExtension<R> as Ring>::Element,
+        <AlgebraicExtension<R> as Set>::Element,
+        <AlgebraicExtension<R> as Set>::Element,
     )
     where
-        AlgebraicExtension<R>: PolynomialGCD<u16>,
+        AlgebraicExtension<R>: PolynomialGCD<u16> + Ring<Element = AlgebraicNumber<R>>,
         MultivariatePolynomial<R>: Factorize,
         MultivariatePolynomial<AlgebraicExtension<R>>: Factorize,
     {
@@ -754,16 +1058,30 @@ impl<R: Field + PolynomialGCD<u16>> AlgebraicExtension<R> {
         let (_, s, g, r) = b.norm_impl();
         debug_assert!(r.is_irreducible());
 
-        let f: AlgebraicExtension<R> = AlgebraicExtension::new(r.clone());
+        let mut f = AlgebraicExtension::new(r);
         let mut g2 = g.to_number_field(&f);
         let mut h = self.poly.to_number_field(&f); // yields constant coeffs
 
         g2.unify_variables(&mut h);
         let g2 = g2.gcd(&h);
 
-        let a = f.neg(&f.div(&g2.get_constant(), &g2.lcoeff()));
+        let mut a = f.neg(&f.div(&g2.get_constant(), &g2.lcoeff()));
         let y = f.to_element(g2.ring.poly.one().mul_exp(&[1]));
-        let b = f.sub(&y, &f.mul(&a, &f.nth(s.into())));
+        let mut b = f.sub(&y, &f.mul(&a, &f.nth(s.into())));
+
+        if let Some(v) = &new_symbol {
+            let old_var = &f.poly.get_vars_ref()[0];
+            a.poly.rename_variable(old_var, v);
+            b.poly.rename_variable(old_var, v);
+
+            let mut new_poly = f.poly.as_ref().clone();
+            new_poly.rename_variable(old_var, v);
+
+            f = AlgebraicExtension {
+                poly: Arc::new(new_poly),
+                embedding: f.embedding,
+            };
+        }
 
         (f, a, b)
     }
@@ -834,15 +1152,86 @@ impl<R: Field + PolynomialGCD<E>, E: PositiveExponent>
     }
 }
 
+impl AlgebraicExtension<Q> {
+    /// Determine if the algebraic number is negative.
+    /// This requires the embedding information to be set.
+    pub fn is_negative(&self, element: &AlgebraicNumber<Q>) -> Result<bool, String> {
+        if self.is_zero(element) {
+            Ok(false)
+        } else {
+            self.is_positive(element).map(|b| !b)
+        }
+    }
+
+    /// Determine if the algebraic number is positive.
+    /// This requires the embedding information to be set.
+    pub fn is_positive(&self, element: &AlgebraicNumber<Q>) -> Result<bool, String> {
+        if element.poly.is_constant() {
+            return Ok(!element.poly.get_constant().is_negative());
+        }
+
+        if let Some(embedding) = &self.embedding {
+            if embedding.is_real {
+                // use the isolating interval if available
+                if let Some((l, h)) = &embedding.isolating_interval {
+                    let mut tolerance = (h - l) / (l + h).abs();
+                    let (mut l, mut h) = (l.clone(), h.clone());
+                    loop {
+                        let eval_lower = element.poly.replace_all(&[l.clone()]);
+                        let eval_upper = element.poly.replace_all(&[h.clone()]);
+
+                        if !eval_lower.is_negative() && !eval_upper.is_negative() {
+                            return Ok(true);
+                        } else if eval_lower.is_negative() && eval_upper.is_negative() {
+                            return Ok(false);
+                        }
+
+                        // refine the interval
+                        let uni = self.poly.to_univariate_from_univariate(0);
+                        tolerance *= &(1, 2).into();
+                        (l, h) = uni.refine_root_interval((l, h), &tolerance);
+                    }
+                }
+
+                Err("Isolating interval missing for number field".to_string())
+            } else {
+                Err(format!(
+                    "Cannot determine the sign of a non-real algebraic number {}",
+                    self.printer(element)
+                ))
+            }
+        } else {
+            Err(format!(
+                "Cannot determine the sign of an algebraic number without embedding information {}",
+                self.printer(element)
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::atom::AtomCore;
-    use crate::domains::Ring;
-    use crate::domains::algebraic_number::AlgebraicExtension;
+    use crate::domains::algebraic_number::{AlgebraicExtension, RootInfo};
     use crate::domains::finite_field::{PrimeIteratorU64, Z2, Zp};
     use crate::domains::integer::Z;
     use crate::domains::rational::Q;
+    use crate::domains::{Ring, RingOps};
     use crate::{parse, symbol};
+
+    #[test]
+    fn is_algebraic_number_positive() {
+        let ring = parse!("a^3 + 3a^2 - 46*a + 1").to_polynomial(&Q, None);
+        let ring = AlgebraicExtension::new_with_embedding(
+            ring.clone(),
+            RootInfo::from_index(2, &ring.to_univariate_from_univariate(0)),
+        );
+
+        let a = parse!("1/5a^2-a-1/10").to_polynomial::<_, u16>(&Q, None);
+        let a = ring.to_element(a);
+
+        assert_eq!(ring.is_positive(&a), Ok(true));
+    }
 
     #[test]
     fn gcd_number_field() {
@@ -897,7 +1286,7 @@ mod tests {
 
         let b = parse!("y^2-3").to_polynomial(&Q, None).to_number_field(&ae);
 
-        let (c, rep1, rep2) = ae.extend(&b);
+        let (c, rep1, rep2) = ae.adjoin(&b, None);
 
         let rf = parse!("1-10*y^2+y^4").to_polynomial(&Q, None);
 

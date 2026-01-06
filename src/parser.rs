@@ -6,8 +6,9 @@
 //! [Token::to_polynomial], [Token::to_rational_polynomial] or [Token::to_factorized_rational_polynomial] for accelerated parsing of polynomials written
 //! in Symbolica's fast format.
 
-use std::{fmt::Write, string::String, sync::Arc};
+use std::{borrow::Cow, fmt::Write, string::String, sync::Arc};
 
+use ahash::HashMap;
 use bytes::Buf;
 use rug::Integer as MultiPrecisionInteger;
 
@@ -16,16 +17,16 @@ use smartstring::{LazyCompact, SmartString};
 
 use crate::{
     LicenseManager,
-    atom::{Atom, DefaultNamespace},
+    atom::{Atom, DefaultNamespace, Symbol, SymbolAttribute, SymbolBuilder},
     coefficient::{Coefficient, ConvertToRing},
     domains::{
         Ring,
-        float::{Complex, Float, NumericalFloatLike},
+        float::{Complex, Float, FloatLike},
         integer::Integer,
         rational::Rational,
     },
-    poly::{PositiveExponent, Variable, polynomial::MultivariatePolynomial},
-    state::{State, Workspace},
+    poly::{PolyVariable, PositiveExponent, polynomial::MultivariatePolynomial},
+    state::{RecycledAtom, State, Workspace},
 };
 
 const HEX_DIGIT_MASK: [bool; 255] = [
@@ -98,6 +99,69 @@ pub enum Operator {
     Inv,      // left side should be tagged as 'finished', for internal use
 }
 
+/// The mode in which to parse the expression.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum ParseMode {
+    #[default]
+    Symbolica,
+    Mathematica,
+}
+
+/// Settings for parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseSettings {
+    pub mode: ParseMode,
+    /// Convert completed terms to atoms during parsing, to save memory
+    pub convert_mul_to_atom: bool,
+    pub distribute_neg: bool,
+}
+
+impl ParseMode {
+    pub fn is_mathematica(&self) -> bool {
+        *self == ParseMode::Mathematica
+    }
+
+    pub fn is_symbolica(&self) -> bool {
+        *self == ParseMode::Symbolica
+    }
+}
+
+impl ParseSettings {
+    pub const fn symbolica() -> Self {
+        ParseSettings {
+            mode: ParseMode::Symbolica,
+            convert_mul_to_atom: true,
+            distribute_neg: false,
+        }
+    }
+
+    pub const fn mathematica() -> Self {
+        ParseSettings {
+            mode: ParseMode::Mathematica,
+            convert_mul_to_atom: true,
+            distribute_neg: false,
+        }
+    }
+
+    pub const fn polynomial() -> Self {
+        ParseSettings {
+            mode: ParseMode::Symbolica,
+            convert_mul_to_atom: false,
+            distribute_neg: true,
+        }
+    }
+}
+
+impl Default for ParseSettings {
+    fn default() -> Self {
+        ParseSettings {
+            mode: ParseMode::Symbolica,
+            convert_mul_to_atom: true,
+            distribute_neg: false,
+        }
+    }
+}
+
 impl std::fmt::Display for Operator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -113,7 +177,7 @@ impl std::fmt::Display for Operator {
 
 impl Operator {
     #[inline]
-    pub fn get_arity(&self) -> usize {
+    pub const fn get_arity(&self) -> usize {
         match self {
             Operator::Neg | Operator::Inv => 1,
             _ => 2,
@@ -121,7 +185,7 @@ impl Operator {
     }
 
     #[inline]
-    pub fn get_precedence(&self) -> u8 {
+    pub const fn get_precedence(&self) -> u8 {
         match self {
             Operator::Mul => 8,
             Operator::Add => 7,
@@ -133,7 +197,7 @@ impl Operator {
     }
 
     #[inline]
-    pub fn left_associative(&self) -> bool {
+    pub const fn left_associative(&self) -> bool {
         match self {
             Operator::Mul => true,
             Operator::Add => true,
@@ -145,7 +209,7 @@ impl Operator {
     }
 
     #[inline]
-    pub fn right_associative(&self) -> bool {
+    pub const fn right_associative(&self) -> bool {
         match self {
             Operator::Mul => true,
             Operator::Add => true,
@@ -170,15 +234,24 @@ pub struct Position {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token {
     Number(SmartString<LazyCompact>, bool),
+    SpecialNumber(char),
     ID(SmartString<LazyCompact>),
     RationalPolynomial(SmartString<LazyCompact>),
     Op(bool, bool, Operator, Vec<Token>),
     Fn(bool, bool, Vec<Token>),
+    ParsedMul(Box<RecycledAtom>), // a partially parsed and converted expression
     Start,
     OpenParenthesis,
     CloseParenthesis,
     CloseBracket,
     EOF,
+}
+
+impl Token {
+    const OPS: [char; 11] = ['\0', '^', '+', '*', '-', '(', ')', '/', ',', '[', ']'];
+    const WHITESPACE: [char; 5] = [' ', '\t', '\n', '\r', '\\'];
+    const WHITESPACE_MATHEMATICA: [char; 4] = [' ', '\t', '\n', '\r'];
+    const FORBIDDEN: [char; 12] = [';', '&', '!', '%', '.', '"', '¿', '⧞', '∞', '{', '}', '`'];
 }
 
 impl std::fmt::Display for Token {
@@ -192,6 +265,7 @@ impl std::fmt::Display for Token {
                     f.write_str(n)
                 }
             }
+            Token::SpecialNumber(c) => f.write_char(*c),
             Token::ID(v) => f.write_str(v),
             Token::RationalPolynomial(v) => {
                 f.write_char('[')?;
@@ -247,15 +321,68 @@ impl std::fmt::Display for Token {
             Token::CloseParenthesis => f.write_char(')'),
             Token::CloseBracket => f.write_char(']'),
             Token::EOF => f.write_str("EOF"),
+            Token::ParsedMul(a) => write!(f, "Atom({})", a),
         }
     }
 }
 
 impl Token {
+    /// Check the validity of a symbol name.
+    pub fn check_symbol_name(symbol: &str) -> Result<(), String> {
+        if !symbol.starts_with('"') && symbol.contains(':') {
+            return Err(format!("Symbol name {} cannot contain ':'", symbol));
+        }
+
+        Token::check_symbol_namespace(symbol)
+    }
+
+    /// Check the validity of a symbol namespace.
+    pub fn check_symbol_namespace(symbol: &str) -> Result<(), String> {
+        if symbol.is_empty() {
+            return Err("Empty symbol namespace".to_string());
+        }
+
+        if symbol.starts_with(|c: char| c.is_numeric()) {
+            return Err(format!("Symbol namespace '{symbol}' starts with a number"));
+        }
+
+        if symbol.starts_with('"') && symbol.ends_with('"') {
+            let mut escaped = false;
+            for (i, c) in symbol.chars().enumerate().skip(1).take(symbol.len() - 2) {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    return Err(format!(
+                        "Invalid character '\"' at position {} in symbol namespace '{symbol}'",
+                        i
+                    ));
+                }
+            }
+
+            return Ok(());
+        }
+
+        for c in symbol.chars() {
+            if Token::OPS.contains(&c)
+                || Token::WHITESPACE.contains(&c)
+                || Token::FORBIDDEN.contains(&c)
+            {
+                return Err(format!(
+                    "Invalid character '{c}' in symbol namespace '{symbol}'"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Return if the token does not require any further arguments.
     fn is_normal(&self) -> bool {
         match self {
             Token::Number(_, _) => true,
+            Token::SpecialNumber(_) => true,
             Token::ID(_) => true,
             Token::RationalPolynomial(_) => true,
             Token::Op(more_left, more_right, _, _) => !more_left && !more_right,
@@ -266,10 +393,12 @@ impl Token {
 
     /// Get the precedence of the token.
     #[inline]
-    fn get_precedence(&self) -> u8 {
+    const fn get_precedence(&self) -> u8 {
         match self {
             Token::Number(_, _) => 11,
+            Token::SpecialNumber(_) => 11,
             Token::ID(_) => 11,
+            Token::ParsedMul(_) => Operator::Mul.get_precedence(),
             Token::RationalPolynomial(_) => 11,
             Token::Op(_, _, o, _) => o.get_precedence(),
             Token::Fn(_, _, _)
@@ -302,8 +431,7 @@ impl Token {
             Ok(())
         } else {
             Err(format!(
-                "operator expected, but found '{}'. Are parentheses unbalanced?",
-                self
+                "operator expected, but found '{self}'. Are parentheses unbalanced?"
             ))
         }
     }
@@ -317,16 +445,14 @@ impl Token {
             Token::Op(_, _, Operator::Mul, args) => {
                 if distribute_neg {
                     args[0].distribute_neg(distribute_neg);
-                } else {
-                    if let Token::Number(n, _) = &mut args[0] {
-                        if n.starts_with('-') {
-                            n.remove(0);
-                        } else {
-                            n.insert(0, '-');
-                        }
+                } else if let Token::Number(n, _) = &mut args[0] {
+                    if n.starts_with('-') {
+                        n.remove(0);
                     } else {
-                        args.push(Token::Number("-1".into(), false));
+                        n.insert(0, '-');
                     }
+                } else {
+                    args.push(Token::Number("-1".into(), false));
                 }
             }
             Token::Op(_, _, Operator::Add, args) => {
@@ -393,19 +519,19 @@ impl Token {
 
             Ok(())
         } else if let Token::Number(n, _) = other {
-            Err(format!("operator expected between '{}' and '{}'", self, n))
+            Err(format!("operator expected between '{self}' and '{n}'"))
         } else {
             Err(format!(
-                "operator expected, but found '{}'. Are parentheses unbalanced?",
-                self
+                "operator expected, but found '{self}'. Are parentheses unbalanced?"
             ))
         }
     }
 
     /// Parse the token into an atom.
-    pub fn to_atom(
+    pub fn to_atom<T>(
         &self,
-        namespace: &DefaultNamespace,
+        namespace: &DefaultNamespace<T>,
+        name_map: &mut HashMap<SmartString<LazyCompact>, Symbol>,
         workspace: &Workspace,
     ) -> Result<Atom, String> {
         let mut atom = workspace.new_atom();
@@ -413,7 +539,9 @@ impl Token {
         {
             let mut state = State::get_global_state().write().unwrap();
             // do not normalize to prevent potential deadlocks
-            self.to_atom_with_output_no_norm(namespace, &mut state, workspace, &mut atom)?;
+            self.to_atom_with_output_no_norm(
+                namespace, name_map, &mut state, workspace, &mut atom,
+            )?;
         }
 
         let mut out = Atom::new();
@@ -422,15 +550,88 @@ impl Token {
         Ok(out)
     }
 
+    /// Parse a symbol with potential attributes.
+    pub(crate) fn parse_symbol<T>(
+        x: &str,
+        namespace: &DefaultNamespace<T>,
+        name_map: &mut HashMap<SmartString<LazyCompact>, Symbol>,
+        state: &mut State,
+    ) -> Result<Symbol, String> {
+        if let Some(s) = name_map.get(x) {
+            return Ok(*s);
+        }
+
+        let s = if let Some((namespace, attr)) = x.split_once("::{") {
+            if let Some((attrs, symbol)) = attr.split_once("}::") {
+                let mut attributes = vec![];
+                let mut tags = vec![];
+                for x in attrs.split(',') {
+                    match x {
+                        "" => {}
+                        "linear" => attributes.push(SymbolAttribute::Linear),
+                        "symmetric" => attributes.push(SymbolAttribute::Symmetric),
+                        "antisymmetric" => attributes.push(SymbolAttribute::Antisymmetric),
+                        "cyclesymmetric" => attributes.push(SymbolAttribute::Cyclesymmetric),
+                        "scalar" => attributes.push(SymbolAttribute::Scalar),
+                        "real" => attributes.push(SymbolAttribute::Real),
+                        "integer" => attributes.push(SymbolAttribute::Integer),
+                        "positive" => attributes.push(SymbolAttribute::Positive),
+                        x => {
+                            if x.contains("::") {
+                                tags.push(x.to_string());
+                            } else {
+                                Err(format!(
+                                    "Unknown attribute or tag: {x}. Tags must contain a namespace"
+                                ))?;
+                            }
+                        }
+                    }
+                }
+
+                let symbol_whole = format!("{}::{}", namespace, symbol);
+
+                SymbolBuilder::new(crate::atom::NamespacedSymbol::parse(&symbol_whole))
+                    .with_attributes(attributes)
+                    .with_tags(tags)
+                    .build_with_state(state)
+                    .map_err(|e| e.to_string())
+            } else {
+                Err(format!("Malformatted attribute section in {}", x))
+            }
+        } else {
+            SymbolBuilder::new(namespace.attach_namespace(x))
+                .build_with_state(state)
+                .map_err(|e| e.to_string())
+        }?;
+
+        // store the name in a map to prevent string allocation when the default namespace
+        // gets added to the symbol
+        name_map.insert(x.into(), s);
+        Ok(s)
+    }
+
     /// Parse the token into the atom `out`.
-    fn to_atom_with_output_no_norm(
+    fn to_atom_with_output_no_norm<T>(
         &self,
-        namespace: &DefaultNamespace,
+        namespace: &DefaultNamespace<T>,
+        name_map: &mut HashMap<SmartString<LazyCompact>, Symbol>,
         state: &mut State,
         workspace: &Workspace,
         out: &mut Atom,
     ) -> Result<(), String> {
         match self {
+            Token::SpecialNumber(c) => match c {
+                '¿' => {
+                    out.to_num(Coefficient::Indeterminate);
+                }
+                '⧞' => {
+                    out.to_num(Coefficient::Infinity(None));
+                }
+                '∞' => {
+                    out.to_num(Coefficient::Infinity(Some(Rational::one().into())));
+                }
+                _ => unreachable!(),
+            },
             Token::Number(n, is_imag) => match n.parse::<Integer>() {
                 Ok(x) => {
                     if *is_imag {
@@ -443,16 +644,16 @@ impl Token {
                     Ok(f) => {
                         // derive precision from string length, should be overestimate
                         if *is_imag {
-                            out.to_num(Complex::new(f.zero(), f.into()).into());
+                            out.to_num(Complex::new(f.zero(), f).into());
                         } else {
                             out.to_num(Coefficient::Float(f.into()));
                         }
                     }
-                    Err(e) => Err(format!("Error parsing number: {}", e))?,
+                    Err(e) => Err(format!("Error parsing number: {e}"))?,
                 },
             },
             Token::ID(x) => {
-                out.to_var(state.get_symbol(namespace.attach_namespace(x))?);
+                out.to_var(Self::parse_symbol(x, namespace, name_map, state)?);
             }
             Token::Op(_, _, op, args) => match op {
                 Operator::Mul => {
@@ -460,7 +661,9 @@ impl Token {
 
                     let mut atom = workspace.new_atom();
                     for a in args {
-                        a.to_atom_with_output_no_norm(namespace, state, workspace, &mut atom)?;
+                        a.to_atom_with_output_no_norm(
+                            namespace, name_map, state, workspace, &mut atom,
+                        )?;
                         mul.extend(atom.as_view());
                     }
                 }
@@ -469,7 +672,9 @@ impl Token {
 
                     let mut atom = workspace.new_atom();
                     for a in args {
-                        a.to_atom_with_output_no_norm(namespace, state, workspace, &mut atom)?;
+                        a.to_atom_with_output_no_norm(
+                            namespace, name_map, state, workspace, &mut atom,
+                        )?;
                         add.extend(atom.as_view());
                     }
                 }
@@ -477,10 +682,16 @@ impl Token {
                     // pow is right associative
                     args.last()
                         .unwrap()
-                        .to_atom_with_output_no_norm(namespace, state, workspace, out)?;
+                        .to_atom_with_output_no_norm(namespace, name_map, state, workspace, out)?;
                     for a in args.iter().rev().skip(1) {
                         let mut cur_base = workspace.new_atom();
-                        a.to_atom_with_output_no_norm(namespace, state, workspace, &mut cur_base)?;
+                        a.to_atom_with_output_no_norm(
+                            namespace,
+                            name_map,
+                            state,
+                            workspace,
+                            &mut cur_base,
+                        )?;
 
                         let mut pow_h = workspace.new_atom();
                         pow_h.to_pow(cur_base.as_view(), out.as_view());
@@ -492,7 +703,9 @@ impl Token {
                     debug_assert!(args.len() == 1);
 
                     let mut base = workspace.new_atom();
-                    args[0].to_atom_with_output_no_norm(namespace, state, workspace, &mut base)?;
+                    args[0].to_atom_with_output_no_norm(
+                        namespace, name_map, state, workspace, &mut base,
+                    )?;
 
                     let num = workspace.new_num(-1);
 
@@ -504,7 +717,9 @@ impl Token {
                     debug_assert!(args.len() == 1);
 
                     let mut base = workspace.new_atom();
-                    args[0].to_atom_with_output_no_norm(namespace, state, workspace, &mut base)?;
+                    args[0].to_atom_with_output_no_norm(
+                        namespace, name_map, state, workspace, &mut base,
+                    )?;
 
                     let num = workspace.new_num(-1);
 
@@ -517,18 +732,22 @@ impl Token {
                     _ => unreachable!(),
                 };
 
-                let fun = out.to_fun(state.get_symbol(namespace.attach_namespace(name))?);
+                let fun = out.to_fun(Self::parse_symbol(name, namespace, name_map, state)?);
                 let mut atom = workspace.new_atom();
                 for a in args.iter().skip(1) {
-                    a.to_atom_with_output_no_norm(namespace, state, workspace, &mut atom)?;
+                    a.to_atom_with_output_no_norm(
+                        namespace, name_map, state, workspace, &mut atom,
+                    )?;
                     fun.add_arg(atom.as_view());
                 }
             }
             Token::RationalPolynomial(_) => Err(format!(
-                "Optimized rational polynomial input cannot be parsed yet as atom: {}",
-                self
+                "Optimized rational polynomial input cannot be parsed yet as atom: {self}"
             ))?,
-            x => return Err(format!("Unexpected token {}", x)),
+            Token::ParsedMul(a) => {
+                out.set_from_view(&a.as_view());
+            }
+            x => return Err(format!("Unexpected token {x}")),
         }
 
         Ok(())
@@ -538,7 +757,7 @@ impl Token {
     pub fn to_atom_with_output_and_var_map(
         &self,
         workspace: &Workspace,
-        var_map: &Arc<Vec<Variable>>,
+        var_map: &Arc<Vec<PolyVariable>>,
         var_name_map: &[SmartString<LazyCompact>],
         out: &mut Atom,
     ) -> Result<(), String> {
@@ -555,23 +774,23 @@ impl Token {
                     Ok(f) => {
                         // derive precision from string length, should be overestimate
                         if *is_imag {
-                            out.to_num(Complex::new(f.zero(), f.into()).into());
+                            out.to_num(Complex::new(f.zero(), f).into());
                         } else {
                             out.to_num(Coefficient::Float(f.into()));
                         }
                     }
-                    Err(e) => Err(format!("Error parsing number: {}", e))?,
+                    Err(e) => Err(format!("Error parsing number: {e}"))?,
                 },
             },
             Token::ID(name) => {
                 let index = var_name_map
                     .iter()
                     .position(|x| x == name)
-                    .ok_or_else(|| format!("Undefined variable {}", name))?;
-                if let Variable::Symbol(id) = var_map[index] {
+                    .ok_or_else(|| format!("Undefined variable {name}"))?;
+                if let PolyVariable::Symbol(id) = var_map[index] {
                     out.to_var(id);
                 } else {
-                    Err(format!("Undefined variable {}", name))?;
+                    Err(format!("Undefined variable {name}"))?;
                 }
             }
             Token::Op(_, _, op, args) => match op {
@@ -677,8 +896,8 @@ impl Token {
                 let index = var_name_map
                     .iter()
                     .position(|x| x == name)
-                    .ok_or_else(|| format!("Undefined variable {}", name))?;
-                if let Variable::Symbol(id) = var_map[index] {
+                    .ok_or_else(|| format!("Undefined variable {name}"))?;
+                if let PolyVariable::Symbol(id) = var_map[index] {
                     let mut fun_h = workspace.new_atom();
                     let fun = fun_h.to_fun(id);
                     let mut atom = workspace.new_atom();
@@ -694,29 +913,224 @@ impl Token {
 
                     fun_h.as_view().normalize(workspace, out);
                 } else {
-                    Err(format!("Undefined variable {}", name))?;
+                    Err(format!("Undefined variable {name}"))?;
                 }
             }
-            x => return Err(format!("Unexpected token {}", x)),
+            x => return Err(format!("Unexpected token {x}")),
         }
 
         Ok(())
     }
 
+    /// Map Mathematica `FullForm` symbols to internal functions and operators.
+    /// The first argument is the function name.
+    fn map_mathematica_full_form_symbols(args: &mut Vec<Token>) -> Result<Option<Self>, String> {
+        if let Some(Token::ID(name)) = args.first() {
+            match name.as_str() {
+                "Power" => {
+                    let mut args = std::mem::take(args);
+                    args.remove(0);
+                    Ok(Some(Token::Op(false, false, Operator::Pow, args)))
+                }
+                "Times" => {
+                    let mut args = std::mem::take(args);
+                    args.remove(0);
+                    Ok(Some(Token::Op(false, false, Operator::Mul, args)))
+                }
+                "Plus" => {
+                    let mut args = std::mem::take(args);
+                    args.remove(0);
+                    Ok(Some(Token::Op(false, false, Operator::Add, args)))
+                }
+                "Rational" => {
+                    if args.len() != 3 {
+                        return Err("Rational takes exactly two arguments".into());
+                    }
+                    let num = std::mem::replace(&mut args[1], Token::EOF);
+                    let den = std::mem::replace(&mut args[2], Token::EOF);
+                    Ok(Some(Token::Op(
+                        false,
+                        false,
+                        Operator::Mul,
+                        vec![num, Token::Op(false, false, Operator::Inv, vec![den])],
+                    )))
+                }
+                "Complex" => {
+                    if args.len() != 3 {
+                        return Err("Complex takes exactly two arguments".into());
+                    }
+                    let real = std::mem::replace(&mut args[1], Token::EOF);
+                    let imag = std::mem::replace(&mut args[2], Token::EOF);
+
+                    Ok(Some(Token::Op(
+                        false,
+                        false,
+                        Operator::Add,
+                        vec![
+                            real,
+                            Token::Op(
+                                false,
+                                false,
+                                Operator::Mul,
+                                vec![imag, Token::Number("1".into(), true)],
+                            ),
+                        ],
+                    )))
+                }
+                "DirectedInfinity" => {
+                    if args.len() == 1 {
+                        Ok(Some(Token::SpecialNumber('⧞')))
+                    } else if args.len() == 2 {
+                        let arg = std::mem::replace(&mut args[1], Token::EOF);
+                        Ok(Some(Token::Op(
+                            false,
+                            false,
+                            Operator::Mul,
+                            vec![arg, Token::SpecialNumber('∞')],
+                        )))
+                    } else {
+                        Err("DirectedInfinity takes at most one argument".into())
+                    }
+                }
+                "Derivative" | "der" => {
+                    // will be called for every curried argument
+                    args[0] = Token::ID("der".into());
+
+                    let sep = Token::ID(Symbol::SEP_STR.into());
+                    args.retain(|x| *x != sep);
+
+                    let mut function_index = 1;
+                    for x in &args[1..] {
+                        if let Token::Number(_, _) = x {
+                            function_index += 1;
+                        }
+                    }
+
+                    if function_index == args.len() {
+                        return Ok(None);
+                    }
+
+                    // merge curried arguments into one function
+                    // Derivative[2][f][x,y] => der(2,f(x,y))
+                    if let Token::ID(_) = &args[function_index] {
+                        // upgrade argument to function
+                        let fn_arg = args.split_off(function_index);
+                        args.push(Token::Fn(false, false, fn_arg));
+                    } else {
+                        let new_fn_arg = args.split_off(function_index + 1);
+
+                        if let Token::Fn(false, false, fn_arg) = &mut args[function_index] {
+                            fn_arg.extend(new_fn_arg);
+                        } else {
+                            return Err("Derivative function argument is not a function".into());
+                        }
+                    }
+
+                    Ok(None)
+                }
+                "Pattern" => {
+                    if args.len() == 3
+                        && let Some(Token::ID(_)) = args.get(1)
+                        && let Some(Token::Fn(_, _, wildcard_type)) = args.get(2)
+                        && wildcard_type.len() == 1
+                        && let Some(Token::ID(wt)) = wildcard_type.first()
+                    {
+                        let level;
+                        match wt.as_str() {
+                            "Blank" => {
+                                level = 1;
+                            }
+                            "BlankSequence" => {
+                                level = 2;
+                            }
+                            "BlankNullSequence" => {
+                                level = 3;
+                            }
+                            _ => {
+                                return Ok(None);
+                            }
+                        }
+
+                        let mut args = std::mem::take(args);
+                        let mut t = args.swap_remove(1);
+                        if let Token::ID(symbol) = &mut t {
+                            for _ in 0..level {
+                                symbol.push('_');
+                            }
+                        } else {
+                            unreachable!();
+                        }
+
+                        Ok(Some(t))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                "SetAccuracy" => {
+                    if args.len() == 3
+                        && let Some(Token::Number(s, false)) = args.get(1)
+                        && s == "0"
+                        && let Some(Token::Number(prec, false)) = args.get(2)
+                    {
+                        // precision on 0 is treated as accuracy
+                        Ok(Some(Token::Number(SmartString::from("0`") + prec, false)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Parse a Symbolica expression, generating a token tree. For most users,
     /// it is recommended to use [crate::parse] instead, which returns an atom.
-    ///
-    /// Optionally, distribute distribute unary minus operators into sums.
-    pub fn parse(input: &str, distribute_neg: bool) -> Result<Token, String> {
+    pub fn parse(input: &str, settings: ParseSettings) -> Result<Token, String> {
+        Token::parse_with_atom_info::<&'static str>(input, settings, None)
+    }
+
+    /// Parse a Symbolica expression, generating a token tree that may contain
+    /// parsed atom. For most users, it is recommended to use [crate::parse] instead, which returns an atom.
+    pub fn parse_with_atom_info<T>(
+        input: &str,
+        settings: ParseSettings,
+        mut atom_info: Option<(
+            &DefaultNamespace<T>,
+            &mut HashMap<SmartString<LazyCompact>, Symbol>,
+            &Workspace,
+        )>,
+    ) -> Result<Token, String> {
         LicenseManager::check();
+
+        // Remove ANSI color codes from the input string.
+        let mut input = Cow::Borrowed(input);
+        if input.contains('\x1b') {
+            let mut s = String::with_capacity(input.len());
+            let mut in_ansi = false;
+            for c in input.chars() {
+                if c == '\x1b' {
+                    in_ansi = true;
+                } else if in_ansi && c == 'm' {
+                    in_ansi = false;
+                } else if !in_ansi {
+                    s.push(c);
+                }
+            }
+
+            input = Cow::Owned(s);
+        }
+
+        let whitespaces = if settings.mode.is_mathematica() {
+            Token::WHITESPACE_MATHEMATICA.as_slice()
+        } else {
+            Token::WHITESPACE.as_slice()
+        };
 
         let mut stack: Vec<_> = Vec::with_capacity(20);
         stack.push(Token::Start);
         let mut state = ParseState::Any;
-
-        let ops = ['\0', '^', '+', '*', '-', '(', ')', '/', ',', '[', ']'];
-        let whitespace = [' ', '\t', '\n', '\r', '\\'];
-        let forbidden = [';', '&', '!', '%', '.', '"'];
 
         let mut char_iter = input.chars();
         let mut c = char_iter.next().unwrap_or('\0'); // add EOF as a token
@@ -727,22 +1141,97 @@ impl Token {
         let mut line_counter = 1;
         let mut column_counter = 1;
 
+        let mut inside_mathematica_full_form = false;
         loop {
             match state {
                 ParseState::Identifier => {
-                    if ops.contains(&c) || whitespace.contains(&c) {
+                    if inside_mathematica_full_form && c == '[' {
+                        // convert \[Alpha] to ‖Alpha‖
+                        if !id_buffer.ends_with(Symbol::SEP_STR) {
+                            Err(format!(
+                                "Unexpected '{c:?}' in input at line {line_counter} and column {column_counter}"
+                            ))?;
+                        }
+                    } else if inside_mathematica_full_form && c == ']' {
+                        inside_mathematica_full_form = false;
+                        id_buffer.push_str(Symbol::SEP_STR);
+                    } else if Token::OPS.contains(&c) || whitespaces.contains(&c) {
                         state = ParseState::Any;
 
-                        stack.push(Token::ID(id_buffer.as_str().into()));
+                        if settings.mode.is_mathematica() {
+                            match id_buffer.as_str() {
+                                "Pi" => {
+                                    stack.push(Token::ID(Symbol::PI_STR.into()));
+                                }
+                                "E" => {
+                                    stack.push(Token::ID(Symbol::E_STR.into()));
+                                }
+                                "I" => {
+                                    stack.push(Token::Number("1".into(), true));
+                                }
+                                "Sqrt" => {
+                                    stack.push(Token::ID("sqrt".into()));
+                                }
+                                "Cos" => {
+                                    stack.push(Token::ID("cos".into()));
+                                }
+                                "Sin" => {
+                                    stack.push(Token::ID("sin".into()));
+                                }
+                                "Log" => {
+                                    stack.push(Token::ID("log".into()));
+                                }
+                                "Exp" => {
+                                    stack.push(Token::ID("exp".into()));
+                                }
+                                "Conjugate" => {
+                                    stack.push(Token::ID("conj".into()));
+                                }
+                                "Indeterminate" => {
+                                    stack.push(Token::SpecialNumber('¿'));
+                                }
+                                _ => {
+                                    stack.push(Token::ID(id_buffer.as_str().into()));
+                                }
+                            }
+                        } else {
+                            stack.push(Token::ID(id_buffer.as_str().into()));
+                        }
+
                         id_buffer.clear();
-                    } else if !forbidden.contains(&c) {
+                    } else if c == '{' && settings.mode == ParseMode::Symbolica {
+                        while c != '}' && c != '\0' {
+                            id_buffer.push(c);
+                            c = char_iter.next().unwrap_or('\0');
+                            column_counter += 1;
+                        }
+
+                        if c == '\0' {
+                            Err(format!(
+                                "Missing }} of bracket started at line {line_counter} and column {column_counter}"
+                            ))?;
+                        }
+
+                        if Token::OPS.contains(&c) || Token::WHITESPACE.contains(&c) {
+                            state = ParseState::Any;
+
+                            stack.push(Token::ID(id_buffer.as_str().into()));
+                            id_buffer.clear();
+                        }
+
+                        id_buffer.push(c);
+                    } else if settings.mode.is_mathematica() && c == '`' {
+                        id_buffer.push_str("::");
+                    } else if settings.mode.is_mathematica() && c == '\\' {
+                        inside_mathematica_full_form = true;
+                        id_buffer.push_str(Symbol::SEP_STR);
+                    } else if !Token::FORBIDDEN.contains(&c) {
                         id_buffer.push(c);
                     } else {
                         // check for some symbols that could be the result of copy-paste errors
                         // when importing from other languages
                         Err(format!(
-                            "Unexpected '{}' in input at line {} and column {}",
-                            c, line_counter, column_counter
+                            "Unexpected '{c}' in input at line {line_counter} and column {column_counter}"
                         ))?;
                     }
                 }
@@ -752,6 +1241,7 @@ impl Token {
                         if c.is_ascii_digit() {
                             id_buffer.push(c);
                             c = char_iter.next().unwrap_or('\0');
+                            column_counter += 1;
                             last_digit_is_exp = false;
                             continue;
                         }
@@ -776,8 +1266,9 @@ impl Token {
                             let old_c = c;
                             // complex number has trailing i and must be followed by whitespace or an operator
                             c = char_iter.next().unwrap_or('\0');
+                            column_counter += 1;
 
-                            let is_imag = whitespace.contains(&c) || ops.contains(&c);
+                            let is_imag = Token::WHITESPACE.contains(&c) || Token::OPS.contains(&c);
 
                             state = ParseState::Any;
                             stack.push(Token::Number(id_buffer.as_str().into(), is_imag));
@@ -798,6 +1289,19 @@ impl Token {
                             break;
                         }
 
+                        if settings.mode.is_mathematica() && c == '*' {
+                            c = char_iter.next().unwrap_or('\0');
+                            column_counter += 1;
+
+                            if c == '^' {
+                                c = 'e';
+                            } else {
+                                extra_ops.push(c);
+                                c = '*';
+                                break;
+                            }
+                        }
+
                         let digit_is_exp = c == 'e' || c == 'E';
 
                         if c != '_' && c != ' ' {
@@ -811,6 +1315,7 @@ impl Token {
                         last_digit_is_exp = digit_is_exp;
 
                         c = char_iter.next().unwrap_or('\0');
+                        column_counter += 1;
                     }
 
                     if !last_digit_is_exp {
@@ -829,12 +1334,12 @@ impl Token {
                     while c != ']' && c != '\0' {
                         pos += 1;
                         c = char_iter.next().unwrap_or('\0');
+                        column_counter += 1;
                     }
 
                     if c == '\0' {
                         Err(format!(
-                            "Missing ] of bracket started at line {} and column {}",
-                            line_counter, column_counter
+                            "Missing ] of bracket started at line {line_counter} and column {column_counter}"
                         ))?;
                     }
 
@@ -845,12 +1350,13 @@ impl Token {
 
                     column_counter += pos + 1;
                     c = char_iter.next().unwrap_or('\0');
+                    column_counter += 1;
                 }
                 ParseState::Any => {}
             }
 
             if state == ParseState::Any {
-                if whitespace.contains(&c) {
+                if whitespaces.contains(&c) {
                     if c == '\n' {
                         column_counter = 1;
                         line_counter += 1;
@@ -895,7 +1401,9 @@ impl Token {
                     }
                     '(' => {
                         // check if the opening bracket belongs to a function
-                        if let Some(Token::ID(_)) = stack.last() {
+                        if settings.mode == ParseMode::Symbolica
+                            && let Some(Token::ID(_)) = stack.last()
+                        {
                             let name = unsafe { stack.pop().unwrap_unchecked() };
                             if let Token::ID(_) = name {
                                 stack.push(Token::Fn(true, false, vec![name])); // serves as open paren
@@ -933,16 +1441,58 @@ impl Token {
                                 if let Token::ID(_) = name {
                                     stack.push(Token::Fn(true, true, vec![name]));
                                 }
-                            } else {
+                            } else if settings.mode == ParseMode::Symbolica {
                                 // insert multiplication: f(x)[3,4] -> f(x)*[3,4]
                                 stack.push(Token::Op(true, true, Operator::Mul, vec![]));
                                 extra_ops.push(c);
+                            } else if settings.mode == ParseMode::Mathematica
+                                && let Token::Fn(need_more, _, args) =
+                                    unsafe { stack.last_mut().unwrap_unchecked() }
+                            {
+                                // parse curried functions, e.g. f[x][y]
+                                *need_more = true;
+                                args.push(Token::ID(Symbol::SEP_STR.into()));
+                            } else {
+                                Err(format!(
+                                    "Unexpected '[' in input at line {line_counter} and column {column_counter}"
+                                ))?;
                             }
-                        } else {
+                        } else if settings.mode == ParseMode::Symbolica {
                             state = ParseState::RationalPolynomial;
+                        } else {
+                            Err(format!(
+                                "Unexpected '[' in input at line {line_counter} and column {column_counter}"
+                            ))?;
                         }
                     }
                     ']' => stack.push(Token::CloseBracket),
+                    '"' => {
+                        if !settings.mode.is_mathematica() {
+                            Err(format!(
+                                "Unexpected '\"' in input at line {line_counter} and column {column_counter}"
+                            ))?;
+                        }
+
+                        // parse a string as a literal id in the current namespace
+                        id_buffer.clear();
+                        let mut escape = true;
+                        while (escape || c != '"') && c != '\0' {
+                            id_buffer.push(c);
+                            escape = c == '\\';
+                            c = char_iter.next().unwrap_or('\0');
+                            column_counter += 1;
+                        }
+
+                        if c == '\0' {
+                            Err(format!(
+                                "Unexpected 'EOF' in input at line {line_counter} and column {column_counter}"
+                            ))?;
+                        }
+
+                        id_buffer.push(c);
+                        stack.push(Token::ID(id_buffer.as_str().into()));
+                        id_buffer.clear();
+                    }
                     _ => {
                         if unsafe { stack.last().unwrap_unchecked() }.is_normal()
                             && (!c.is_ascii_digit()
@@ -959,13 +1509,20 @@ impl Token {
                         } else if c.is_ascii_digit() {
                             state = ParseState::Number;
                             id_buffer.push(c);
-                        } else if !forbidden.contains(&c) {
+                        } else if c == '¿' || c == '⧞' || c == '∞' {
+                            stack.push(Token::SpecialNumber(c));
+                        } else if !Token::FORBIDDEN.contains(&c) {
                             state = ParseState::Identifier;
-                            id_buffer.push(c);
+
+                            if settings.mode.is_mathematica() && c == '\\' {
+                                inside_mathematica_full_form = true;
+                                id_buffer.push_str(Symbol::SEP_STR);
+                            } else {
+                                id_buffer.push(c);
+                            }
                         } else {
                             Err(format!(
-                                "Unexpected '{}' in input at line {} and column {}",
-                                c, line_counter, column_counter
+                                "Unexpected '{c}' in input at line {line_counter} and column {column_counter}"
                             ))?;
                         }
                     }
@@ -981,8 +1538,7 @@ impl Token {
                     match unsafe { stack.get_unchecked(stack.len() - 1) } {
                         Token::Op(true, _, op, _) => {
                             Err(format!(
-                                "Error at line {} and position {}: operator '{}' is missing left-hand side",
-                                line_counter, column_counter, op,
+                                "Error at line {line_counter} and position {column_counter}: operator '{op}' is missing left-hand side",
                             ))?;
                         }
 
@@ -990,13 +1546,21 @@ impl Token {
                             let c = x.clone();
                             let pos = stack.len() - 2;
                             // check if we have an empty function
-                            if let Token::Fn(f, bracket, _) =
+                            if let Token::Fn(f, bracket, args) =
                                 unsafe { stack.get_unchecked_mut(pos) }
                             {
                                 if c == Token::CloseParenthesis && !*bracket
                                     || c == Token::CloseBracket && *bracket
                                 {
                                     *f = false;
+
+                                    if settings.mode.is_mathematica()
+                                        && let Some(rewrite) =
+                                            Token::map_mathematica_full_form_symbols(args)?
+                                    {
+                                        *unsafe { stack.get_unchecked_mut(pos) } = rewrite;
+                                    }
+
                                     stack.pop();
                                 } else {
                                     Err(format!(
@@ -1036,20 +1600,19 @@ impl Token {
 
                 match first.get_precedence().cmp(&last.get_precedence()) {
                     std::cmp::Ordering::Greater => {
-                        first.add_right(middle, distribute_neg).map_err(|e| {
-                            format!(
-                                "Error at line {} and position {}: ",
-                                line_counter, column_counter
-                            ) + e.as_str()
-                        })?;
+                        first
+                            .add_right(middle, settings.distribute_neg)
+                            .map_err(|e| {
+                                format!(
+                                    "Error at line {line_counter} and position {column_counter}: "
+                                ) + e.as_str()
+                            })?;
                         stack.push(last);
                     }
                     std::cmp::Ordering::Less => {
                         last.add_left(middle).map_err(|e| {
-                            format!(
-                                "Error at line {} and position {}: ",
-                                line_counter, column_counter
-                            ) + e.as_str()
+                            format!("Error at line {line_counter} and position {column_counter}: ")
+                                + e.as_str()
                         })?;
 
                         stack.push(last);
@@ -1088,6 +1651,13 @@ impl Token {
                                 } else {
                                     args.push(mid);
                                 }
+
+                                if settings.mode.is_mathematica()
+                                    && let Some(rewrite) =
+                                        Token::map_mathematica_full_form_symbols(args)?
+                                {
+                                    *first = rewrite;
+                                }
                             }
                             (Token::OpenParenthesis, mid, Token::CloseParenthesis) => {
                                 *first = mid;
@@ -1107,7 +1677,33 @@ impl Token {
                                     if o_mid == *o1 && o_mid.right_associative() {
                                         m.append(&mut m_mid);
                                     } else {
-                                        m.push(Token::Op(false, false, o_mid, m_mid));
+                                        if settings.convert_mul_to_atom
+                                            && o_mid == Operator::Mul
+                                            && let Some((ns, name_map, ws)) = &mut atom_info
+                                        {
+                                            // convert a finished multiplication sandwiched between
+                                            // two additions (a term) into an atom
+                                            // this representation will be more memory efficient
+                                            let t = Token::Op(false, false, o_mid, m_mid);
+
+                                            let mut atom = ws.new_atom();
+
+                                            {
+                                                let mut state =
+                                                    State::get_global_state().write().unwrap();
+                                                // do not normalize to prevent potential deadlocks
+                                                t.to_atom_with_output_no_norm(
+                                                    ns, name_map, &mut state, ws, &mut atom,
+                                                )?;
+                                            }
+
+                                            let mut norm = ws.new_atom();
+                                            atom.as_view().normalize(ws, &mut norm);
+
+                                            m.push(Token::ParsedMul(Box::new(norm)));
+                                        } else {
+                                            m.push(Token::Op(false, false, o_mid, m_mid));
+                                        }
                                     }
                                 } else {
                                     m.push(mid)
@@ -1155,8 +1751,7 @@ impl Token {
         } else {
             match stack.get(stack.len() - 2) {
                 Some(Token::Op(false, true, op, _)) => Err(format!(
-                    "Unexpected end of input: missing right-hand side for operator '{}'",
-                    op
+                    "Unexpected end of input: missing right-hand side for operator '{op}'"
                 )),
                 Some(Token::OpenParenthesis) => {
                     Err("Unexpected end of input: open parenthesis is not closed".to_string())
@@ -1167,7 +1762,7 @@ impl Token {
                     args[0]
                 )),
                 Some(Token::Start) => Err("Expression is empty".to_string()),
-                _ => Err(format!("Unknown parsing error: {:?}", stack)),
+                _ => Err(format!("Unknown parsing error: {stack:?}")),
             }
         }
     }
@@ -1176,7 +1771,7 @@ impl Token {
     /// where the coefficient comes first.
     pub fn parse_polynomial<'a, R: Ring + ConvertToRing, E: PositiveExponent>(
         mut input: &'a [u8],
-        var_map: &Arc<Vec<Variable>>,
+        var_map: &Arc<Vec<PolyVariable>>,
         var_name_map: &[SmartString<LazyCompact>],
         field: &R,
     ) -> (&'a [u8], MultivariatePolynomial<R, E>) {
@@ -1242,10 +1837,10 @@ impl Token {
                     if !is_hex && len <= 40 {
                         let n = unsafe { std::str::from_utf8_unchecked(&num_start[..len]) };
 
-                        if len <= 20 {
-                            if let Ok(n) = n.parse::<i64>() {
-                                break 'read_coeff field.element_from_coefficient(n.into());
-                            }
+                        if len <= 20
+                            && let Ok(n) = n.parse::<i64>()
+                        {
+                            break 'read_coeff field.element_from_coefficient(n.into());
                         }
 
                         if let Ok(n) = n.parse::<i128>() {
@@ -1269,7 +1864,7 @@ impl Token {
                                 .map(|&x| HEX_TO_DIGIT[(x - b'0') as usize]),
                         );
                     } else {
-                        digit_buffer.extend(digits.iter().map(|&x| (x - b'0')));
+                        digit_buffer.extend(digits.iter().map(|&x| x - b'0'));
                     }
 
                     let mut p = MultiPrecisionInteger::new();
@@ -1387,8 +1982,62 @@ mod test {
     use std::sync::Arc;
 
     use crate::{
-        atom::AtomCore, domains::integer::Z, parse, parser::Token, printer::PrintOptions, symbol,
+        atom::{AtomCore, SymbolAttribute},
+        domains::{SelfRing, integer::Z},
+        parse,
+        parser::Token,
+        printer::{PrintOptions, PrintState},
+        symbol,
     };
+
+    #[test]
+    fn mathematica() {
+        let a = parse!("cos(x+2i + 3)+sqrt(conj(x)) + test::y + exp(test::test2::x) + log(α)");
+        let s = a.format_string(&PrintOptions::mathematica(), PrintState::default());
+        let b = parse!(s, Mathematica);
+        assert_eq!(a, b);
+
+        let input = "a\\[Alpha]b+\\[Beta]";
+        let b = parse!(input, Mathematica);
+        assert_eq!(b, parse!("a‖Alpha‖b+‖Beta‖"));
+        let s = b.format_string(&PrintOptions::mathematica(), PrintState::default());
+        assert_eq!(s, input);
+
+        let input =
+            "Pattern[f, Blank[]][Pattern[x, BlankSequence[]], Pattern[v, BlankNullSequence[]]]";
+        let b = parse!(input, Mathematica);
+        assert_eq!(b, parse!("f_(x__, v___)"));
+
+        let a = parse!("2*x+2*^5y + SetAccuracy[0, 10.]", Mathematica);
+        assert_eq!(a, parse!("2*x+2e5*y"));
+
+        let a = parse!("\"a b $ * \\\" / // c\"", Mathematica);
+        assert!(a.get_symbol().is_some());
+    }
+
+    #[test]
+    fn attributes() {
+        let input = parse!("symbolica::b::{linear,symmetric,test::a}::dot_ls");
+        let s = input.get_symbol().unwrap();
+        assert_eq!(s.get_name(), "symbolica::b::dot_ls");
+        assert_eq!(
+            s.get_attributes(),
+            vec![SymbolAttribute::Symmetric, SymbolAttribute::Linear,]
+        );
+        assert_eq!(s.get_tags(), vec!["test::a"]);
+
+        let input = parse!("symbolica::{}::f1()").get_symbol().unwrap();
+        assert_eq!(input.get_name(), "symbolica::f1");
+    }
+
+    #[test]
+    fn infinity() {
+        let input = parse!("∞ + 5 - ¿ + 3*⧞ - ∞");
+        assert_eq!(
+            format!("{}", input.printer(PrintOptions::file_no_namespace())),
+            "¿"
+        );
+    }
 
     #[test]
     fn pow() {
@@ -1457,5 +2106,12 @@ mod test {
             input,
             parse!("5+2748*v1^2*v2").to_polynomial(&Z, var_map.clone())
         );
+    }
+
+    #[test]
+    fn two_way_parse() {
+        let input = parse!("a::{real}::b(c)");
+        let s = input.to_canonical_string();
+        assert_eq!(parse!(s), input);
     }
 }

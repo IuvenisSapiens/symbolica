@@ -11,7 +11,7 @@ use rand::{Rng, rng};
 
 use crate::{
     atom::{Atom, AtomView, KeyLookup},
-    domains::{Ring, float::Real},
+    domains::{Ring, RingOps, float::Real},
     evaluate::EvaluationFn,
 };
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
     coefficient::CoefficientView,
     domains::{
         EuclideanDomain,
-        float::NumericalFloatLike,
+        float::FloatLike,
         rational::{Q, Rational, RationalField},
     },
     state::Workspace,
@@ -232,14 +232,14 @@ impl HornerScheme<RationalField> {
                 let e = match &n.content_rest.0 {
                     Some(s) => match &n.content_rest.1 {
                         Some(s1) => Q.add(
-                            &Q.mul(&Q.pow(&samples[n.var], n.pow as u64), &s.evaluate(samples)),
-                            &s1.evaluate(samples),
+                            Q.mul(Q.pow(&samples[n.var], n.pow as u64), s.evaluate(samples)),
+                            s1.evaluate(samples),
                         ),
-                        None => Q.mul(&Q.pow(&samples[n.var], n.pow as u64), &s.evaluate(samples)),
+                        None => Q.mul(Q.pow(&samples[n.var], n.pow as u64), s.evaluate(samples)),
                     },
                     None => match &n.content_rest.1 {
                         Some(s1) => {
-                            Q.add(&Q.pow(&samples[n.var], n.pow as u64), &s1.evaluate(samples))
+                            Q.add(Q.pow(&samples[n.var], n.pow as u64), s1.evaluate(samples))
                         }
                         None => Q.pow(&samples[n.var], n.pow as u64),
                     },
@@ -285,7 +285,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HornerScheme::Leaf(_, l) => f.write_fmt(format_args!("{:?}", l)),
+            HornerScheme::Leaf(_, l) => f.write_fmt(format_args!("{l:?}")),
             HornerScheme::Node(n) => {
                 f.write_fmt(format_args!("+{:?}*(", n.gcd))?;
 
@@ -774,7 +774,7 @@ impl HornerScheme<RationalField> {
                                     return *a;
                                 }
 
-                                if p % 2 == 0 {
+                                if p.is_multiple_of(2) {
                                     let p_half = bin_exp(var, p / 2, instr, seen);
                                     instr.push(Instruction::Mul(vec![p_half, p_half]));
                                 } else {
@@ -838,7 +838,7 @@ impl HornerScheme<RationalField> {
 
 // An arithmetical instruction that is part of an `InstructionList`.
 #[derive(Debug, Clone)]
-pub enum Instruction<N: NumericalFloatLike> {
+pub enum Instruction<N: FloatLike> {
     Init(Variable<N>),
     Add(Vec<usize>),
     Mul(Vec<usize>),
@@ -849,44 +849,43 @@ pub enum Instruction<N: NumericalFloatLike> {
 // An variable that is part of an `InstructionList`,
 // which may refer to another instruction in the instruction list.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Variable<N: NumericalFloatLike> {
+pub enum Variable<N: FloatLike> {
     Var(usize, Option<usize>), // var or var[index]
     Constant(N),
 }
 
 impl Variable<Rational> {
-    fn to_pretty_string(&self, var_map: &[super::Variable], mode: InstructionSetMode) -> String {
+    fn to_pretty_string(
+        &self,
+        var_map: &[super::PolyVariable],
+        mode: InstructionSetMode,
+    ) -> String {
         match self {
             Variable::Var(v, index) => {
                 // convert f(0) to f[0]
-                if let super::Variable::Function(_, f) = &var_map[*v] {
-                    if let AtomView::Fun(f) = f.as_view() {
-                        if f.get_nargs() == 1 {
-                            if let Some(a) = f.iter().next() {
-                                if let AtomView::Num(n) = a {
-                                    if let CoefficientView::Natural(n, d, ni, _di) =
-                                        n.get_coeff_view()
-                                    {
-                                        if d == 1 && ni == 0 && n >= 0 {
-                                            return format!("{}[{}]", f.get_symbol(), a);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if let super::PolyVariable::Function(_, f) = &var_map[*v]
+                    && let AtomView::Fun(f) = f.as_view()
+                    && f.get_nargs() == 1
+                    && let Some(a) = f.iter().next()
+                    && let AtomView::Num(n) = a
+                    && let CoefficientView::Natural(n, d, ni, _di) = n.get_coeff_view()
+                    && d == 1
+                    && ni == 0
+                    && n >= 0
+                {
+                    return format!("{}[{}]", f.get_symbol(), a);
                 }
 
                 let mut s = var_map[*v].to_string();
 
                 if let Some(index) = index {
-                    s.push_str(&format!("[{}]", index));
+                    s.push_str(&format!("[{index}]"));
                 }
 
                 s
             }
             Variable::Constant(c) => match mode {
-                InstructionSetMode::Plain => format!("{}", c),
+                InstructionSetMode::Plain => format!("{c}"),
                 InstructionSetMode::CPP(_) => {
                     if c.is_integer() {
                         format!("T({})", c.numerator_ref())
@@ -899,14 +898,14 @@ impl Variable<Rational> {
     }
 }
 
-impl<N: NumericalFloatLike> std::fmt::Display for Variable<N> {
+impl<N: FloatLike> std::fmt::Display for Variable<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Variable::Var(v, index) => {
                 if let Some(index) = index {
-                    f.write_fmt(format_args!("x[{}][{}]", v, index))
+                    f.write_fmt(format_args!("x[{v}][{index}]"))
                 } else {
-                    f.write_fmt(format_args!("x{}", v))
+                    f.write_fmt(format_args!("x{v}"))
                 }
             }
             Variable::Constant(c) => <N as std::fmt::Display>::fmt(c, f),
@@ -914,8 +913,8 @@ impl<N: NumericalFloatLike> std::fmt::Display for Variable<N> {
     }
 }
 
-impl<N: NumericalFloatLike> Variable<N> {
-    pub fn convert<NO: NumericalFloatLike, F: Fn(&N) -> NO>(&self, coeff_map: F) -> Variable<NO> {
+impl<N: FloatLike> Variable<N> {
+    pub fn convert<NO: FloatLike, F: Fn(&N) -> NO>(&self, coeff_map: F) -> Variable<NO> {
         match self {
             Variable::Var(v, index) => Variable::Var(*v, *index),
             Variable::Constant(c) => Variable::Constant(coeff_map(c)),
@@ -1013,33 +1012,32 @@ impl InstructionList {
 
         for i in 0..self.instr.len() {
             // we could be in chain of single use -> single use -> etc so work from the start
-            if let Instruction::Add(a) | Instruction::Mul(a) = &self.instr[i] {
-                if a.iter().any(|v| use_count[*v] == 1) {
-                    let mut instr = std::mem::replace(&mut self.instr[i], Instruction::Empty);
+            if let Instruction::Add(a) | Instruction::Mul(a) = &self.instr[i]
+                && a.iter().any(|v| use_count[*v] == 1)
+            {
+                let mut instr = std::mem::replace(&mut self.instr[i], Instruction::Empty);
 
-                    if let Instruction::Add(a) | Instruction::Mul(a) = &mut instr {
-                        let mut new_a = Vec::with_capacity(a.len());
-                        for v in a.drain(..) {
-                            if use_count[v] == 1 {
-                                if let Instruction::Add(aa) | Instruction::Mul(aa) = &self.instr[v]
-                                {
-                                    for x in aa {
-                                        new_a.push(*x);
-                                    }
-                                    self.instr[v] = Instruction::Empty;
-                                } else {
-                                    unreachable!()
+                if let Instruction::Add(a) | Instruction::Mul(a) = &mut instr {
+                    let mut new_a = Vec::with_capacity(a.len());
+                    for v in a.drain(..) {
+                        if use_count[v] == 1 {
+                            if let Instruction::Add(aa) | Instruction::Mul(aa) = &self.instr[v] {
+                                for x in aa {
+                                    new_a.push(*x);
                                 }
+                                self.instr[v] = Instruction::Empty;
                             } else {
-                                new_a.push(v);
+                                unreachable!()
                             }
+                        } else {
+                            new_a.push(v);
                         }
-                        new_a.sort();
-                        *a = new_a;
                     }
-
-                    self.instr[i] = instr;
+                    new_a.sort();
+                    *a = new_a;
                 }
+
+                self.instr[i] = instr;
             }
         }
 
@@ -1248,7 +1246,7 @@ impl InstructionList {
     /// the computational memory needed for evaluations.
     pub fn to_output(
         self,
-        input_map: Vec<super::Variable>,
+        input_map: Vec<super::PolyVariable>,
         recycle_registers: bool,
     ) -> InstructionListOutput<Rational> {
         if !recycle_registers {
@@ -1322,9 +1320,9 @@ impl InstructionList {
 }
 
 /// A list of instructions suitable for fast numerical evaluation.
-pub struct InstructionListOutput<N: NumericalFloatLike> {
+pub struct InstructionListOutput<N: FloatLike> {
     instr: Vec<(usize, Instruction<N>)>,
-    input_map: Vec<super::Variable>,
+    input_map: Vec<super::PolyVariable>,
 }
 
 /// An efficient structure that performs a range of operations.
@@ -1353,15 +1351,15 @@ enum InstructionRange {
 /// indices in the `Z` array and their evaluation can therefore
 /// be done efficiently.
 #[derive(Clone)]
-pub struct InstructionEvaluator<N: NumericalFloatLike> {
-    input_map: Vec<super::Variable>,
+pub struct InstructionEvaluator<N: FloatLike> {
+    input_map: Vec<super::PolyVariable>,
     instr: Vec<InstructionRange>,
     indices: Vec<usize>,
     eval: Vec<N>, // evaluation buffer
     out: Vec<N>,  // output buffer
 }
 
-impl<N: NumericalFloatLike> InstructionEvaluator<N> {
+impl<N: FloatLike> InstructionEvaluator<N> {
     pub fn output_len(&self) -> usize {
         let mut len = 0;
         for x in &self.instr {
@@ -1473,16 +1471,16 @@ impl<N: Real + for<'b> From<&'b Rational>> InstructionEvaluator<N> {
         Workspace::get_local().with(|ws| {
             for (input, expr) in self.eval.iter_mut().zip(&self.input_map) {
                 match expr {
-                    super::Variable::Symbol(s) => {
+                    super::PolyVariable::Symbol(s) => {
                         *input = const_map
                             .get(ws.new_var(*s).as_view().get_data())
                             .expect("Variable not found")
                             .clone();
                     }
-                    super::Variable::Function(_, o) | super::Variable::Other(o) => {
+                    super::PolyVariable::Function(_, o) | super::PolyVariable::Power(o) => {
                         *input = o.evaluate(coeff_map, const_map, function_map).unwrap();
                     }
-                    super::Variable::Temporary(_) => panic!("Temporary variable in input"),
+                    super::PolyVariable::Temporary(_) => panic!("Temporary variable in input"),
                 }
             }
         });
@@ -1491,17 +1489,15 @@ impl<N: Real + for<'b> From<&'b Rational>> InstructionEvaluator<N> {
     }
 }
 
-impl<N: NumericalFloatLike> InstructionListOutput<N> {
+impl<N: FloatLike> InstructionListOutput<N> {
     /// Convert all numbers in the instruction list from the field `N` to the field `NO`.
-    pub fn convert<'a, NO: NumericalFloatLike + for<'b> From<&'b N>>(
-        &'a self,
-    ) -> InstructionListOutput<NO> {
+    pub fn convert<'a, NO: FloatLike + for<'b> From<&'b N>>(&'a self) -> InstructionListOutput<NO> {
         self.convert_with_map(|x| x.into())
     }
 
     /// Convert all numbers in the instruction list from the field `N` to the field `NO`,
     /// using a custom map function.
-    pub fn convert_with_map<NO: NumericalFloatLike, F: Fn(&N) -> NO + Copy>(
+    pub fn convert_with_map<NO: FloatLike, F: Fn(&N) -> NO + Copy>(
         &self,
         coeff_map: F,
     ) -> InstructionListOutput<NO> {
@@ -1576,7 +1572,7 @@ impl std::fmt::Display for InstructionList {
                     "Z{} = {};\n",
                     reg,
                     a.iter()
-                        .map(|x| format!("Z{}", x))
+                        .map(|x| format!("Z{x}"))
                         .collect::<Vec<_>>()
                         .join("+")
                 ))?,
@@ -1584,16 +1580,16 @@ impl std::fmt::Display for InstructionList {
                     "Z{} = {};\n",
                     reg,
                     m.iter()
-                        .map(|x| format!("Z{}", x))
+                        .map(|x| format!("Z{x}"))
                         .collect::<Vec<_>>()
                         .join("*")
                 ))?,
                 Instruction::Yield(y) => {
-                    f.write_fmt(format_args!("OUT{} = Z{};\n", out_counter, y))?;
+                    f.write_fmt(format_args!("OUT{out_counter} = Z{y};\n"))?;
                     out_counter += 1;
                 }
-                Instruction::Empty => f.write_fmt(format_args!("Z{} = NOP;\n", reg))?,
-                Instruction::Init(i) => f.write_fmt(format_args!("Z{} = {};\n", reg, i))?,
+                Instruction::Empty => f.write_fmt(format_args!("Z{reg} = NOP;\n"))?,
+                Instruction::Init(i) => f.write_fmt(format_args!("Z{reg} = {i};\n"))?,
             }
         }
 
@@ -1663,22 +1659,22 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
                 self.instr
                     .input_map
                     .iter()
-                    .filter_map(|x| if let super::Variable::Function(x, _) = x {
+                    .filter_map(|x| if let super::PolyVariable::Function(x, _) = x {
                         if !seen_arrays.contains(x) {
                             seen_arrays.push(*x);
 
-                            Some(format!("T* {}", super::Variable::Symbol(*x)))
+                            Some(format!("T* {}", super::PolyVariable::Symbol(*x)))
                         } else {
                             None
                         }
-                    } else if let super::Variable::Symbol(i) = x {
-                        if [Atom::E, Atom::PI].contains(i) {
+                    } else if let super::PolyVariable::Symbol(i) = x {
+                        if [Symbol::E, Symbol::PI].contains(i) {
                             None
                         } else {
-                            Some(format!("T {}", x))
+                            Some(format!("T {x}"))
                         }
                     } else {
-                        Some(format!("T {}", x))
+                        Some(format!("T {x}"))
                     })
                     .collect::<Vec<_>>()
                     .join(","),
@@ -1689,7 +1685,7 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
             f.write_fmt(format_args!(
                 "\tT {};\n",
                 (0..=max_register)
-                    .map(|x| format!("Z{}", x))
+                    .map(|x| format!("Z{x}"))
                     .collect::<Vec<_>>()
                     .join(","),
             ))?;
@@ -1703,7 +1699,7 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
                     "\tZ{} = {};\n",
                     reg,
                     a.iter()
-                        .map(|x| format!("Z{}", x))
+                        .map(|x| format!("Z{x}"))
                         .collect::<Vec<_>>()
                         .join("+")
                 ))?,
@@ -1711,26 +1707,26 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
                     "\tZ{} = {};\n",
                     reg,
                     m.iter()
-                        .map(|x| format!("Z{}", x))
+                        .map(|x| format!("Z{x}"))
                         .collect::<Vec<_>>()
                         .join("*")
                 ))?,
                 Instruction::Yield(y) => {
                     match self.mode {
                         InstructionSetMode::Plain => {
-                            f.write_fmt(format_args!("\tOUT{} = Z{};\n", out_counter, y))?
+                            f.write_fmt(format_args!("\tOUT{out_counter} = Z{y};\n"))?
                         }
                         InstructionSetMode::CPP(_) => {
                             if use_return_value {
-                                f.write_fmt(format_args!("\treturn Z{};\n", y))?
+                                f.write_fmt(format_args!("\treturn Z{y};\n"))?
                             } else {
-                                f.write_fmt(format_args!("\tout[{}] = Z{};\n", out_counter, y))?
+                                f.write_fmt(format_args!("\tout[{out_counter}] = Z{y};\n"))?
                             }
                         }
                     }
                     out_counter += 1;
                 }
-                Instruction::Empty => f.write_fmt(format_args!("\tZ{} = NOP;\n", reg))?,
+                Instruction::Empty => f.write_fmt(format_args!("\tZ{reg} = NOP;\n"))?,
                 Instruction::Init(x) => f.write_fmt(format_args!(
                     "\tZ{} = {};\n",
                     reg,
@@ -1758,7 +1754,7 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
                         out_counter,
                         points.join(","),
                         (0..out_counter)
-                            .map(|i| format!("out[{}]", i))
+                            .map(|i| format!("out[{i}]"))
                             .collect::<Vec<_>>()
                             .join(" << \", \" << ")
                     ))?;
@@ -1773,12 +1769,12 @@ impl std::fmt::Display for InstructionSetPrinter<'_> {
 /// A computational graph with efficient output evaluation for a nesting of variable identifications (`x_n = x_{n-1} + 2*x_{n-2}`, etc).
 pub struct ExpressionEvaluator {
     operations: Vec<(
-        super::Variable,
+        super::PolyVariable,
         usize,
         InstructionListOutput<Rational>,
-        Vec<super::Variable>,
+        Vec<super::PolyVariable>,
     )>,
-    input: Vec<super::Variable>,
+    input: Vec<super::PolyVariable>,
 }
 
 impl ExpressionEvaluator {
@@ -1839,16 +1835,16 @@ impl ExpressionEvaluator {
                 let call_args = var_map
                     .iter()
                     .filter_map(|x| {
-                        if let super::Variable::Function(x, _) = x {
+                        if let super::PolyVariable::Function(x, _) = x {
                             if !seen_arrays.contains(x) {
                                 seen_arrays.push(*x);
 
-                                Some(super::Variable::Symbol(*x))
+                                Some(super::PolyVariable::Symbol(*x))
                             } else {
                                 None
                             }
-                        } else if let super::Variable::Symbol(i) = x {
-                            if [Atom::E, Atom::PI].contains(i) {
+                        } else if let super::PolyVariable::Symbol(i) = x {
+                            if [Symbol::E, Symbol::PI].contains(i) {
                                 None
                             } else {
                                 Some(x.clone())
@@ -1859,7 +1855,7 @@ impl ExpressionEvaluator {
                     })
                     .collect::<Vec<_>>();
 
-                overall_ops.push((super::Variable::Symbol(id), h.len(), o, call_args));
+                overall_ops.push((super::PolyVariable::Symbol(id), h.len(), o, call_args));
             }
         }
 
@@ -1882,7 +1878,7 @@ impl ExpressionEvaluator {
     }
 
     /// Get the list of input variables that have to be provided in this order to the generated evaluation function.
-    pub fn get_input(&self) -> &[super::Variable] {
+    pub fn get_input(&self) -> &[super::PolyVariable] {
         &self.input
     }
 }
@@ -1920,7 +1916,7 @@ auto 𝑖 = 1i;\n",
             "void evaluate({}, T* {}_res) {{\n",
             self.input
                 .iter()
-                .map(|x| format!("T* {}", x))
+                .map(|x| format!("T* {x}"))
                 .collect::<Vec<_>>()
                 .join(", "),
             last
@@ -1930,7 +1926,7 @@ auto 𝑖 = 1i;\n",
             let name = id.to_string();
 
             if *id != last {
-                f.write_fmt(format_args!("\tT {}_res[{}];\n", name, out_len))?;
+                f.write_fmt(format_args!("\tT {name}_res[{out_len}];\n"))?;
             }
 
             let mut f_args: Vec<_> = args
@@ -1943,7 +1939,7 @@ auto 𝑖 = 1i;\n",
                     }
                 })
                 .collect();
-            f_args.push(format!("{}_res", name));
+            f_args.push(format!("{name}_res"));
 
             f.write_fmt(format_args!("\t{}({});\n", name, f_args.join(",")))?;
         }
@@ -1954,6 +1950,8 @@ auto 𝑖 = 1i;\n",
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use crate::{
         atom::AtomCore,
         domains::{float::Complex, rational::Q},
@@ -1962,6 +1960,7 @@ mod test {
             evaluate::{BorrowedHornerScheme, InstructionSetPrinter},
             polynomial::MultivariatePolynomial,
         },
+        symbol,
     };
 
     use wide::f64x4;
@@ -2018,7 +2017,11 @@ a0^2*a2*b2^2*b3^3-2*a0^2*a2*b1*b3^4-a0^2*a1*b2*b3^4+a0^3*b3^5";
 
     #[test]
     fn res_53() {
-        let poly: MultivariatePolynomial<_, u8> = parse!(RES_53).to_polynomial(&Q, None);
+        let vars = ["a0", "a1", "a2", "a3", "a4", "a5", "b0", "b1", "b2", "b3"];
+        let vars = vars.iter().map(|x| symbol!(x).into()).collect::<Vec<_>>();
+
+        let poly: MultivariatePolynomial<_, u8> =
+            parse!(RES_53).to_polynomial(&Q, Some(Arc::new(vars)));
 
         let (h, _ops, scheme) = poly.optimize_horner_scheme(1000);
         let mut i = h.to_instr(poly.nvars());
@@ -2060,7 +2063,7 @@ a0^2*a2*b2^2*b3^3-2*a0^2*a2*b1*b3^4-a0^2*a1*b2*b3^4+a0^3*b3^5";
         let res = evaluator
             .evaluate_with_input(&(0..poly.nvars()).map(|x| x as f64 + 1.).collect::<Vec<_>>())[0];
 
-        assert_eq!(res, 280944.);
+        assert_eq!(res, -1167748.);
 
         // evaluate with simd
         let o_f64x4 = o.convert::<f64x4>();
@@ -2072,7 +2075,10 @@ a0^2*a2*b2^2*b3^3-2*a0^2*a2*b1*b3^4-a0^2*a1*b2*b3^4+a0^3*b3^5";
                 .collect::<Vec<_>>(),
         )[0];
 
-        assert_eq!(res, f64x4::new([280944.0, 645000.0, 1774950.0, 4985154.0]));
+        assert_eq!(
+            res,
+            f64x4::new([-1167748., -3589814., -8821476., -18822982.])
+        );
 
         // evaluate with complex numbers
         let mut complex_evaluator = o.convert::<Complex<f64>>().evaluator();
@@ -2082,7 +2088,8 @@ a0^2*a2*b2^2*b3^3-2*a0^2*a2*b1*b3^4-a0^2*a1*b2*b3^4+a0^3*b3^5";
                 .collect::<Vec<_>>(),
         )[0];
         assert!(
-            (res.re - 3230756.634848104).abs() < 1e-6 && (res.im - 2522437.0904901037).abs() < 1e-6
+            (res.re - -9246939.447600078).abs() < 1e-6
+                && (res.im - -21536192.22926005).abs() < 1e-6
         );
     }
 }

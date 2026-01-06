@@ -5,289 +5,20 @@ use std::fmt::{self, Error, Write};
 use colored::Colorize;
 
 use crate::{
-    atom::{AddView, AtomView, MulView, NumView, PowView, VarView, representation::FunView},
+    atom::{
+        AddView, Atom, AtomView, FunctionBuilder, MulView, NumView, PowView, Symbol, VarView,
+        representation::FunView,
+    },
     coefficient::CoefficientView,
-    domains::{SelfRing, finite_field::FiniteFieldCore, float::Complex},
+    domains::{SelfRing, finite_field::FiniteFieldCore, float::Complex, rational::Rational},
     state::State,
 };
+
+pub use numerica::printer::*;
 
 /// A function that takes an atom and prints it in a custom way.
 /// If the function returns `None`, the default printing is used.
 pub type PrintFunction = Box<dyn Fn(AtomView, &PrintOptions) -> Option<String> + Send + Sync>;
-
-/// The overall print mode.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-#[derive(Default)]
-pub enum PrintMode {
-    #[default]
-    Symbolica,
-    Latex,
-    Mathematica,
-    Sympy,
-}
-
-impl PrintMode {
-    pub fn is_symbolica(&self) -> bool {
-        *self == PrintMode::Symbolica
-    }
-
-    pub fn is_latex(&self) -> bool {
-        *self == PrintMode::Latex
-    }
-
-    pub fn is_mathematica(&self) -> bool {
-        *self == PrintMode::Mathematica
-    }
-
-    pub fn is_sympy(&self) -> bool {
-        *self == PrintMode::Sympy
-    }
-}
-
-/// Various options for printing expressions.
-#[derive(Debug, Copy, Clone)]
-pub struct PrintOptions {
-    pub mode: PrintMode,
-    pub terms_on_new_line: bool,
-    pub color_top_level_sum: bool,
-    pub color_builtin_symbols: bool,
-    pub print_finite_field: bool,
-    pub symmetric_representation_for_finite_field: bool,
-    pub explicit_rational_polynomial: bool,
-    pub number_thousands_separator: Option<char>,
-    pub multiplication_operator: char,
-    pub double_star_for_exponentiation: bool,
-    pub square_brackets_for_function: bool,
-    pub num_exp_as_superscript: bool,
-    pub precision: Option<usize>,
-    pub pretty_matrix: bool,
-    pub hide_namespace: Option<&'static str>,
-    pub hide_all_namespaces: bool,
-    pub color_namespace: bool,
-    pub max_terms: Option<usize>,
-    /// Provides a handle to set the behavior of the custom print function.
-    /// Symbolica does not use this option for its own printing.
-    pub custom_print_mode: Option<(&'static str, usize)>,
-}
-
-impl PrintOptions {
-    pub const fn new() -> Self {
-        Self {
-            terms_on_new_line: false,
-            color_top_level_sum: true,
-            color_builtin_symbols: true,
-            print_finite_field: true,
-            symmetric_representation_for_finite_field: false,
-            explicit_rational_polynomial: false,
-            number_thousands_separator: None,
-            multiplication_operator: '*',
-            double_star_for_exponentiation: false,
-            square_brackets_for_function: false,
-            num_exp_as_superscript: false,
-            mode: PrintMode::Symbolica,
-            precision: None,
-            pretty_matrix: false,
-            hide_namespace: None,
-            hide_all_namespaces: true,
-            color_namespace: true,
-            max_terms: None,
-            custom_print_mode: None,
-        }
-    }
-
-    /// Print the output in a Mathematica-readable format.
-    pub const fn mathematica() -> PrintOptions {
-        Self {
-            terms_on_new_line: false,
-            color_top_level_sum: false,
-            color_builtin_symbols: false,
-            print_finite_field: true,
-            symmetric_representation_for_finite_field: false,
-            explicit_rational_polynomial: false,
-            number_thousands_separator: None,
-            multiplication_operator: ' ',
-            double_star_for_exponentiation: false,
-            square_brackets_for_function: true,
-            num_exp_as_superscript: false,
-            mode: PrintMode::Mathematica,
-            precision: None,
-            pretty_matrix: false,
-            hide_namespace: None,
-            hide_all_namespaces: true,
-            color_namespace: false,
-            max_terms: None,
-            custom_print_mode: None,
-        }
-    }
-
-    /// Print the output in a Latex input format.
-    pub const fn latex() -> PrintOptions {
-        Self {
-            terms_on_new_line: false,
-            color_top_level_sum: false,
-            color_builtin_symbols: false,
-            print_finite_field: true,
-            symmetric_representation_for_finite_field: false,
-            explicit_rational_polynomial: false,
-            number_thousands_separator: None,
-            multiplication_operator: ' ',
-            double_star_for_exponentiation: false,
-            square_brackets_for_function: false,
-            num_exp_as_superscript: false,
-            mode: PrintMode::Latex,
-            precision: None,
-            pretty_matrix: false,
-            hide_namespace: None,
-            hide_all_namespaces: true,
-            color_namespace: false,
-            max_terms: None,
-            custom_print_mode: None,
-        }
-    }
-
-    /// Print the output suitable for a file.
-    pub const fn file() -> PrintOptions {
-        Self {
-            terms_on_new_line: false,
-            color_top_level_sum: false,
-            color_builtin_symbols: false,
-            print_finite_field: false,
-            symmetric_representation_for_finite_field: false,
-            explicit_rational_polynomial: false,
-            number_thousands_separator: None,
-            multiplication_operator: '*',
-            double_star_for_exponentiation: false,
-            square_brackets_for_function: false,
-            num_exp_as_superscript: false,
-            mode: PrintMode::Symbolica,
-            precision: None,
-            pretty_matrix: false,
-            hide_namespace: None,
-            hide_all_namespaces: false,
-            color_namespace: false,
-            max_terms: None,
-            custom_print_mode: None,
-        }
-    }
-
-    /// Print the output suitable for a file without namespaces.
-    pub const fn file_no_namespace() -> PrintOptions {
-        Self {
-            hide_all_namespaces: true,
-            ..Self::file()
-        }
-    }
-
-    /// Print the output with namespaces suppressed.
-    pub const fn short() -> PrintOptions {
-        Self {
-            hide_all_namespaces: true,
-            ..Self::new()
-        }
-    }
-
-    /// Print the output in a sympy input format.
-    pub const fn sympy() -> PrintOptions {
-        Self {
-            double_star_for_exponentiation: true,
-            ..Self::file()
-        }
-    }
-
-    pub fn from_fmt(f: &std::fmt::Formatter) -> PrintOptions {
-        PrintOptions {
-            precision: f.precision(),
-            hide_all_namespaces: !f.alternate(),
-            terms_on_new_line: f.align() == Some(std::fmt::Alignment::Right),
-            ..Default::default()
-        }
-    }
-
-    pub fn update_with_fmt(mut self, f: &std::fmt::Formatter) -> Self {
-        self.precision = f.precision();
-
-        if f.alternate() {
-            self.hide_all_namespaces = false;
-        }
-
-        if let Some(a) = f.align() {
-            self.terms_on_new_line = a == std::fmt::Alignment::Right;
-        }
-        self
-    }
-
-    pub const fn hide_namespace(mut self, namespace: &'static str) -> Self {
-        self.hide_namespace = Some(namespace);
-        self
-    }
-}
-
-impl Default for PrintOptions {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The current state useful for printing. These
-/// settings will control, for example, if parentheses are needed
-/// (e.g., a sum in a product),
-/// and if 1 should be suppressed (e.g. in a product).
-#[derive(Debug, Copy, Clone)]
-pub struct PrintState {
-    pub in_sum: bool,
-    pub in_product: bool,
-    pub suppress_one: bool,
-    pub in_exp: bool,
-    pub in_exp_base: bool,
-    pub top_level_add_child: bool,
-    pub superscript: bool,
-    pub level: u16,
-}
-
-impl Default for PrintState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PrintState {
-    pub const fn new() -> PrintState {
-        Self {
-            in_sum: false,
-            in_product: false,
-            in_exp: false,
-            in_exp_base: false,
-            suppress_one: false,
-            top_level_add_child: true,
-            superscript: false,
-            level: 0,
-        }
-    }
-
-    pub fn from_fmt(f: &std::fmt::Formatter) -> PrintState {
-        PrintState {
-            in_sum: f.sign_plus(),
-            ..Default::default()
-        }
-    }
-
-    pub fn update_with_fmt(mut self, f: &std::fmt::Formatter) -> Self {
-        self.in_sum = f.sign_plus();
-        self
-    }
-
-    pub fn step(self, in_sum: bool, in_product: bool, in_exp: bool, in_exp_base: bool) -> Self {
-        Self {
-            in_sum,
-            in_product,
-            in_exp,
-            in_exp_base,
-            level: self.level + 1,
-            ..self
-        }
-    }
-}
 
 macro_rules! define_formatters {
     ($($a:ident),*) => {
@@ -358,6 +89,24 @@ impl fmt::Display for AtomPrinter<'_> {
     }
 }
 
+/// Settings for canonical ordering of atoms when printing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CanonicalOrderingSettings {
+    pub include_namespace: bool,
+    pub include_attributes: bool,
+    pub hide_namespace: Option<&'static str>,
+}
+
+impl Default for CanonicalOrderingSettings {
+    fn default() -> Self {
+        Self {
+            include_namespace: true,
+            include_attributes: true,
+            hide_namespace: None,
+        }
+    }
+}
+
 impl AtomView<'_> {
     fn fmt_debug(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -387,23 +136,151 @@ impl AtomView<'_> {
     }
 
     /// Construct a printer for the atom with special options.
-    pub(crate) fn printer(&self, opts: PrintOptions) -> AtomPrinter {
+    pub(crate) fn printer(&self, opts: PrintOptions) -> AtomPrinter<'_> {
         AtomPrinter::new_with_options(*self, opts)
     }
 
+    pub(crate) fn to_canonically_ordered_string(
+        &self,
+        settings: CanonicalOrderingSettings,
+    ) -> String {
+        let fixed = self.canonical_string_sign_fix(&settings);
+        fixed.as_view().to_canonical_string_symmetric(&settings)
+    }
+
     /// Print the atom in a form that is unique and independent of any implementation details.
-    ///
-    /// Anti-symmetric functions are not supported.
     pub(crate) fn to_canonical_string(&self) -> String {
+        let settings = CanonicalOrderingSettings::default();
+        let fixed = self.canonical_string_sign_fix(&settings);
+        fixed.as_view().to_canonical_string_symmetric(&settings)
+    }
+
+    /// Print the atom in a form that is unique and independent of any implementation details,
+    /// treating all antisymmetric functions as symmetric.
+    fn to_canonical_string_symmetric(&self, settings: &CanonicalOrderingSettings) -> String {
         let mut s = String::new();
-        self.to_canonical_view_impl(&mut s);
+        self.to_canonical_view_impl(settings, &mut s);
         s
     }
 
-    fn to_canonical_view_impl(&self, out: &mut String) {
+    /// Fix the sign of antisymmetric functions so that they can be treated as symmetric under
+    /// canonical string ordering.
+    fn canonical_string_sign_fix(&self, settings: &CanonicalOrderingSettings) -> Atom {
+        match self {
+            AtomView::Num(_) | AtomView::Var(_) => self.to_owned(),
+            AtomView::Fun(f) => {
+                let mut fb = FunctionBuilder::new(f.get_symbol());
+                for aa in f.iter() {
+                    fb = fb.add_arg(aa.canonical_string_sign_fix(settings));
+                }
+
+                // sign changes in the arguments may cause a reordering, and linearity may
+                // move minus sign out of the function
+                let res = fb.finish();
+
+                if f.is_antisymmetric() {
+                    fn sort_args(ff: &FunView, settings: &CanonicalOrderingSettings) -> Atom {
+                        let mut args = vec![];
+                        for (i, aa) in ff.iter().enumerate() {
+                            // all antisymmetric functions in the arguments can be treated as symmetric under canonical string ordering
+                            args.push((aa.to_canonical_string_symmetric(settings), i));
+                        }
+
+                        args.sort();
+
+                        if ff.is_antisymmetric() {
+                            // find the number of swaps needed to sort the arguments
+                            let mut order: Vec<_> = (0..args.len())
+                                .map(|i| args.iter().position(|(_, j)| *j == i).unwrap())
+                                .collect();
+                            let mut swaps = 0;
+                            for i in 0..order.len() {
+                                let pos = order[i..].iter().position(|&x| x == i).unwrap();
+                                order.copy_within(i..i + pos, i + 1);
+                                swaps += pos;
+                            }
+
+                            if swaps % 2 == 1 {
+                                return -ff.as_view();
+                            }
+                        }
+
+                        ff.as_view().to_owned()
+                    }
+
+                    match res.as_view() {
+                        AtomView::Fun(ff) => sort_args(&ff, settings),
+                        AtomView::Mul(m) => {
+                            // find the antisymmetric function in the product
+                            let mut it = m.iter();
+                            let first = it.next().unwrap_or_else(|| {
+                                panic!("Expected at least two terms in product: {}", self)
+                            });
+                            let second = it.next().unwrap_or_else(|| {
+                                panic!("Expected at least one term in product: {}", self)
+                            });
+                            if it.next().is_some() {
+                                panic!("Expected at most two terms in product: {}", self);
+                            }
+
+                            if let AtomView::Fun(fff) = first {
+                                sort_args(&fff, settings) * second
+                            } else if let AtomView::Fun(fff) = second {
+                                sort_args(&fff, settings) * first
+                            } else {
+                                panic!(
+                                    "Expected one term in product to be antisymmetric function: {}",
+                                    self
+                                );
+                            }
+                        }
+                        _ => panic!(
+                            "Unexpected result from antisymmetric function sign fix of {}",
+                            self
+                        ),
+                    }
+                } else {
+                    res
+                }
+            }
+            AtomView::Pow(p) => {
+                let (b, e) = p.get_base_exp();
+                b.canonical_string_sign_fix(settings)
+                    .pow(e.canonical_string_sign_fix(settings))
+            }
+            AtomView::Mul(m) => {
+                let mut terms = vec![];
+                for x in m.iter() {
+                    terms.push(x.canonical_string_sign_fix(settings));
+                }
+
+                Atom::mul_many(&terms)
+            }
+            AtomView::Add(a) => {
+                let mut terms = vec![];
+                for x in a.iter() {
+                    terms.push(x.canonical_string_sign_fix(settings));
+                }
+
+                Atom::add_many(&terms)
+            }
+        }
+    }
+
+    fn to_canonical_view_impl(&self, settings: &CanonicalOrderingSettings, out: &mut String) {
         fn add_paren(cur: AtomView, s: AtomView) -> bool {
             if let AtomView::Pow(_) = cur {
-                matches!(s, AtomView::Add(_) | AtomView::Mul(_))
+                match s {
+                    AtomView::Var(_) => false,
+                    AtomView::Num(n) => match n.get_coeff_view() {
+                        CoefficientView::Natural(c, d, ic, _) => c < 0 || ic != 0 || d != 1,
+                        CoefficientView::Large(r, i) => {
+                            r.is_negative() || !i.is_zero() || !r.to_rat().is_integer()
+                        }
+                        _ => true,
+                    },
+                    _ => true,
+                }
             } else if let AtomView::Mul(_) = cur {
                 matches!(s, AtomView::Add(_))
             } else {
@@ -413,35 +290,64 @@ impl AtomView<'_> {
 
         match self {
             AtomView::Num(_) => write!(out, "{}", self.printer(PrintOptions::file())).unwrap(),
-            AtomView::Var(v) => v.get_symbol().format(&PrintOptions::file(), out).unwrap(),
+            AtomView::Var(v) => {
+                if settings.include_attributes {
+                    v.get_symbol().format(&PrintOptions::full(), out).unwrap();
+                } else if settings.include_namespace {
+                    v.get_symbol()
+                        .format(
+                            &PrintOptions {
+                                hide_namespace: settings.hide_namespace,
+                                ..PrintOptions::file()
+                            },
+                            out,
+                        )
+                        .unwrap();
+                } else {
+                    v.get_symbol()
+                        .format(&PrintOptions::file_no_namespace(), out)
+                        .unwrap();
+                }
+            }
             AtomView::Fun(f) => {
-                f.get_symbol().format(&PrintOptions::file(), out).unwrap();
+                if settings.include_attributes {
+                    f.get_symbol().format(&PrintOptions::full(), out).unwrap();
+                } else if settings.include_namespace {
+                    f.get_symbol()
+                        .format(
+                            &PrintOptions {
+                                hide_namespace: settings.hide_namespace,
+                                ..PrintOptions::file()
+                            },
+                            out,
+                        )
+                        .unwrap();
+                } else {
+                    f.get_symbol()
+                        .format(&PrintOptions::file_no_namespace(), out)
+                        .unwrap();
+                }
                 out.push('(');
 
                 let mut args = vec![];
 
                 for x in f.iter() {
                     let mut arg = String::new();
-                    x.to_canonical_view_impl(&mut arg);
+                    x.to_canonical_view_impl(settings, &mut arg);
                     args.push(arg);
                 }
 
-                // TODO: anti-symmetric may generate minus sign...
-                if f.is_symmetric() {
+                // The potential sign flip for antisymmetric functions should have been
+                // taken into account in the input, by the canonical_string_sign_fix() function
+                if f.is_symmetric() || f.is_antisymmetric() {
                     args.sort();
-                }
-
-                if f.is_antisymmetric() {
-                    unimplemented!(
-                        "Antisymmetric functions are not supported yet for canonical view"
-                    );
                 }
 
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(out, ",").unwrap();
                     }
-                    write!(out, "{}", arg).unwrap();
+                    write!(out, "{arg}").unwrap();
                 }
 
                 write!(out, ")").unwrap();
@@ -451,19 +357,19 @@ impl AtomView<'_> {
 
                 if add_paren(*self, b) {
                     write!(out, "(").unwrap();
-                    b.to_canonical_view_impl(out);
+                    b.to_canonical_view_impl(settings, out);
                     write!(out, ")").unwrap();
                 } else {
-                    b.to_canonical_view_impl(out);
+                    b.to_canonical_view_impl(settings, out);
                 }
 
                 if add_paren(*self, e) {
                     write!(out, "^(").unwrap();
-                    e.to_canonical_view_impl(out);
+                    e.to_canonical_view_impl(settings, out);
                     write!(out, ")").unwrap();
                 } else {
                     write!(out, "^").unwrap();
-                    e.to_canonical_view_impl(out);
+                    e.to_canonical_view_impl(settings, out);
                 }
             }
             AtomView::Mul(m) => {
@@ -476,7 +382,7 @@ impl AtomView<'_> {
                         String::new()
                     };
 
-                    x.to_canonical_view_impl(&mut term);
+                    x.to_canonical_view_impl(settings, &mut term);
 
                     if add_paren(*self, x) {
                         term.push(')');
@@ -492,7 +398,7 @@ impl AtomView<'_> {
                         write!(out, "*").unwrap();
                     }
 
-                    write!(out, "{}", term).unwrap();
+                    write!(out, "{term}").unwrap();
                 }
             }
             AtomView::Add(a) => {
@@ -505,7 +411,7 @@ impl AtomView<'_> {
                         String::new()
                     };
 
-                    x.to_canonical_view_impl(&mut term);
+                    x.to_canonical_view_impl(settings, &mut term);
 
                     if add_paren(*self, x) {
                         term.push(')');
@@ -520,7 +426,7 @@ impl AtomView<'_> {
                     if i > 0 {
                         write!(out, "+").unwrap();
                     }
-                    write!(out, "{}", term).unwrap();
+                    write!(out, "{term}").unwrap();
                 }
             }
         }
@@ -529,7 +435,14 @@ impl AtomView<'_> {
 
 impl fmt::Debug for AtomView<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        self.fmt_debug(fmt)
+        if fmt.alternate() {
+            self.fmt_debug(fmt)
+        } else {
+            std::fmt::Display::fmt(
+                &AtomPrinter::new_with_options(*self, PrintOptions::file()),
+                fmt,
+            )
+        }
     }
 }
 
@@ -557,13 +470,13 @@ impl FormattedPrintVar for VarView<'_> {
     }
 
     fn fmt_debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        f.write_fmt(format_args!("{:?}", self))
     }
 }
 
 impl FormattedPrintNum for NumView<'_> {
     fn fmt_debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        f.write_fmt(format_args!("{:?}", self))
     }
 
     fn fmt_output<W: std::fmt::Write>(
@@ -579,7 +492,7 @@ impl FormattedPrintNum for NumView<'_> {
             print_state: &PrintState,
             f: &mut W,
         ) -> fmt::Result {
-            if print_state.superscript {
+            if print_state.superscript && opts.mode.is_symbolica() {
                 let map = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
                 s = s
                     .as_bytes()
@@ -648,116 +561,152 @@ impl FormattedPrintNum for NumView<'_> {
             print_state.in_sum = false;
         }
 
-        let i_str = if opts.color_builtin_symbols {
+        let i_str = if opts.mode.is_symbolica() && opts.color_builtin_symbols {
             "\u{1b}\u{5b}\u{33}\u{35}\u{6d}\u{1d456}\u{1b}\u{5b}\u{30}\u{6d}"
+        } else if opts.mode.is_mathematica() {
+            "I"
         } else {
             "𝑖"
         };
 
-        match d {
-            CoefficientView::Natural(num, den, num_i, den_i) => {
-                if num_i == 0 && den == 1 && print_state.suppress_one && (num == 1 || num == -1) {
-                    if num == -1 && !global_negative {
+        fn print_complex_rational<W: std::fmt::Write>(
+            real: Rational,
+            imag: Rational,
+            global_negative: bool,
+            i_str: &str,
+            print_state: PrintState,
+            f: &mut W,
+            opts: &PrintOptions,
+        ) -> Result<bool, Error> {
+            if imag.is_zero()
+                && real.denominator_ref().is_one()
+                && print_state.suppress_one
+                && (real.numerator_ref().is_one() || *real.numerator_ref() == -1)
+            {
+                if *real.numerator_ref() == -1 && !global_negative {
+                    f.write_char('-')?;
+                }
+                return Ok(true);
+            }
+
+            let need_paren =
+                (print_state.in_product || print_state.in_exp || print_state.in_exp_base)
+                    && (!real.is_zero() && !imag.is_zero())
+                    || print_state.in_exp_base
+                        && (real.is_negative() || !imag.is_zero() || !real.is_integer())
+                    || print_state.in_exp && (!real.is_integer() || !imag.is_zero());
+
+            if need_paren {
+                f.write_char('(')?;
+            }
+
+            if !opts.mode.is_latex()
+                && (opts.number_thousands_separator.is_some() || print_state.superscript)
+            {
+                if !real.is_zero() {
+                    if !global_negative && real.is_negative() {
                         f.write_char('-')?;
                     }
-                    return Ok(true);
+
+                    format_num(
+                        real.numerator_ref().abs().to_string(),
+                        opts,
+                        &print_state,
+                        f,
+                    )?;
+                    if !real.is_integer() {
+                        f.write_char('/')?;
+                        format_num(real.denominator_ref().to_string(), opts, &print_state, f)?;
+                    }
                 }
 
-                let need_paren = (print_state.in_product
-                    || print_state.in_exp
-                    || print_state.in_exp_base)
-                    && (num != 0 && num_i != 0)
-                    || print_state.in_exp_base && (num < 0 || num_i < 0 || den != 1 || den_i != 1)
-                    || print_state.in_exp && (den != 1 || den_i != 1);
-
-                if need_paren {
-                    f.write_char('(')?;
+                if !real.is_zero() && !imag.is_zero() && !imag.is_negative() {
+                    f.write_char('+')?;
                 }
 
-                if !opts.mode.is_latex()
-                    && (opts.number_thousands_separator.is_some() || print_state.superscript)
-                {
-                    if num != 0 {
-                        if !global_negative && num < 0 {
-                            f.write_char('-')?;
-                        }
-
-                        format_num(num.unsigned_abs().to_string(), opts, &print_state, f)?;
-                        if den != 1 {
-                            f.write_char('/')?;
-                            format_num(den.to_string(), opts, &print_state, f)?;
-                        }
+                if !imag.is_zero() {
+                    if !global_negative && imag.is_negative() {
+                        f.write_char('-')?;
                     }
-
-                    if num != 0 && num_i > 0 {
-                        f.write_char('+')?;
+                    format_num(
+                        imag.numerator_ref().abs().to_string(),
+                        opts,
+                        &print_state,
+                        f,
+                    )?;
+                    f.write_str(i_str)?;
+                    if !imag.is_integer() {
+                        f.write_char('/')?;
+                        format_num(imag.denominator_ref().to_string(), opts, &print_state, f)?;
                     }
-
-                    if num_i != 0 {
-                        if !global_negative && num_i < 0 {
-                            f.write_char('-')?;
-                        }
-                        format_num(num_i.unsigned_abs().to_string(), opts, &print_state, f)?;
-                        f.write_str(i_str)?;
-                        if den_i != 1 {
-                            f.write_char('/')?;
-                            format_num(den_i.to_string(), opts, &print_state, f)?;
-                        }
+                }
+            } else {
+                if !real.is_zero() || imag.is_zero() {
+                    if !global_negative && real.is_negative() {
+                        f.write_char('-')?;
                     }
-                } else {
-                    if num != 0 || num_i == 0 {
-                        if !global_negative && num < 0 {
-                            f.write_char('-')?;
-                        }
-                        if den != 1 {
-                            if opts.mode.is_latex() {
-                                f.write_fmt(format_args!(
-                                    "\\frac{{{}}}{{{}}}",
-                                    num.unsigned_abs(),
-                                    den
-                                ))?;
-                            } else {
-                                f.write_fmt(format_args!("{}/{}", num.unsigned_abs(), den))?;
-                            }
+                    if !real.is_integer() {
+                        if opts.mode.is_latex() {
+                            f.write_fmt(format_args!(
+                                "\\frac{{{}}}{{{}}}",
+                                real.numerator_ref().abs(),
+                                real.denominator_ref()
+                            ))?;
                         } else {
-                            f.write_fmt(format_args!("{}", num.unsigned_abs()))?;
+                            f.write_fmt(format_args!(
+                                "{}/{}",
+                                real.numerator_ref().abs(),
+                                real.denominator_ref()
+                            ))?;
                         }
+                    } else {
+                        f.write_fmt(format_args!("{}", real.numerator_ref().abs()))?;
+                    }
+                }
+
+                if !real.is_zero() && !imag.is_zero() && !imag.is_negative() {
+                    f.write_char('+')?;
+                }
+
+                if !imag.is_zero() {
+                    if !global_negative && imag.is_negative() {
+                        f.write_char('-')?;
                     }
 
-                    if num != 0 && num_i > 0 {
-                        f.write_char('+')?;
-                    }
-
-                    if num_i != 0 {
-                        if !global_negative && num_i < 0 {
-                            f.write_char('-')?;
-                        }
-                        if den_i != 1 {
-                            if opts.mode.is_latex() {
-                                f.write_fmt(format_args!(
-                                    "\\frac{{{}}}{{{}}}𝑖",
-                                    num_i.unsigned_abs(),
-                                    den_i,
-                                ))?;
-                            } else {
-                                f.write_fmt(format_args!(
-                                    "{}{}/{}",
-                                    num_i.unsigned_abs(),
-                                    i_str,
-                                    den_i
-                                ))?;
-                            }
+                    if !imag.is_integer() {
+                        if opts.mode.is_latex() {
+                            f.write_fmt(format_args!(
+                                "\\frac{{{}}}{{{}}}𝑖",
+                                imag.numerator_ref().abs(),
+                                imag.denominator_ref(),
+                            ))?;
                         } else {
-                            f.write_fmt(format_args!("{}{}", num_i.unsigned_abs(), i_str))?;
+                            f.write_fmt(format_args!(
+                                "{}{}/{}",
+                                imag.numerator_ref().abs(),
+                                i_str,
+                                imag.denominator_ref()
+                            ))?;
                         }
+                    } else {
+                        f.write_fmt(format_args!("{}{}", imag.numerator_ref().abs(), i_str))?;
                     }
                 }
+            }
 
-                if need_paren {
-                    f.write_char(')')?;
-                }
+            if need_paren {
+                f.write_char(')')?;
+            }
 
-                Ok(false)
+            Ok(false)
+        }
+
+        match d {
+            CoefficientView::Natural(num, den, num_i, den_i) => {
+                let real = Rational::from_int_unchecked(num, den);
+                let imag = Rational::from_int_unchecked(num_i, den_i);
+
+                print_complex_rational(real, imag, global_negative, i_str, print_state, f, opts)
             }
             CoefficientView::Float(r, i) => {
                 if i.is_zero() {
@@ -772,118 +721,51 @@ impl FormattedPrintNum for NumView<'_> {
                 let real = r.to_rat();
                 let imag = i.to_rat();
 
-                let need_paren =
-                    (print_state.in_product || print_state.in_exp || print_state.in_exp_base)
-                        && (!real.is_zero() && !imag.is_zero())
-                        || print_state.in_exp_base
-                            && (real.is_negative()
-                                || imag.is_negative()
-                                || !real.is_integer()
-                                || !imag.is_integer())
-                        || print_state.in_exp && (!real.is_integer() || !imag.is_integer());
+                print_complex_rational(real, imag, global_negative, i_str, print_state, f, opts)
+            }
+            CoefficientView::Indeterminate => {
+                f.write_char('¿')?;
+                Ok(false)
+            }
+            CoefficientView::Infinity(None) => {
+                f.write_char('⧞')?;
+                Ok(false)
+            }
+            CoefficientView::Infinity(Some((r, i))) => {
+                let real = r.to_rat();
+                let imag = i.to_rat();
 
-                if need_paren {
-                    f.write_char('(')?;
-                }
-
-                if !opts.mode.is_latex()
-                    && (opts.number_thousands_separator.is_some() || print_state.superscript)
-                {
-                    if !real.is_zero() {
-                        if !global_negative && real.is_negative() {
-                            f.write_char('-')?;
+                if imag.is_zero() {
+                    if real.is_negative() {
+                        if opts.mode.is_latex() {
+                            f.write_str("-\\infty")?;
+                        } else {
+                            f.write_str("-∞")?;
                         }
-
-                        format_num(
-                            real.numerator_ref().abs().to_string(),
-                            opts,
-                            &print_state,
-                            f,
-                        )?;
-                        if !real.is_integer() {
-                            f.write_char('/')?;
-                            format_num(real.denominator_ref().to_string(), opts, &print_state, f)?;
-                        }
-                    }
-
-                    if !real.is_zero() && !imag.is_zero() && !imag.is_negative() {
-                        f.write_char('+')?;
-                    }
-
-                    if !imag.is_zero() {
-                        if !global_negative && imag.is_negative() {
-                            f.write_char('-')?;
-                        }
-                        format_num(
-                            imag.numerator_ref().abs().to_string(),
-                            opts,
-                            &print_state,
-                            f,
-                        )?;
-                        f.write_str(i_str)?;
-                        if !imag.is_integer() {
-                            f.write_char('/')?;
-                            format_num(imag.denominator_ref().to_string(), opts, &print_state, f)?;
-                        }
+                    } else if opts.mode.is_latex() {
+                        f.write_str("\\infty")?;
+                    } else {
+                        f.write_char('∞')?;
                     }
                 } else {
-                    if !real.is_zero() || imag.is_zero() {
-                        if !global_negative && real.is_negative() {
-                            f.write_char('-')?;
-                        }
-                        if !real.is_integer() {
-                            if opts.mode.is_latex() {
-                                f.write_fmt(format_args!(
-                                    "\\frac{{{}}}{{{}}}",
-                                    real.numerator_ref().abs(),
-                                    real.denominator_ref()
-                                ))?;
-                            } else {
-                                f.write_fmt(format_args!(
-                                    "{}/{}",
-                                    real.numerator_ref().abs(),
-                                    real.denominator_ref()
-                                ))?;
-                            }
-                        } else {
-                            f.write_fmt(format_args!("{}", real.numerator_ref().abs()))?;
-                        }
-                    }
+                    print_state.in_product = true;
+                    print_complex_rational(
+                        real,
+                        imag,
+                        global_negative,
+                        i_str,
+                        print_state,
+                        f,
+                        opts,
+                    )?;
 
-                    if !real.is_zero() && !imag.is_zero() && !imag.is_negative() {
-                        f.write_char('+')?;
-                    }
-
-                    if !imag.is_zero() {
-                        if !global_negative && imag.is_negative() {
-                            f.write_char('-')?;
-                        }
-
-                        if !imag.is_integer() {
-                            if opts.mode.is_latex() {
-                                f.write_fmt(format_args!(
-                                    "\\frac{{{}}}{{{}}}𝑖",
-                                    imag.numerator_ref().abs(),
-                                    imag.denominator_ref(),
-                                ))?;
-                            } else {
-                                f.write_fmt(format_args!(
-                                    "{}{}/{}",
-                                    imag.numerator_ref().abs(),
-                                    i_str,
-                                    imag.denominator_ref()
-                                ))?;
-                            }
-                        } else {
-                            f.write_fmt(format_args!("{}{}", imag.numerator_ref().abs(), i_str))?;
-                        }
+                    if opts.mode.is_latex() {
+                        f.write_str(" \\infty")?;
+                    } else {
+                        f.write_char(opts.multiplication_operator)?;
+                        f.write_char('∞')?;
                     }
                 }
-
-                if need_paren {
-                    f.write_char(')')?;
-                }
-
                 Ok(false)
             }
             CoefficientView::FiniteField(num, fi) => {
@@ -906,7 +788,7 @@ impl FormattedPrintNum for NumView<'_> {
 
 impl FormattedPrintMul for MulView<'_> {
     fn fmt_debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        f.write_fmt(format_args!("{:?}", self))
     }
 
     fn fmt_output<W: std::fmt::Write>(
@@ -995,11 +877,11 @@ impl FormattedPrintFn for FunView<'_> {
         }
 
         let id = self.get_symbol();
-        if let Some(custom_print) = &State::get_symbol_data(id).custom_print {
-            if let Some(s) = custom_print(self.as_view(), opts) {
-                f.write_str(&s)?;
-                return Ok(false);
-            }
+        if let Some(custom_print) = &id.get_global_data().custom_print
+            && let Some(s) = custom_print(self.as_view(), opts)
+        {
+            f.write_str(&s)?;
+            return Ok(false);
         }
 
         id.format(opts, f)?;
@@ -1021,6 +903,37 @@ impl FormattedPrintFn for FunView<'_> {
         print_state.suppress_one = false;
         let mut first = true;
         for x in self.iter() {
+            if opts.mode.is_mathematica() {
+                if let AtomView::Var(s) = x
+                    && s.get_symbol() == Symbol::SEP
+                {
+                    first = true;
+                    f.write_str("][")?;
+                    continue;
+                }
+
+                // curry the derivative function
+                if id == Symbol::DERIVATIVE
+                    && let AtomView::Fun(fun) = x
+                {
+                    f.write_str("][")?;
+                    fun.get_symbol().format(opts, f)?;
+                    f.write_str("][")?;
+
+                    first = true;
+                    for x2 in fun.iter() {
+                        if !first {
+                            f.write_char(',')?;
+                        } else {
+                            first = false;
+                        }
+
+                        x2.format(f, opts, print_state)?;
+                    }
+                    continue;
+                }
+            }
+
             if !first {
                 f.write_char(',')?;
             }
@@ -1041,7 +954,7 @@ impl FormattedPrintFn for FunView<'_> {
     }
 
     fn fmt_debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        f.write_fmt(format_args!("{:?}", self))
     }
 }
 
@@ -1081,19 +994,20 @@ impl FormattedPrintPow for PowView<'_> {
 
         let mut superscript_exponent = false;
         if opts.mode.is_latex() {
-            if let AtomView::Num(n) = e {
-                if n.get_coeff_view() == CoefficientView::Natural(-1, 1, 0, 1) {
-                    // TODO: construct the numerator
-                    f.write_str("\\frac{1}{")?;
-                    b.format(f, opts, print_state)?;
-                    f.write_char('}')?;
-                    return Ok(false);
-                }
+            if let AtomView::Num(n) = e
+                && n.get_coeff_view() == CoefficientView::Natural(-1, 1, 0, 1)
+            {
+                // TODO: construct the numerator
+                f.write_str("\\frac{1}{")?;
+                b.format(f, opts, print_state)?;
+                f.write_char('}')?;
+                return Ok(false);
             }
-        } else if opts.mode.is_symbolica() && opts.num_exp_as_superscript {
-            if let AtomView::Num(n) = e {
-                superscript_exponent = n.get_coeff_view().is_integer()
-            }
+        } else if opts.mode.is_symbolica()
+            && opts.num_exp_as_superscript
+            && let AtomView::Num(n) = e
+        {
+            superscript_exponent = n.get_coeff_view().is_integer()
         }
 
         print_state.in_exp_base = true;
@@ -1135,7 +1049,7 @@ impl FormattedPrintPow for PowView<'_> {
     }
 
     fn fmt_debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        f.write_fmt(format_args!("{:?}", self))
     }
 }
 
@@ -1178,10 +1092,11 @@ impl FormattedPrintAdd for AddView<'_> {
 
         let mut count = 0;
         for x in self.iter() {
-            if let Some(max_terms) = opts.max_terms {
-                if opts.mode.is_symbolica() && count >= max_terms {
-                    break;
-                }
+            if let Some(max_terms) = opts.max_terms
+                && opts.mode.is_symbolica()
+                && count >= max_terms
+            {
+                break;
             }
 
             if !first && print_state.top_level_add_child && opts.terms_on_new_line {
@@ -1219,7 +1134,7 @@ impl FormattedPrintAdd for AddView<'_> {
     }
 
     fn fmt_debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        f.write_fmt(format_args!("{:?}", self))
     }
 }
 
@@ -1230,7 +1145,7 @@ mod test {
     use crate::{
         atom::{AtomCore, AtomView},
         domains::{SelfRing, finite_field::Zp, integer::Z},
-        parse,
+        function, parse,
         printer::{AtomPrinter, PrintOptions, PrintState},
         symbol,
     };
@@ -1292,7 +1207,7 @@ mod test {
         let mut s = String::new();
         a.format(
             &PrintOptions {
-                print_finite_field: true,
+                print_ring: true,
                 symmetric_representation_for_finite_field: true,
                 ..PrintOptions::file()
             },
@@ -1307,10 +1222,10 @@ mod test {
     #[test]
     fn rational_polynomials() {
         let a = parse!("15 x^2 / (1+x)").to_rational_polynomial::<_, _, u8>(&Z, &Z, None);
-        assert_eq!(format!("{}", a), "15*x^2/(1+x)");
+        assert_eq!(format!("{a}"), "15*x^2/(1+x)");
 
         let a = parse!("(15 x^2 + 6) / (1+x)").to_rational_polynomial::<_, _, u8>(&Z, &Z, None);
-        assert_eq!(format!("{}", a), "(6+15*x^2)/(1+x)");
+        assert_eq!(format!("{a}"), "(6+15*x^2)/(1+x)");
     }
 
     #[test]
@@ -1318,22 +1233,21 @@ mod test {
         let a = parse!("15 x^2 / ((1+x)(x+2))")
             .to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert!(
-            format!("{}", a) == "15*x^2/((1+x)*(2+x))"
-                || format!("{}", a) == "15*x^2/((2+x)*(1+x))"
+            format!("{a}") == "15*x^2/((1+x)*(2+x))" || format!("{a}") == "15*x^2/((2+x)*(1+x))"
         );
 
         let a = parse!("(15 x^2 + 6) / ((1+x)(x+2))")
             .to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
         assert!(
-            format!("{}", a) == "3*(2+5*x^2)/((1+x)*(2+x))"
-                || format!("{}", a) == "3*(2+5*x^2)/((2+x)*(1+x))"
+            format!("{a}") == "3*(2+5*x^2)/((1+x)*(2+x))"
+                || format!("{a}") == "3*(2+5*x^2)/((2+x)*(1+x))"
         );
 
         let a = parse!("1/(v1*v2)").to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
-        assert!(format!("{}", a) == "1/(v1*v2)" || format!("{}", a) == "1/(v2*v1)");
+        assert!(format!("{a}") == "1/(v1*v2)" || format!("{a}") == "1/(v2*v1)");
 
         let a = parse!("-1/(2+v1)").to_factorized_rational_polynomial::<_, _, u8>(&Z, &Z, None);
-        assert!(format!("{}", a) == "-1/(2+v1)");
+        assert!(format!("{a}") == "-1/(2+v1)");
     }
 
     #[test]
@@ -1359,35 +1273,59 @@ mod test {
         );
         assert_eq!(
             a.to_canonical_string(),
-            "(symbolica::canon_x+symbolica::canon_y)*symbolica::canon_y^2+2*symbolica::canon_x*symbolica::canon_y+symbolica::canon_f(symbolica::canon_x,symbolica::canon_y)+symbolica::canon_x^2"
+            "(symbolica::{}::canon_x+symbolica::{}::canon_y)*symbolica::{}::canon_y^2+2*symbolica::{}::canon_x*symbolica::{}::canon_y+symbolica::{symmetric}::canon_f(symbolica::{}::canon_x,symbolica::{}::canon_y)+symbolica::{}::canon_x^2"
+        );
+    }
+
+    #[test]
+    fn canon_antisymmetric() {
+        let (y, x) = symbol!(
+            "symbolica::canon_antisymmetric::y",
+            "symbolica::canon_antisymmetric::x"
+        );
+        let f = symbol!("symbolica::canon_antisymmetric::f"; Antisymmetric);
+        let f_l = symbol!("symbolica::canon_antisymmetric::f_l"; Antisymmetric, Linear);
+        let r1 = (function!(f, y, x) + 2).to_canonical_string();
+        assert_eq!(
+            r1,
+            "-1*symbolica::canon_antisymmetric::{antisymmetric}::f(symbolica::canon_antisymmetric::{}::x,symbolica::canon_antisymmetric::{}::y)+2"
+        );
+
+        let r2 = (function!(f_l, function!(f, y, x), x) * 3).to_canonical_string();
+        assert_eq!(
+            r2,
+            "-3*symbolica::canon_antisymmetric::{antisymmetric,linear}::f_l(symbolica::canon_antisymmetric::{antisymmetric}::f(symbolica::canon_antisymmetric::{}::x,symbolica::canon_antisymmetric::{}::y),symbolica::canon_antisymmetric::{}::x)"
         );
     }
 
     #[test]
     fn custom_print() {
-        let _ = symbol!("mu";;;|a, opt| {
-            if !opt.mode.is_latex() {
-                return None; // use default printer
-            }
-
-            let mut fmt = String::new();
-            fmt.push_str("\\mu");
-            if let AtomView::Fun(f) = a {
-                fmt.push_str("_{");
-                let n_args = f.get_nargs();
-
-                for (i, a) in f.iter().enumerate() {
-                    a.format(&mut fmt, opt, PrintState::new()).unwrap();
-                    if i < n_args - 1 {
-                        fmt.push(',');
-                    }
+        let _ = symbol!(
+            "mu",
+            print = |a, opt| {
+                if !opt.mode.is_latex() {
+                    return None; // use default printer
                 }
 
-                fmt.push('}');
-            }
+                let mut fmt = String::new();
+                fmt.push_str("\\mu");
+                if let AtomView::Fun(f) = a {
+                    fmt.push_str("_{");
+                    let n_args = f.get_nargs();
 
-            Some(fmt)
-        });
+                    for (i, a) in f.iter().enumerate() {
+                        a.format(&mut fmt, opt, PrintState::new()).unwrap();
+                        if i < n_args - 1 {
+                            fmt.push(',');
+                        }
+                    }
+
+                    fmt.push('}');
+                }
+
+                Some(fmt)
+            }
+        );
 
         let e = crate::parse!("mu^2 + mu(1) + mu(1,2)");
         let s = format!("{}", e.printer(PrintOptions::latex()));

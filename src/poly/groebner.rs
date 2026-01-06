@@ -53,7 +53,7 @@ use std::{cmp::Ordering, rc::Rc};
 use ahash::HashMap;
 
 use crate::domains::{
-    Field, Ring,
+    Field, Ring, RingOps, Set,
     algebraic_number::AlgebraicExtension,
     finite_field::{FiniteField, FiniteFieldCore, Mersenne64, Z2, Zp, Zp64},
     rational::RationalField,
@@ -163,7 +163,7 @@ impl<R: Field + Echelonize, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O
                 return a;
             }
         }
-        panic!("Unknown polynomial associated with exponent map {:?}", lcm);
+        panic!("Unknown polynomial associated with exponent map {lcm:?}");
     }
 
     /// The F4 algorithm for computing a Groebner basis.
@@ -423,10 +423,10 @@ impl<R: Field, E: Exponent, O: MonomialOrder> MultivariatePolynomial<R, E, O> {
         gs: &[MultivariatePolynomial<R, E, O>],
     ) -> MultivariatePolynomial<R, E, O> {
         if gs.iter().any(|x| self.variables != x.variables) {
-            let mut sys: Vec<_> = vec![self.clone()];
-            sys.extend_from_slice(gs);
+            let mut sys: Vec<_> = gs.to_vec();
+            sys.push(self.clone());
             Self::unify_variables_list(&mut sys);
-            return sys[0].reduce(&sys[1..]);
+            return sys.last().unwrap().reduce(&sys[..gs.len()]);
         }
 
         let mut q = self.zero_with_capacity(self.nterms());
@@ -626,7 +626,7 @@ impl<R: Field, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O> {
 pub trait Echelonize: Field {
     type LargerField;
 
-    fn from_larger(&self, element: &Self::LargerField) -> <Self as Ring>::Element;
+    fn from_larger(&self, element: &Self::LargerField) -> <Self as Set>::Element;
     fn echelonize<E: Exponent, O: MonomialOrder>(
         matrix: &mut Vec<Vec<(Self::LargerField, usize)>>,
         selected_polys: &mut Vec<Rc<MultivariatePolynomial<Self, E, O>>>,
@@ -722,8 +722,8 @@ impl Echelonize for Zp {
         let mut pc = 0;
         for r in 0..matrix.len() {
             // identify all pivots
-            if let Some((coeff, col)) = matrix[r].first_mut() {
-                if pivots[*col].is_none() {
+            if let Some((coeff, col)) = matrix[r].first_mut()
+                && pivots[*col].is_none() {
                     pivots[*col] = Some(r);
                     pc += 1;
 
@@ -736,7 +736,6 @@ impl Echelonize for Zp {
                         }
                     }
                 }
-            }
         }
 
         if print_stats {
@@ -748,8 +747,8 @@ impl Echelonize for Zp {
                 continue;
             }
 
-            if let Some((coeff, col)) = matrix[r].first_mut() {
-                if pivots[*col].is_none() {
+            if let Some((coeff, col)) = matrix[r].first_mut()
+                && pivots[*col].is_none() {
                     pivots[*col] = Some(r);
                     pc += 1;
 
@@ -762,10 +761,9 @@ impl Echelonize for Zp {
                         }
                     }
                 }
-            }
 
             // do not reduce pivots
-            if pivots.iter().any(|c| *c == Some(r)) {
+            if pivots.contains(&Some(r)) {
                 continue;
             }
 
@@ -836,7 +834,7 @@ impl Echelonize for Zp {
         matrix.retain(|r| !r.is_empty());
     }
 
-    fn from_larger(&self, element: &i64) -> <Self as Ring>::Element {
+    fn from_larger(&self, element: &i64) -> <Self as Set>::Element {
         self.to_element(*element as u32)
     }
 }
@@ -972,7 +970,7 @@ macro_rules! echelonize_impl {
                 matrix.retain(|r| !r.is_empty());
             }
 
-            fn from_larger(&self, element: &Self::LargerField) -> <Self as Ring>::Element {
+            fn from_larger(&self, element: &Self::LargerField) -> <Self as Set>::Element {
                 element.clone()
             }
         }
@@ -984,6 +982,7 @@ echelonize_impl!(FiniteField<Mersenne64>);
 echelonize_impl!(RationalField);
 echelonize_impl!(Z2);
 echelonize_impl!(AlgebraicExtension<Zp>);
+echelonize_impl!(AlgebraicExtension<Zp64>);
 echelonize_impl!(AlgebraicExtension<Z2>);
 echelonize_impl!(AlgebraicExtension<RationalField>);
 

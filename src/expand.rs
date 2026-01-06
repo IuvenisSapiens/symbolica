@@ -7,7 +7,7 @@ use crate::{
     coefficient::CoefficientView,
     combinatorics::CombinationWithReplacementIterator,
     domains::{integer::Integer, rational::Q},
-    poly::{Exponent, Variable},
+    poly::{Exponent, PolyVariable},
     state::{RecycledAtom, Workspace},
 };
 
@@ -63,14 +63,12 @@ impl AtomView<'_> {
                     return false;
                 }
 
-                if let AtomView::Num(n) = exp {
-                    if let CoefficientView::Natural(n, 1, 0, 1) = n.get_coeff_view() {
-                        if n.unsigned_abs() <= u32::MAX as u64
-                            && matches!(base, AtomView::Add(_) | AtomView::Mul(_))
-                        {
-                            return var.map(|s| !base.contains(s)).unwrap_or(false);
-                        }
-                    }
+                if let AtomView::Num(n) = exp
+                    && let CoefficientView::Natural(n, 1, 0, 1) = n.get_coeff_view()
+                    && n.unsigned_abs() <= u32::MAX as u64
+                    && matches!(base, AtomView::Add(_) | AtomView::Mul(_))
+                {
+                    return var.map(|s| !base.contains(s)).unwrap_or(false);
                 }
 
                 true
@@ -105,7 +103,7 @@ impl AtomView<'_> {
     /// that fits the largest exponent in the expanded expression. Often,
     /// `u8` or `u16` is sufficient.
     pub(crate) fn expand_via_poly<E: Exponent>(&self, var: Option<AtomView>) -> Atom {
-        let var_map = var.map(|v| Arc::new(vec![v.to_owned().into()]));
+        let var_map = var.map(|v| Arc::new(vec![v.to_owned().try_into().unwrap()]));
 
         let mut out = Atom::new();
         Workspace::get_local().with(|ws| {
@@ -118,7 +116,7 @@ impl AtomView<'_> {
         &self,
         ws: &Workspace,
         var: Option<AtomView>,
-        var_map: &Option<Arc<Vec<Variable>>>,
+        var_map: &Option<Arc<Vec<PolyVariable>>>,
         out: &mut Atom,
     ) {
         if self.is_expanded(var) {
@@ -126,11 +124,11 @@ impl AtomView<'_> {
             return;
         }
 
-        if let Some(v) = var {
-            if !self.contains(v) {
-                out.set_from_view(self);
-                return;
-            }
+        if let Some(v) = var
+            && !self.contains(v)
+        {
+            out.set_from_view(self);
+            return;
         }
 
         match self {
@@ -139,14 +137,22 @@ impl AtomView<'_> {
                 if let Some(v) = var_map {
                     *out = self.to_polynomial_in_vars::<E>(v).flatten(true);
                 } else {
-                    *out = self.to_polynomial::<_, E>(&Q, None).to_expression();
+                    if let Ok(p) = self.try_to_polynomial::<_, E>(&Q, None) {
+                        *out = p.to_expression();
+                    } else {
+                        self.expand_into(var, out);
+                    }
                 }
             }
             AtomView::Mul(_) => {
                 if let Some(v) = var_map {
                     *out = self.to_polynomial_in_vars::<E>(v).flatten(true);
                 } else {
-                    *out = self.to_polynomial::<_, E>(&Q, None).to_expression();
+                    if let Ok(p) = self.try_to_polynomial::<_, E>(&Q, None) {
+                        *out = p.to_expression();
+                    } else {
+                        self.expand_into(var, out);
+                    }
                 }
             }
             AtomView::Add(add_view) => {
@@ -167,11 +173,11 @@ impl AtomView<'_> {
 
     /// Expand an expression, but do not normalize the result.
     fn expand_no_norm(&self, workspace: &Workspace, var: Option<AtomView>, out: &mut Atom) -> bool {
-        if let Some(s) = var {
-            if !self.contains(s) {
-                out.set_from_view(self);
-                return false;
-            }
+        if let Some(s) = var
+            && !self.contains(s)
+        {
+            out.set_from_view(self);
+            return false;
         }
 
         match self {
@@ -185,12 +191,11 @@ impl AtomView<'_> {
                 changed |= exp.expand_with_ws_into(workspace, var, &mut new_exp);
 
                 let (negative, num) = 'get_num: {
-                    if let AtomView::Num(n) = new_exp.as_view() {
-                        if let CoefficientView::Natural(n, 1, 0, 1) = n.get_coeff_view() {
-                            if n.unsigned_abs() <= u32::MAX as u64 {
-                                break 'get_num (n < 0, n.unsigned_abs() as u32);
-                            }
-                        }
+                    if let AtomView::Num(n) = new_exp.as_view()
+                        && let CoefficientView::Natural(n, 1, 0, 1) = n.get_coeff_view()
+                        && n.unsigned_abs() <= u32::MAX as u64
+                    {
+                        break 'get_num (n < 0, n.unsigned_abs() as u32);
                     }
 
                     let mut pow_h = workspace.new_atom();
@@ -430,6 +435,23 @@ impl AtomView<'_> {
                 changed
             }
             AtomView::Mul(mul_view) => {
+                let mut changed = false;
+
+                // propagate to all arguments
+                let mut new_mul = ws.new_atom();
+                let m = new_mul.to_mul();
+                let mut new_arg = ws.new_atom();
+                for arg in mul_view {
+                    changed |= arg.expand_num_impl(ws, &mut new_arg);
+                    m.extend(new_arg.as_view());
+                }
+
+                if changed {
+                    new_mul.as_view().normalize(ws, &mut new_arg);
+                    new_arg.as_view().expand_num_impl(ws, out);
+                    return true;
+                }
+
                 if !mul_view.has_coefficient()
                     || !mul_view.iter().any(|a| matches!(a, AtomView::Add(_)))
                 {
@@ -554,16 +576,14 @@ mod test {
 
     #[test]
     fn expand_in_var() {
-        let exp = parse!("(1+v1)^2+(1+v2)^100")
-            .expand_in_symbol(symbol!("v1"));
+        let exp = parse!("(1+v1)^2+(1+v2)^100").expand_in_symbol(symbol!("v1"));
         let res = parse!("1+2*v1+v1^2+(v2+1)^100");
         assert_eq!(exp, res);
     }
 
     #[test]
     fn expand_with_poly() {
-        let exp = parse!("(1+v1)^2+(1+v2)^100")
-            .expand_in_symbol(symbol!("v1"));
+        let exp = parse!("(1+v1)^2+(1+v2)^100").expand_in_symbol(symbol!("v1"));
         let res = parse!("1+2*v1+v1^2+(v2+1)^100");
         assert_eq!(exp, res);
     }

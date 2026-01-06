@@ -1,20 +1,18 @@
 //! Evaluation of expressions.
 //!
 //! The main entry point is through [AtomCore::evaluator].
-
-use std::{
-    hash::{Hash, Hasher},
-    os::raw::c_ulong,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
-
 use ahash::{AHasher, HashMap};
 use rand::Rng;
-
 use self_cell::self_cell;
+use std::{
+    hash::{Hash, Hasher},
+    os::raw::{c_ulong, c_void},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 
 use crate::{
     LicenseManager,
@@ -23,16 +21,20 @@ use crate::{
     combinatorics::unique_permutations,
     domains::{
         InternalOrdering,
+        dual::DualNumberStructure,
         float::{
-            Complex, ConstructibleFloat, ErrorPropagatingFloat, F64, Float, NumericalFloatLike,
-            Real, RealNumberLike, SingleFloat,
+            Complex, Constructible, ErrorPropagatingFloat, F64, Float, FloatLike, Real, RealLike,
+            SingleFloat,
         },
         integer::Integer,
         rational::Rational,
     },
+    error,
     id::ConditionResult,
+    info,
     numerical_integration::MonteCarloRng,
     state::State,
+    utils::AbortCheck,
 };
 
 type EvalFnType<A, T> = Box<
@@ -44,6 +46,7 @@ type EvalFnType<A, T> = Box<
     ) -> T,
 >;
 
+/// A closure that can be called to evaluate a function called with arguments of type `T`.
 pub struct EvaluationFn<A, T>(EvalFnType<A, T>);
 
 impl<A, T> EvaluationFn<A, T> {
@@ -57,6 +60,22 @@ impl<A, T> EvaluationFn<A, T> {
     }
 }
 
+/// A map of functions and constants used for evaluating expressions.
+///
+/// Examples
+/// --------
+/// ```rust
+/// use symbolica::{atom::AtomCore, parse, symbol};
+/// use symbolica::evaluate::{FunctionMap, OptimizationSettings};
+/// let mut fn_map = FunctionMap::new();
+/// fn_map.add_function(symbol!("f"), "f".to_string(), vec![symbol!("x")], parse!("x^2 + 1")).unwrap();
+///
+/// let optimization_settings = OptimizationSettings::default();
+/// let mut evaluator = parse!("f(x)")
+///     .evaluator(&fn_map, &vec![parse!("x")], optimization_settings)
+///     .unwrap().map_coeff(&|x| x.re.to_f64());
+/// assert_eq!(evaluator.evaluate_single(&[2.0]), 5.0);
+/// ```
 #[cfg_attr(
     feature = "bincode",
     derive(bincode_trait_derive::Encode),
@@ -68,6 +87,7 @@ impl<A, T> EvaluationFn<A, T> {
 pub struct FunctionMap<T = Complex<Rational>> {
     map: HashMap<Atom, ConstOrExpr<T>>,
     tagged_fn_map: HashMap<(Symbol, Vec<Atom>), ConstOrExpr<T>>,
+    external_fn: HashMap<Symbol, ConstOrExpr<T>>,
     tag: HashMap<Symbol, usize>,
 }
 
@@ -78,29 +98,43 @@ impl<T> Default for FunctionMap<T> {
 }
 
 impl<T> FunctionMap<T> {
+    /// Create a new, empty function map.
     pub fn new() -> Self {
         FunctionMap {
             map: HashMap::default(),
             tagged_fn_map: HashMap::default(),
             tag: HashMap::default(),
+            external_fn: HashMap::default(),
         }
     }
 
+    /// Register a constant.
     pub fn add_constant(&mut self, key: Atom, value: T) {
         self.map.insert(key, ConstOrExpr::Const(value));
     }
 
+    /// Register a function without tags. `rename` is the name used in exported code.
     pub fn add_function(
         &mut self,
         name: Symbol,
         rename: String,
         args: Vec<Symbol>,
         body: Atom,
-    ) -> Result<(), &str> {
-        if let Some(t) = self.tag.insert(name, 0) {
-            if t != 0 {
-                return Err("Cannot add the same function with a different number of parameters");
-            }
+    ) -> Result<(), String> {
+        if self.external_fn.contains_key(&name) {
+            return Err(format!(
+                "Cannot add function {}, as it is also an external function",
+                name.get_name()
+            ));
+        }
+
+        if let Some(t) = self.tag.insert(name, 0)
+            && t != 0
+        {
+            return Err(format!(
+                "Cannot add the same function {} with a different number of parameters",
+                name.get_name()
+            ));
         }
 
         self.tagged_fn_map.insert(
@@ -116,6 +150,7 @@ impl<T> FunctionMap<T> {
         Ok(())
     }
 
+    /// Register a function, where the first arguments are `tags` instead of arguments. `rename` is the name used in exported code.
     pub fn add_tagged_function(
         &mut self,
         name: Symbol,
@@ -123,11 +158,21 @@ impl<T> FunctionMap<T> {
         rename: String,
         args: Vec<Symbol>,
         body: Atom,
-    ) -> Result<(), &str> {
-        if let Some(t) = self.tag.insert(name, tags.len()) {
-            if t != tags.len() {
-                return Err("Cannot add the same function with a different number of parameters");
-            }
+    ) -> Result<(), String> {
+        if self.external_fn.contains_key(&name) {
+            return Err(format!(
+                "Cannot add function {}, as it is also an external function",
+                name.get_name()
+            ));
+        }
+
+        if let Some(t) = self.tag.insert(name, tags.len())
+            && t != tags.len()
+        {
+            return Err(format!(
+                "Cannot add the same function {} with a different number of parameters",
+                name.get_name()
+            ));
         }
 
         let tag_len = tags.len();
@@ -140,6 +185,48 @@ impl<T> FunctionMap<T> {
                 body,
             }),
         );
+
+        Ok(())
+    }
+
+    /// Register an external function that can later be linked with [ExpressionEvaluator::with_external_functions].
+    pub fn add_external_function(&mut self, name: Symbol, rename: String) -> Result<(), String> {
+        if self.tag.contains_key(&name) || self.external_fn.contains_key(&name) {
+            return Err(format!(
+                "Cannot add external function {}, as it is also a tagged function",
+                name.get_name()
+            ));
+        }
+
+        self.external_fn
+            .insert(name, ConstOrExpr::External(self.external_fn.len(), rename));
+
+        Ok(())
+    }
+
+    /// Register a conditional function that consists of three arguments:
+    /// - the condition that should be non-zero
+    /// - the true branch
+    /// - the false branch
+    pub fn add_conditional(&mut self, name: Symbol) -> Result<(), String> {
+        if self.external_fn.contains_key(&name) {
+            return Err(format!(
+                "Cannot add function {}, as it is also an external function",
+                name.get_name()
+            ));
+        }
+
+        if let Some(t) = self.tag.insert(name, 0)
+            && t != 0
+        {
+            return Err(format!(
+                "Cannot add the same function {} with a different number of parameters",
+                name.get_name()
+            ));
+        }
+
+        self.tagged_fn_map
+            .insert((name, vec![]), ConstOrExpr::Condition);
 
         Ok(())
     }
@@ -164,6 +251,10 @@ impl<T> FunctionMap<T> {
             let s = aa.get_symbol();
             let tag_len = self.get_tag_len(&s);
 
+            if let Some(s) = self.external_fn.get(&s) {
+                return Some(s);
+            }
+
             if aa.get_nargs() >= tag_len {
                 let tag = aa.iter().take(tag_len).map(|x| x.to_owned()).collect();
                 return self.tagged_fn_map.get(&(s, tag));
@@ -185,6 +276,8 @@ impl<T> FunctionMap<T> {
 enum ConstOrExpr<T> {
     Const(T),
     Expr(Expr),
+    External(usize, String),
+    Condition,
 }
 
 #[cfg_attr(
@@ -202,13 +295,28 @@ struct Expr {
     body: Atom,
 }
 
-#[derive(Debug, Clone)]
+/// Settings for optimizing the evaluation of expressions.
+#[derive(Clone)]
 pub struct OptimizationSettings {
     pub horner_iterations: usize,
     pub n_cores: usize,
     pub cpe_iterations: Option<usize>,
     pub hot_start: Option<Vec<Expression<Complex<Rational>>>>,
+    pub abort_check: Option<Box<dyn AbortCheck>>,
     pub verbose: bool,
+}
+
+impl std::fmt::Debug for OptimizationSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("OptimizationSettings")
+            .field("horner_iterations", &self.horner_iterations)
+            .field("n_cores", &self.n_cores)
+            .field("cpe_iterations", &self.cpe_iterations)
+            .field("hot_start", &self.hot_start)
+            .field("abort_check", &self.abort_check.is_some())
+            .field("verbose", &self.verbose)
+            .finish()
+    }
 }
 
 impl Default for OptimizationSettings {
@@ -218,20 +326,23 @@ impl Default for OptimizationSettings {
             n_cores: 1,
             cpe_iterations: None,
             hot_start: None,
+            abort_check: None,
             verbose: false,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct SplitExpression<T> {
-    pub tree: Vec<Expression<T>>,
-    pub subexpressions: Vec<Expression<T>>,
+struct SplitExpression<T> {
+    tree: Vec<Expression<T>>,
+    subexpressions: Vec<Expression<T>>,
 }
 
+/// A tree representation of multiple expressions, including function definitions.
 #[derive(Debug, Clone)]
 pub struct EvalTree<T> {
     functions: Vec<(String, Vec<Symbol>, SplitExpression<T>)>,
+    external_functions: Vec<String>,
     expressions: SplitExpression<T>,
     param_count: usize,
 }
@@ -283,6 +394,7 @@ impl BuiltinSymbol {
     }
 }
 
+/// A tree representation of an expression.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -296,6 +408,8 @@ pub enum Expression<T> {
     Powf(Box<(Expression<T>, Expression<T>)>),
     ReadArg(usize), // read nth function argument
     BuiltinFun(BuiltinSymbol, Box<Expression<T>>),
+    ExternalFun(usize, Vec<Expression<T>>),
+    IfElse(Box<(Expression<T>, Expression<T>, Expression<T>)>),
     SubExpression(usize),
 }
 
@@ -321,6 +435,10 @@ impl<T: InternalOrdering + Eq> Ord for Expression<T> {
             (Expression::BuiltinFun(a, arg1), Expression::BuiltinFun(b, arg2)) => {
                 a.cmp(b).then_with(|| arg1.cmp(arg2))
             }
+            (Expression::ExternalFun(a, arg1), Expression::ExternalFun(b, arg2)) => {
+                a.cmp(b).then_with(|| arg1.cmp(arg2))
+            }
+            (Expression::IfElse(a), Expression::IfElse(b)) => a.cmp(b),
             (Expression::SubExpression(a), Expression::SubExpression(b)) => a.cmp(b),
             (Expression::Const(_), _) => std::cmp::Ordering::Less,
             (_, Expression::Const(_)) => std::cmp::Ordering::Greater,
@@ -340,6 +458,10 @@ impl<T: InternalOrdering + Eq> Ord for Expression<T> {
             (_, Expression::ReadArg(_)) => std::cmp::Ordering::Greater,
             (Expression::BuiltinFun(_, _), _) => std::cmp::Ordering::Less,
             (_, Expression::BuiltinFun(_, _)) => std::cmp::Ordering::Greater,
+            (Expression::ExternalFun(_, _), _) => std::cmp::Ordering::Less,
+            (_, Expression::ExternalFun(_, _)) => std::cmp::Ordering::Greater,
+            (Expression::IfElse(_), _) => std::cmp::Ordering::Less,
+            (_, Expression::IfElse(_)) => std::cmp::Ordering::Greater,
         }
     }
 }
@@ -347,7 +469,7 @@ impl<T: InternalOrdering + Eq> Ord for Expression<T> {
 type ExpressionHash = u64;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum HashedExpression<T> {
+enum HashedExpression<T> {
     Const(ExpressionHash, T),
     Parameter(ExpressionHash, usize),
     Eval(ExpressionHash, usize, Vec<HashedExpression<T>>),
@@ -360,6 +482,15 @@ pub enum HashedExpression<T> {
     ),
     ReadArg(ExpressionHash, usize), // read nth function argument
     BuiltinFun(ExpressionHash, BuiltinSymbol, Box<HashedExpression<T>>),
+    ExternalFun(ExpressionHash, usize, Vec<HashedExpression<T>>),
+    IfElse(
+        ExpressionHash,
+        Box<(
+            HashedExpression<T>,
+            HashedExpression<T>,
+            HashedExpression<T>,
+        )>,
+    ),
     SubExpression(ExpressionHash, usize),
 }
 
@@ -376,6 +507,8 @@ impl<T> HashedExpression<T> {
             HashedExpression::ReadArg(h, _) => *h,
             HashedExpression::BuiltinFun(h, _, _) => *h,
             HashedExpression::SubExpression(h, _) => *h,
+            HashedExpression::ExternalFun(h, _, _) => *h,
+            HashedExpression::IfElse(h, _) => *h,
         }
     }
 }
@@ -403,6 +536,14 @@ impl<T: Clone> HashedExpression<T> {
                 Expression::BuiltinFun(*s, Box::new(a.to_expression()))
             }
             HashedExpression::SubExpression(_, s) => Expression::SubExpression(*s),
+            HashedExpression::ExternalFun(_, s, a) => {
+                Expression::ExternalFun(*s, a.iter().map(|x| x.to_expression()).collect())
+            }
+            HashedExpression::IfElse(_, b) => Expression::IfElse(Box::new((
+                b.0.to_expression(),
+                b.1.to_expression(),
+                b.2.to_expression(),
+            ))),
         }
     }
 }
@@ -432,6 +573,10 @@ impl<T: Eq + InternalOrdering> Ord for HashedExpression<T> {
             (HashedExpression::SubExpression(_, s1), HashedExpression::SubExpression(_, s2)) => {
                 s1.cmp(s2)
             }
+            (HashedExpression::ExternalFun(_, a, b), HashedExpression::ExternalFun(_, c, d)) => {
+                a.cmp(c).then_with(|| b.cmp(d))
+            }
+            (HashedExpression::IfElse(_, a), HashedExpression::IfElse(_, b)) => a.cmp(b),
             (HashedExpression::Const(_, _), _) => std::cmp::Ordering::Less,
             (_, HashedExpression::Const(_, _)) => std::cmp::Ordering::Greater,
             (HashedExpression::Parameter(_, _), _) => std::cmp::Ordering::Less,
@@ -450,6 +595,10 @@ impl<T: Eq + InternalOrdering> Ord for HashedExpression<T> {
             (_, HashedExpression::ReadArg(_, _)) => std::cmp::Ordering::Greater,
             (HashedExpression::BuiltinFun(_, _, _), _) => std::cmp::Ordering::Less,
             (_, HashedExpression::BuiltinFun(_, _, _)) => std::cmp::Ordering::Greater,
+            (HashedExpression::ExternalFun(_, _, _), _) => std::cmp::Ordering::Less,
+            (_, HashedExpression::ExternalFun(_, _, _)) => std::cmp::Ordering::Greater,
+            (HashedExpression::IfElse(_, _), _) => std::cmp::Ordering::Less,
+            (_, HashedExpression::IfElse(_, _)) => std::cmp::Ordering::Greater,
         }
     }
 }
@@ -490,7 +639,9 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
                     arg.find_subexpression(subexp);
                 }
             }
-            HashedExpression::Add(_, a) | HashedExpression::Mul(_, a) => {
+            HashedExpression::Add(_, a)
+            | HashedExpression::Mul(_, a)
+            | HashedExpression::ExternalFun(_, _, a) => {
                 for arg in a {
                     arg.find_subexpression(subexp);
                 }
@@ -502,8 +653,15 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
                 p.0.find_subexpression(subexp);
                 p.1.find_subexpression(subexp);
             }
-            HashedExpression::BuiltinFun(_, _, _) => {}
+            HashedExpression::BuiltinFun(_, _, a) => {
+                a.find_subexpression(subexp);
+            }
             HashedExpression::SubExpression(_, _) => {}
+            HashedExpression::IfElse(_, b) => {
+                b.0.find_subexpression(subexp);
+                b.1.find_subexpression(subexp);
+                b.2.find_subexpression(subexp);
+            }
         }
 
         false
@@ -514,11 +672,9 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
         subexp: &HashMap<&HashedExpression<T>, usize>,
         skip_root: bool,
     ) {
-        if !skip_root {
-            if let Some(i) = subexp.get(self) {
-                *self = HashedExpression::SubExpression(self.get_hash(), *i); // TODO: do not recyle hash?
-                return;
-            }
+        if !skip_root && let Some(i) = subexp.get(self) {
+            *self = HashedExpression::SubExpression(self.get_hash(), *i); // TODO: do not recyle hash?
+            return;
         }
 
         match self {
@@ -530,7 +686,9 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
                     arg.replace_subexpression(subexp, false);
                 }
             }
-            HashedExpression::Add(_, a) | HashedExpression::Mul(_, a) => {
+            HashedExpression::Add(_, a)
+            | HashedExpression::Mul(_, a)
+            | HashedExpression::ExternalFun(_, _, a) => {
                 for arg in a {
                     arg.replace_subexpression(subexp, false);
                 }
@@ -542,8 +700,15 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
                 p.0.replace_subexpression(subexp, false);
                 p.1.replace_subexpression(subexp, false);
             }
-            HashedExpression::BuiltinFun(_, _, _) => {}
+            HashedExpression::BuiltinFun(_, _, a) => {
+                a.replace_subexpression(subexp, false);
+            }
             HashedExpression::SubExpression(_, _) => {}
+            HashedExpression::IfElse(_, b) => {
+                b.0.replace_subexpression(subexp, false);
+                b.1.replace_subexpression(subexp, false);
+                b.2.replace_subexpression(subexp, false);
+            }
         }
     }
 
@@ -563,7 +728,6 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
         }
 
         if sub_expr.contains_key(self) {
-            //println!("SUB {:?}", self);
             return (0, 0);
         }
 
@@ -616,6 +780,22 @@ impl<T: Eq + Hash + Clone + InternalOrdering> HashedExpression<T> {
                 b.count_operations_with_subexpression(sub_expr)
             } // not clear how to count this, third arg?
             HashedExpression::SubExpression(_, _) => (0, 0),
+            HashedExpression::ExternalFun(_, _, a) => {
+                let mut add = 0;
+                let mut mul = 0;
+                for arg in a {
+                    let (a, m) = arg.count_operations_with_subexpression(sub_expr);
+                    add += a;
+                    mul += m;
+                }
+                (add + a.len() - 1, mul)
+            }
+            HashedExpression::IfElse(_, b) => {
+                let (a1, m1) = b.0.count_operations_with_subexpression(sub_expr);
+                let (a2, m2) = b.1.count_operations_with_subexpression(sub_expr);
+                let (a3, m3) = b.2.count_operations_with_subexpression(sub_expr);
+                (a1 + a2 + a3, m1 + m2 + m3)
+            }
         }
     }
 }
@@ -724,10 +904,41 @@ impl<T: std::hash::Hash + Clone> Expression<T> {
                 let h = hasher.finish();
                 (h, HashedExpression::SubExpression(h, *i))
             }
+            Expression::ExternalFun(s, a) => {
+                let mut hasher = AHasher::default();
+                hasher.write_u8(10);
+                s.hash(&mut hasher);
+                let mut args = vec![];
+                for x in a {
+                    let (h, v) = x.to_hashed_expression();
+                    hasher.write_u64(h);
+                    args.push(v);
+                }
+                let h = hasher.finish();
+                (h, HashedExpression::ExternalFun(h, *s, args))
+            }
+            Expression::IfElse(b) => {
+                let mut hasher = AHasher::default();
+                hasher.write_u8(11);
+                let (h1, v1) = b.0.to_hashed_expression();
+                let (h2, v2) = b.1.to_hashed_expression();
+                let (h3, v3) = b.2.to_hashed_expression();
+                hasher.write_u64(h1);
+                hasher.write_u64(h2);
+                hasher.write_u64(h3);
+                let h = hasher.finish();
+                (h, HashedExpression::IfElse(h, Box::new((v1, v2, v3))))
+            }
         }
     }
 }
 
+/// An optimized evaluator for expressions that can evaluate expressions with parameters.
+/// The evaluator can be called directly using [Self::evaluate] or it can be exported
+/// to high-performance C++ code using [Self::export_cpp].
+///
+/// To call the evaluator with external functions, use [Self::with_external_functions] to
+/// register implementation for them.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
 #[derive(Clone, PartialEq, Debug)]
@@ -738,29 +949,97 @@ pub struct ExpressionEvaluator<T> {
     reserved_indices: usize,
     instructions: Vec<Instr>,
     result_indices: Vec<usize>,
+    external_fns: Vec<String>,
+}
+
+impl<T: Clone> ExpressionEvaluator<T> {
+    /// Register external functions for the evaluator.
+    ///
+    /// Examples
+    /// --------
+    /// ```rust
+    /// use ahash::HashMap;
+    /// use symbolica::{atom::AtomCore, evaluate::{FunctionMap, OptimizationSettings}, parse, symbol};
+    ///
+    /// let mut ext: HashMap<String, Box<dyn Fn(&[f64]) -> f64 + Send + Sync>> = HashMap::default();
+    /// ext.insert("f".to_string(), Box::new(|a| a[0] * a[0] + a[1]));
+    ///
+    ///
+    /// let mut f = FunctionMap::new();
+    /// f.add_external_function(symbol!("f"), "f".to_string())
+    ///     .unwrap();
+    ///
+    /// let params = vec![parse!("x"), parse!("y")];
+    /// let optimization_settings = OptimizationSettings::default();
+    /// let evaluator = parse!("f(x,y)").evaluator(&f, &params, optimization_settings).unwrap().map_coeff(&|x| x.re.to_f64());
+    ///
+    /// let mut ev = evaluator.with_external_functions(ext).unwrap();
+    /// assert_eq!(ev.evaluate_single(&[2.0, 3.0]), 7.0);
+    /// ```
+    pub fn with_external_functions(
+        &self,
+        mut external_fns: HashMap<String, Box<dyn Fn(&[T]) -> T + Send + Sync>>,
+    ) -> Result<ExpressionEvaluatorWithExternalFunctions<T>, String> {
+        let mut external = vec![];
+        for e in &self.external_fns {
+            if let Some(f) = external_fns.remove(e) {
+                external.push((vec![], f));
+            } else {
+                return Err(format!("External function '{e}' not found"));
+            }
+        }
+
+        Ok(ExpressionEvaluatorWithExternalFunctions {
+            stack: self.stack.clone(),
+            param_count: self.param_count,
+            instructions: self.instructions.clone(),
+            result_indices: self.result_indices.clone(),
+            external_fns: external,
+        })
+    }
 }
 
 impl<T: SingleFloat> ExpressionEvaluator<Complex<T>> {
+    /// Check if the expression evaluator is real, i.e., all coefficients are real.
     pub fn is_real(&self) -> bool {
         self.stack.iter().all(|x| x.is_real())
     }
 }
 
 impl<T: Real> ExpressionEvaluator<T> {
+    /// Evaluate the expression evaluator which yields a single result.
     pub fn evaluate_single(&mut self, params: &[T]) -> T {
+        if self.result_indices.len() != 1 {
+            panic!(
+                "Evaluator does not return a single result but {} results",
+                self.result_indices.len()
+            );
+        }
+
         let mut res = T::new_zero();
         self.evaluate(params, std::slice::from_mut(&mut res));
         res
     }
 
+    /// Evaluate the expression evaluator and write the results in `out`.
     pub fn evaluate(&mut self, params: &[T], out: &mut [T]) {
+        if self.param_count != params.len() {
+            panic!(
+                "Parameter count mismatch: expected {}, got {}",
+                self.param_count,
+                params.len()
+            );
+        }
+
         for (t, p) in self.stack.iter_mut().zip(params) {
             *t = p.clone();
         }
 
         let mut tmp;
-        for i in &self.instructions {
-            match i {
+        let mut i = 0;
+        while i < self.instructions.len() {
+            let instr = unsafe { &self.instructions.get_unchecked(i) };
+            match instr {
                 Instr::Add(r, v) => {
                     tmp = self.stack[v[0]].clone();
                     for x in &v[1..] {
@@ -788,14 +1067,42 @@ impl<T: Real> ExpressionEvaluator<T> {
                     self.stack[*r] = self.stack[*b].powf(&self.stack[*e]);
                 }
                 Instr::BuiltinFun(r, s, arg) => match s.0 {
-                    Atom::EXP => self.stack[*r] = self.stack[*arg].exp(),
-                    Atom::LOG => self.stack[*r] = self.stack[*arg].log(),
-                    Atom::SIN => self.stack[*r] = self.stack[*arg].sin(),
-                    Atom::COS => self.stack[*r] = self.stack[*arg].cos(),
-                    Atom::SQRT => self.stack[*r] = self.stack[*arg].sqrt(),
+                    Symbol::EXP => self.stack[*r] = self.stack[*arg].exp(),
+                    Symbol::LOG => self.stack[*r] = self.stack[*arg].log(),
+                    Symbol::SIN => self.stack[*r] = self.stack[*arg].sin(),
+                    Symbol::COS => self.stack[*r] = self.stack[*arg].cos(),
+                    Symbol::SQRT => self.stack[*r] = self.stack[*arg].sqrt(),
+                    Symbol::CONJ => self.stack[*r] = self.stack[*arg].conj(),
                     _ => unreachable!(),
                 },
+                Instr::ExternalFun(_, s, _) => {
+                    panic!(
+                        "External function {} is not set. Call `with_external_functions` first.",
+                        self.external_fns[*s]
+                    );
+                }
+                Instr::IfElse(n, label) => {
+                    // jump to else block
+                    if self.stack[*n].is_fully_zero() {
+                        i = label.0;
+                        continue;
+                    }
+                }
+                Instr::Goto(label) => {
+                    i = label.0;
+                    continue;
+                }
+                Instr::Label(_) => {}
+                Instr::Join(r, c, a, b) => {
+                    if !self.stack[*c].is_fully_zero() {
+                        self.stack[*r] = self.stack[*a].clone();
+                    } else {
+                        self.stack[*r] = self.stack[*b].clone();
+                    }
+                }
             }
+
+            i += 1;
         }
 
         for (o, i) in out.iter_mut().zip(&self.result_indices) {
@@ -813,6 +1120,7 @@ impl<T: Default> ExpressionEvaluator<T> {
             reserved_indices: self.reserved_indices,
             instructions: self.instructions,
             result_indices: self.result_indices,
+            external_fns: self.external_fns.clone(),
         }
     }
 
@@ -824,31 +1132,96 @@ impl<T: Default> ExpressionEvaluator<T> {
         self.result_indices.len()
     }
 
+    /// Return the total number of additions and multiplications.
+    pub fn count_operations(&self) -> (usize, usize) {
+        let mut add_count = 0;
+        let mut mul_count = 0;
+
+        for instr in &self.instructions {
+            match instr {
+                Instr::Add(_, s) => add_count += s.len() - 1,
+                Instr::Mul(_, s) => mul_count += s.len() - 1,
+                _ => {}
+            }
+        }
+
+        (add_count, mul_count)
+    }
+
+    /// Remove common pairs of instructions. Assumes that the arguments
+    /// of the instructions are sorted.
     fn remove_common_pairs(&mut self) -> usize {
-        let mut pairs: HashMap<_, Vec<usize>> = HashMap::default();
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        enum CommonInstruction {
+            Add(usize, usize),
+            Mul(usize, usize),
+            BuiltinFun(Symbol, usize),
+            ExternalFun(usize, Vec<usize>),
+        }
 
-        let mut affected_lines = vec![true; self.instructions.len()];
+        let mut common_ops: HashMap<_, Vec<usize>> = HashMap::default();
 
+        let mut affected_lines = vec![false; self.instructions.len()];
+
+        let mut line_usage_zone = vec![0; self.instructions.len()];
+
+        let mut current_zone = 0;
+        let mut current_zone_depth = 0;
         for (p, i) in self.instructions.iter().enumerate() {
             match i {
                 Instr::Add(_, a) | Instr::Mul(_, a) => {
                     let is_add = matches!(i, Instr::Add(_, _));
                     for (li, l) in a.iter().enumerate() {
                         for r in &a[li + 1..] {
-                            pairs.entry((is_add, *l, *r)).or_default().push(p);
+                            if is_add {
+                                common_ops
+                                    .entry(CommonInstruction::Add(*l, *r))
+                                    .or_default()
+                                    .push(p);
+                            } else {
+                                common_ops
+                                    .entry(CommonInstruction::Mul(*l, *r))
+                                    .or_default()
+                                    .push(p);
+                            }
                         }
                     }
                 }
+                Instr::BuiltinFun(_, f, a) => {
+                    common_ops
+                        .entry(CommonInstruction::BuiltinFun(f.0, *a))
+                        .or_default()
+                        .push(p);
+                }
+                Instr::ExternalFun(_, f, args) => {
+                    common_ops
+                        .entry(CommonInstruction::ExternalFun(*f, args.clone()))
+                        .or_default()
+                        .push(p);
+                }
+                Instr::IfElse(_, _) => {
+                    line_usage_zone[p] = current_zone;
+                    current_zone_depth += 1;
+                    current_zone += 3_usize.pow(current_zone_depth);
+                    continue;
+                }
+                Instr::Goto(_) => {
+                    current_zone += 3_usize.pow(current_zone_depth);
+                }
+                Instr::Join(..) => {
+                    current_zone %= 3_usize.pow(current_zone_depth);
+                    current_zone_depth -= 1;
+                }
                 _ => {}
             }
+            line_usage_zone[p] = current_zone;
         }
 
-        // for now, ignore pairs with only occurrences on the same line
-        let mut to_remove: Vec<_> = pairs.clone().into_iter().collect();
-
+        let mut to_remove: Vec<_> = common_ops.clone().into_iter().collect();
         to_remove.retain_mut(|(_, v)| {
+            let keep = v.len() > 1;
             v.dedup();
-            v.len() > 1
+            keep
         });
 
         // sort in other direction since we pop
@@ -856,111 +1229,198 @@ impl<T: Default> ExpressionEvaluator<T> {
 
         let total_remove = to_remove.len();
 
-        affected_lines.fill(false);
-
         let old_len = self.instructions.len();
 
-        while let Some(((is_add, l, r), lines)) = to_remove.pop() {
-            if lines.iter().any(|x| affected_lines[*x]) {
-                continue;
-            }
+        let mut new_symb_usage_zone = vec![];
 
-            let new_idx = self.stack.len();
-            let new_op = if is_add {
-                Instr::Add(new_idx, vec![l, r])
-            } else {
-                Instr::Mul(new_idx, vec![l, r])
+        while let Some((common, lines)) = to_remove.pop() {
+            match common {
+                CommonInstruction::Add(l, r) | CommonInstruction::Mul(l, r) => {
+                    let is_add = matches!(common, CommonInstruction::Add(_, _));
+
+                    if lines.iter().any(|x| affected_lines[*x]) {
+                        continue;
+                    }
+
+                    let new_idx = self.stack.len();
+                    let new_op = if is_add {
+                        Instr::Add(new_idx, vec![l, r])
+                    } else {
+                        Instr::Mul(new_idx, vec![l, r])
+                    };
+
+                    self.stack.push(T::default());
+                    self.instructions.push(new_op);
+
+                    let mut usage_zone = line_usage_zone[lines[0]];
+                    for &line in &lines {
+                        affected_lines[line] = true;
+
+                        let lu = line_usage_zone[line];
+                        for pow in 1..32 {
+                            if lu % 3usize.pow(pow) != usage_zone % 3usize.pow(pow) {
+                                usage_zone %= 3usize.pow(pow - 1);
+                                break;
+                            }
+                        }
+
+                        let is_add = matches!(self.instructions[line], Instr::Add(_, _));
+
+                        if let Instr::Add(_, a) | Instr::Mul(_, a) = &mut self.instructions[line] {
+                            for (li, l) in a.iter().enumerate() {
+                                for r in &a[li + 1..] {
+                                    let pp = common_ops
+                                        .entry(if is_add {
+                                            CommonInstruction::Add(*l, *r)
+                                        } else {
+                                            CommonInstruction::Mul(*l, *r)
+                                        })
+                                        .or_default();
+                                    pp.retain(|x| *x != line);
+                                }
+                            }
+
+                            if l == r {
+                                let count = a.iter().filter(|x| **x == l).count();
+                                let pairs = count / 2;
+                                if pairs > 0 {
+                                    a.retain(|x| *x != l);
+
+                                    if count % 2 == 1 {
+                                        a.push(l);
+                                    }
+
+                                    a.extend(std::iter::repeat_n(new_idx, pairs));
+                                    a.sort();
+                                }
+                            } else {
+                                let mut idx1_count = 0;
+                                let mut idx2_count = 0;
+                                for v in &*a {
+                                    if *v == l {
+                                        idx1_count += 1;
+                                    }
+                                    if *v == r {
+                                        idx2_count += 1;
+                                    }
+                                }
+
+                                let pair_count = idx1_count.min(idx2_count);
+
+                                if pair_count > 0 {
+                                    a.retain(|x| *x != l && *x != r);
+
+                                    // add back removed indices in cases such as idx1*idx2*idx2
+                                    if idx1_count > pair_count {
+                                        a.extend(std::iter::repeat_n(l, idx1_count - pair_count));
+                                    }
+                                    if idx2_count > pair_count {
+                                        a.extend(std::iter::repeat_n(r, idx2_count - pair_count));
+                                    }
+
+                                    a.extend(std::iter::repeat_n(new_idx, pair_count));
+                                    a.sort();
+                                }
+                            }
+
+                            // update the pairs for this line
+                            for (li, l) in a.iter().enumerate() {
+                                for r in &a[li + 1..] {
+                                    common_ops
+                                        .entry(if is_add {
+                                            CommonInstruction::Add(*l, *r)
+                                        } else {
+                                            CommonInstruction::Mul(*l, *r)
+                                        })
+                                        .or_default()
+                                        .push(line);
+                                }
+                            }
+                        }
+                    }
+
+                    new_symb_usage_zone.push((lines[0], usage_zone));
+                }
+                CommonInstruction::BuiltinFun(_, _) | CommonInstruction::ExternalFun(_, _) => {
+                    if lines.iter().any(|x| affected_lines[*x]) {
+                        continue;
+                    }
+
+                    let new_idx = self.stack.len();
+                    let new_op = match common {
+                        CommonInstruction::BuiltinFun(s, a) => {
+                            Instr::BuiltinFun(new_idx, BuiltinSymbol(s), a)
+                        }
+                        CommonInstruction::ExternalFun(s, a) => Instr::ExternalFun(new_idx, s, a),
+                        _ => unreachable!(),
+                    };
+
+                    self.stack.push(T::default());
+                    self.instructions.push(new_op);
+
+                    let mut usage_zone = line_usage_zone[lines[0]];
+                    for &line in &lines {
+                        affected_lines[line] = true;
+
+                        let lu = line_usage_zone[line];
+                        for pow in 1..32 {
+                            if lu % 3usize.pow(pow) != usage_zone % 3usize.pow(pow) {
+                                usage_zone %= 3usize.pow(pow - 1);
+                                break;
+                            }
+                        }
+
+                        match &self.instructions[line] {
+                            Instr::BuiltinFun(r, _, _) => {
+                                self.instructions[line] = Instr::Add(*r, vec![new_idx]);
+                            }
+                            Instr::ExternalFun(r, _, _) => {
+                                self.instructions[line] = Instr::Add(*r, vec![new_idx]);
+                            }
+                            _ => panic!("Expected BuiltinFun or ExternalFun instruction"),
+                        }
+                    }
+
+                    new_symb_usage_zone.push((lines[0], usage_zone));
+                }
+            }
+        }
+
+        // detect the earliest point and latest point for an instruction placement
+        // earliest point: after last dependency
+        // latest point: before first usage in the correct usage zone
+        let mut placement_bounds = vec![];
+        for (i, (first_usage, zone)) in self.instructions.drain(old_len..).zip(new_symb_usage_zone)
+        {
+            let deps = match &i {
+                Instr::BuiltinFun(_, _, a) => std::slice::from_ref(a),
+                Instr::Add(_, a) | Instr::Mul(_, a) | Instr::ExternalFun(_, _, a) => a.as_slice(),
+                _ => unreachable!(),
             };
 
-            self.stack.push(T::default());
-            self.instructions.push(new_op);
-
-            for line in lines {
-                affected_lines[line] = true;
-                let is_add = matches!(self.instructions[line], Instr::Add(_, _));
-
-                if let Instr::Add(_, a) | Instr::Mul(_, a) = &mut self.instructions[line] {
-                    for (li, l) in a.iter().enumerate() {
-                        for r in &a[li + 1..] {
-                            let pp = pairs.entry((is_add, *l, *r)).or_default();
-                            pp.retain(|x| *x != line);
-                        }
-                    }
-
-                    if l == r {
-                        let count = a.iter().filter(|x| **x == l).count();
-                        let pairs = count / 2;
-                        if pairs > 0 {
-                            a.retain(|x| *x != l);
-
-                            if count % 2 == 1 {
-                                a.push(l);
-                            }
-
-                            a.extend(std::iter::repeat_n(new_idx, pairs));
-                            a.sort();
-                        }
-                    } else {
-                        let mut idx1_count = 0;
-                        let mut idx2_count = 0;
-                        for v in &*a {
-                            if *v == l {
-                                idx1_count += 1;
-                            }
-                            if *v == r {
-                                idx2_count += 1;
-                            }
-                        }
-
-                        let pair_count = idx1_count.min(idx2_count);
-
-                        if pair_count > 0 {
-                            a.retain(|x| *x != l && *x != r);
-
-                            // add back removed indices in cases such as idx1*idx2*idx2
-                            if idx1_count > pair_count {
-                                a.extend(std::iter::repeat_n(l, idx1_count - pair_count));
-                            }
-                            if idx2_count > pair_count {
-                                a.extend(std::iter::repeat_n(r, idx2_count - pair_count));
-                            }
-
-                            a.extend(std::iter::repeat_n(new_idx, pair_count));
-                            a.sort();
-                        }
-                    }
-
-                    // update the pairs for this line
-                    for (li, l) in a.iter().enumerate() {
-                        for r in &a[li + 1..] {
-                            pairs.entry((is_add, *l, *r)).or_default().push(line);
-                        }
-                    }
-                }
+            let mut last_dep = deps[0];
+            for v in deps {
+                last_dep = last_dep.max(*v);
             }
-        }
 
-        let mut first_use = vec![];
-        for i in self.instructions.drain(old_len..) {
-            if let Instr::Add(_, a) | Instr::Mul(_, a) = &i {
-                let mut last_dep = a[0];
-                for v in a {
-                    last_dep = last_dep.max(*v);
-                }
-
-                let ins = if last_dep < self.reserved_indices {
-                    0
-                } else {
-                    last_dep + 1 - self.reserved_indices
-                };
-
-                first_use.push((ins, i));
+            let ins = if last_dep < self.reserved_indices {
+                0
             } else {
-                unreachable!()
+                last_dep + 1 - self.reserved_indices
+            };
+
+            let mut latest_pos = ins;
+            for j in (ins..first_usage + 1).rev() {
+                if line_usage_zone[j] == zone {
+                    latest_pos = j;
+                    break;
+                }
             }
+
+            placement_bounds.push((ins, latest_pos, i));
         }
 
-        first_use.sort_by_key(|x| x.0);
+        placement_bounds.sort_by_key(|x| x.1);
 
         let mut new_instr = vec![];
         let mut i = 0;
@@ -982,21 +1442,32 @@ impl<T: Default> ExpressionEvaluator<T> {
         while i < self.instructions.len() {
             let new_pos = new_instr.len() + self.reserved_indices;
 
-            if j < first_use.len() && i == first_use[j].0 {
-                let (o, a) = match &first_use[j].1 {
-                    Instr::Add(o, a) => (*o, a),
-                    Instr::Mul(o, a) => (*o, a),
+            if j < placement_bounds.len() && i == placement_bounds[j].1 {
+                let (o, a) = match &placement_bounds[j].2 {
+                    Instr::Add(o, a) => (*o, a.as_slice()),
+                    Instr::Mul(o, a) => (*o, a.as_slice()),
+                    Instr::BuiltinFun(o, _, a) => (*o, std::slice::from_ref(a)),
+                    Instr::ExternalFun(o, _, a) => (*o, a.as_slice()),
                     _ => unreachable!(),
                 };
 
-                let is_add = matches!(&first_use[j].1, Instr::Add(_, _));
+                let mut new_a = a.iter().map(|x| rename!(*x)).collect::<Vec<_>>();
+                new_a.sort();
 
-                let new_a = a.iter().map(|x| rename!(*x)).collect::<Vec<_>>();
-
-                if is_add {
-                    new_instr.push(Instr::Add(new_pos, new_a));
-                } else {
-                    new_instr.push(Instr::Mul(new_pos, new_a));
+                match placement_bounds[j].2 {
+                    Instr::Add(_, _) => {
+                        new_instr.push(Instr::Add(new_pos, new_a));
+                    }
+                    Instr::Mul(_, _) => {
+                        new_instr.push(Instr::Mul(new_pos, new_a));
+                    }
+                    Instr::BuiltinFun(_, b, _) => {
+                        new_instr.push(Instr::BuiltinFun(new_pos, b, new_a[0]));
+                    }
+                    Instr::ExternalFun(_, fi, _) => {
+                        new_instr.push(Instr::ExternalFun(new_pos, fi, new_a));
+                    }
+                    _ => unreachable!(),
                 }
 
                 sub_rename.insert(o, new_pos);
@@ -1010,6 +1481,7 @@ impl<T: Default> ExpressionEvaluator<T> {
                         for x in &mut *a {
                             *x = rename!(*x);
                         }
+                        a.sort();
 
                         // remove assignments
                         if a.len() == 1 {
@@ -1029,6 +1501,22 @@ impl<T: Default> ExpressionEvaluator<T> {
                         *b = rename!(*b);
                         *p = new_pos;
                     }
+                    Instr::ExternalFun(p, _, a) => {
+                        *p = new_pos;
+                        for x in a {
+                            *x = rename!(*x);
+                        }
+                    }
+                    Instr::Join(p, a, b, c) => {
+                        *a = rename!(*a);
+                        *b = rename!(*b);
+                        *c = rename!(*c);
+                        *p = new_pos;
+                    }
+                    Instr::IfElse(c, _) => {
+                        *c = rename!(*c);
+                    }
+                    Instr::Goto(_) | Instr::Label(_) => {}
                 }
 
                 new_instr.push(s);
@@ -1037,22 +1525,48 @@ impl<T: Default> ExpressionEvaluator<T> {
             }
         }
 
+        // fix labels
+        let mut label_map: HashMap<usize, usize> = HashMap::default();
+        for (i, x) in new_instr.iter_mut().enumerate().rev() {
+            match x {
+                Instr::Label(l) => {
+                    label_map.insert(l.0, i);
+                    l.0 = i;
+                }
+                Instr::Goto(l) => {
+                    l.0 = label_map[&l.0];
+                }
+                Instr::IfElse(_, l) => {
+                    l.0 = label_map[&l.0];
+                }
+                _ => {}
+            }
+        }
+
         for x in &mut self.result_indices {
             *x = rename!(*x);
         }
 
-        assert!(j == first_use.len());
+        assert!(j == placement_bounds.len());
 
         self.instructions = new_instr;
+
         total_remove
     }
 }
 
 impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
-    /// Merge evaluator `other` into `self`. The parameters must be the same.
+    /// Merge evaluator `other` into `self`. The parameters must be the same, and
+    /// the outputs will be concatenated.
+    ///
+    /// The optional `cpe_rounds` parameter can be used to limit the number of common
+    /// pair elimination rounds after the merge.
     pub fn merge(&mut self, mut other: Self, cpe_rounds: Option<usize>) -> Result<(), String> {
         if self.param_count != other.param_count {
-            return Err("Parameter count is different".to_owned());
+            return Err(format!(
+                "Parameter count is different: {} vs {}",
+                self.param_count, other.param_count
+            ));
         }
 
         let mut constants = HashMap::default();
@@ -1083,7 +1597,7 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
         if delta > 0 {
             for i in &mut self.instructions {
                 match i {
-                    Instr::Add(r, a) | Instr::Mul(r, a) => {
+                    Instr::Add(r, a) | Instr::Mul(r, a) | Instr::ExternalFun(r, _, a) => {
                         *r += delta;
                         for aa in a {
                             if *aa >= self.reserved_indices {
@@ -1106,18 +1620,38 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
                             *e += delta;
                         }
                     }
+                    Instr::IfElse(c, _) => {
+                        if *c >= self.reserved_indices {
+                            *c += delta;
+                        }
+                    }
+                    Instr::Join(r, c, t, f) => {
+                        *r += delta;
+                        if *c >= self.reserved_indices {
+                            *c += delta;
+                        }
+                        if *t >= self.reserved_indices {
+                            *t += delta;
+                        }
+                        if *f >= self.reserved_indices {
+                            *f += delta;
+                        }
+                    }
+                    Instr::Goto(..) | Instr::Label(..) => {}
                 }
             }
 
             for x in &mut self.result_indices {
-                *x += delta;
+                if *x >= self.reserved_indices {
+                    *x += delta;
+                }
             }
         }
 
         delta = old_len + new_reserved_indices - other.reserved_indices;
         for i in &mut other.instructions {
             match i {
-                Instr::Add(r, a) | Instr::Mul(r, a) => {
+                Instr::Add(r, a) | Instr::Mul(r, a) | Instr::ExternalFun(r, _, a) => {
                     *r += delta;
                     for aa in a {
                         if *aa >= other.reserved_indices {
@@ -1148,6 +1682,36 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
                         *e = self.param_count + constants[&other.stack[*e]];
                     }
                 }
+                Instr::IfElse(c, l) => {
+                    if *c >= other.reserved_indices {
+                        *c += delta;
+                    } else if *c >= other.param_count {
+                        *c = self.param_count + constants[&other.stack[*c]];
+                    }
+
+                    l.0 += self.instructions.len();
+                }
+                Instr::Join(r, c, t, f) => {
+                    *r += delta;
+                    if *c >= other.reserved_indices {
+                        *c += delta;
+                    } else if *c >= other.param_count {
+                        *c = self.param_count + constants[&other.stack[*c]];
+                    }
+                    if *t >= other.reserved_indices {
+                        *t += delta;
+                    } else if *t >= other.param_count {
+                        *t = self.param_count + constants[&other.stack[*t]];
+                    }
+                    if *f >= other.reserved_indices {
+                        *f += delta;
+                    } else if *f >= other.param_count {
+                        *f = self.param_count + constants[&other.stack[*f]];
+                    }
+                }
+                Instr::Goto(l) | Instr::Label(l) => {
+                    l.0 += self.instructions.len();
+                }
             }
         }
 
@@ -1163,11 +1727,140 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
         self.result_indices.append(&mut other.result_indices);
         self.reserved_indices = new_reserved_indices;
 
+        self.undo_stack_optimization();
+
+        for _ in 0..cpe_rounds.unwrap_or(usize::MAX) {
+            if self.remove_common_pairs() == 0 {
+                break;
+            }
+        }
+
+        self.optimize_stack();
+
+        Ok(())
+    }
+}
+
+impl<T> ExpressionEvaluator<T> {
+    pub fn optimize_stack(&mut self) {
+        let mut last_use: Vec<usize> = vec![0; self.stack.len()];
+
+        for (i, x) in self.instructions.iter().enumerate() {
+            match x {
+                Instr::Add(_, a) | Instr::Mul(_, a) | Instr::ExternalFun(_, _, a) => {
+                    for v in a {
+                        last_use[*v] = i;
+                    }
+                }
+                Instr::Pow(_, b, _) | Instr::BuiltinFun(_, _, b) => {
+                    last_use[*b] = i;
+                }
+                Instr::Powf(_, a, b) => {
+                    last_use[*a] = i;
+                    last_use[*b] = i;
+                }
+                Instr::Join(_, c, a, b) => {
+                    last_use[*c] = i;
+                    last_use[*a] = i;
+                    last_use[*b] = i;
+                }
+                Instr::IfElse(c, _) => {
+                    last_use[*c] = i;
+                }
+                Instr::Goto(..) | Instr::Label(..) => {}
+            };
+        }
+
+        // prevent init slots from being overwritten
+        for i in 0..self.reserved_indices {
+            last_use[i] = self.instructions.len();
+        }
+
+        // prevent the output slots from being overwritten
+        for i in &self.result_indices {
+            last_use[*i] = self.instructions.len();
+        }
+
+        let mut rename_map: Vec<_> = (0..self.stack.len()).collect(); // identity map
+
+        let mut max_reg = self.reserved_indices;
+        for (i, x) in self.instructions.iter_mut().enumerate() {
+            let cur_reg = match x {
+                Instr::Add(r, _)
+                | Instr::Mul(r, _)
+                | Instr::Pow(r, _, _)
+                | Instr::Powf(r, _, _)
+                | Instr::BuiltinFun(r, _, _)
+                | Instr::ExternalFun(r, _, _)
+                | Instr::Join(r, _, _, _) => *r,
+                Instr::IfElse(c, _) => {
+                    *c = rename_map[*c];
+                    continue;
+                }
+                Instr::Goto(..) | Instr::Label(..) => continue,
+            };
+
+            let cur_last_use = last_use[cur_reg];
+
+            let new_reg = if let Some((new_v, lu)) = last_use[..cur_reg]
+                .iter_mut()
+                .enumerate()
+                .find(|(_, r)| **r <= i)
+            // <= is ok because we store intermediate results in temp values
+            {
+                *lu = cur_last_use; // set the last use to the current variable last use
+                last_use[cur_reg] = 0; // make the current index available
+                rename_map[cur_reg] = new_v; // set the rename map so that every occurrence on the rhs is replaced
+                new_v
+            } else {
+                cur_reg
+            };
+
+            max_reg = max_reg.max(new_reg);
+
+            match x {
+                Instr::Add(r, a) | Instr::Mul(r, a) | Instr::ExternalFun(r, _, a) => {
+                    *r = new_reg;
+                    for v in a {
+                        *v = rename_map[*v];
+                    }
+                }
+                Instr::Pow(r, b, _) | Instr::BuiltinFun(r, _, b) => {
+                    *r = new_reg;
+                    *b = rename_map[*b];
+                }
+                Instr::Powf(r, a, b) => {
+                    *r = new_reg;
+                    *a = rename_map[*a];
+                    *b = rename_map[*b];
+                }
+                Instr::Join(r, c, a, b) => {
+                    *r = new_reg;
+                    *c = rename_map[*c];
+                    *a = rename_map[*a];
+                    *b = rename_map[*b];
+                }
+                Instr::IfElse(_, _) | Instr::Goto(..) | Instr::Label(..) => {
+                    unreachable!()
+                }
+            };
+        }
+
+        self.stack.truncate(max_reg + 1);
+
+        for i in &mut self.result_indices {
+            *i = rename_map[*i];
+        }
+    }
+}
+
+impl<T: Default> ExpressionEvaluator<T> {
+    fn undo_stack_optimization(&mut self) {
         // undo the stack optimization
         let mut unfold = HashMap::default();
         for (index, i) in &mut self.instructions.iter_mut().enumerate() {
             match i {
-                Instr::Add(r, a) | Instr::Mul(r, a) => {
+                Instr::Add(r, a) | Instr::Mul(r, a) | Instr::ExternalFun(r, _, a) => {
                     for aa in a {
                         if *aa >= self.reserved_indices {
                             *aa = unfold[aa];
@@ -1194,6 +1887,25 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
                     unfold.insert(*r, index + self.reserved_indices);
                     *r = index + self.reserved_indices;
                 }
+                Instr::IfElse(r, _) => {
+                    if *r >= self.reserved_indices {
+                        *r = unfold[r];
+                    }
+                }
+                Instr::Join(r, c, t, f) => {
+                    if *c >= self.reserved_indices {
+                        *c = unfold[c];
+                    }
+                    if *t >= self.reserved_indices {
+                        *t = unfold[t];
+                    }
+                    if *f >= self.reserved_indices {
+                        *f = unfold[f];
+                    }
+                    unfold.insert(*r, index + self.reserved_indices);
+                    *r = index + self.reserved_indices;
+                }
+                Instr::Goto(..) | Instr::Label(..) => {}
             }
         }
 
@@ -1206,104 +1918,6 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
         for _ in 0..self.instructions.len() {
             self.stack.push(T::default());
         }
-
-        for _ in 0..cpe_rounds.unwrap_or(usize::MAX) {
-            if self.remove_common_pairs() == 0 {
-                break;
-            }
-        }
-
-        self.optimize_stack();
-
-        Ok(())
-    }
-}
-
-impl<T> ExpressionEvaluator<T> {
-    pub fn optimize_stack(&mut self) {
-        let mut last_use: Vec<usize> = vec![0; self.stack.len()];
-
-        for (i, x) in self.instructions.iter().enumerate() {
-            match x {
-                Instr::Add(_, a) | Instr::Mul(_, a) => {
-                    for v in a {
-                        last_use[*v] = i;
-                    }
-                }
-                Instr::Pow(_, b, _) | Instr::BuiltinFun(_, _, b) => {
-                    last_use[*b] = i;
-                }
-                Instr::Powf(_, a, b) => {
-                    last_use[*a] = i;
-                    last_use[*b] = i;
-                }
-            };
-        }
-
-        // prevent init slots from being overwritten
-        for i in 0..self.reserved_indices {
-            last_use[i] = self.instructions.len();
-        }
-
-        // prevent the output slots from being overwritten
-        for i in &self.result_indices {
-            last_use[*i] = self.instructions.len();
-        }
-
-        let mut rename_map: Vec<_> = (0..self.stack.len()).collect(); // identity map
-
-        let mut max_reg = self.reserved_indices;
-        for (i, x) in self.instructions.iter_mut().enumerate() {
-            let cur_reg = match x {
-                Instr::Add(r, _)
-                | Instr::Mul(r, _)
-                | Instr::Pow(r, _, _)
-                | Instr::Powf(r, _, _)
-                | Instr::BuiltinFun(r, _, _) => *r,
-            };
-
-            let cur_last_use = last_use[cur_reg];
-
-            let new_reg = if let Some((new_v, lu)) = last_use[..cur_reg]
-                .iter_mut()
-                .enumerate()
-                .find(|(_, r)| **r <= i)
-            // <= is ok because we store intermediate results in temp values
-            {
-                *lu = cur_last_use; // set the last use to the current variable last use
-                last_use[cur_reg] = 0; // make the current index available
-                rename_map[cur_reg] = new_v; // set the rename map so that every occurrence on the rhs is replaced
-                new_v
-            } else {
-                cur_reg
-            };
-
-            max_reg = max_reg.max(new_reg);
-
-            match x {
-                Instr::Add(r, a) | Instr::Mul(r, a) => {
-                    *r = new_reg;
-                    for v in a {
-                        *v = rename_map[*v];
-                    }
-                }
-                Instr::Pow(r, b, _) | Instr::BuiltinFun(r, _, b) => {
-                    *r = new_reg;
-                    *b = rename_map[*b];
-                }
-                Instr::Powf(r, a, b) => {
-                    *r = new_reg;
-                    *a = rename_map[*a];
-                    *b = rename_map[*b];
-                }
-            };
-        }
-
-        self.stack.truncate(max_reg + 1);
-
-        for i in &mut self.result_indices {
-            *i = rename_map[*i];
-        }
     }
 }
 
@@ -1314,6 +1928,10 @@ pub trait ExportNumber {
     /// Export the number wrapped in a C++ type `T`.
     fn export_wrapped(&self) -> String {
         format!("T({})", self.export())
+    }
+    /// Export the number wrapped in a C++ type `wrapper`.
+    fn export_wrapped_with(&self, wrapper: &str) -> String {
+        format!("{wrapper}({})", self.export())
     }
     /// Check if the number is real.
     fn is_real(&self) -> bool;
@@ -1373,42 +1991,415 @@ impl<T: ExportNumber + SingleFloat> ExportNumber for Complex<T> {
     }
 }
 
-impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
-    /// Create a C++ code representation of the evaluation tree.
+/// The number class used for exporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberClass {
+    RealF64,
+    ComplexF64,
+}
+
+/// Settings for exporting the evaluation tree to C++ code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportSettings {
+    /// Include required `#include` statements in the generated code.
+    pub include_header: bool,
+    /// Set the inline assembly mode.
     /// With `inline_asm` set to any value other than `None`,
     /// high-performance inline ASM code will be generated for most
     /// evaluation instructions. This often gives better performance than
     /// the `O3` optimization level and results in very fast compilation.
-    pub fn export_cpp(
+    pub inline_asm: InlineASM,
+    /// Custom header to include in the generated code.
+    /// This can be used to include additional libraries or custom functions.
+    pub custom_header: Option<String>,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        ExportSettings {
+            include_header: true,
+            inline_asm: InlineASM::default(),
+            custom_header: None,
+        }
+    }
+}
+
+impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
+    /// Create a C++ code representation of the evaluation tree.
+    /// The resulting source code can be compiled and loaded.
+    ///
+    /// You can also call `export_cpp` with types [f64], [wide::f64x4] for SIMD, [Complex] over [f64] and [wide::f64x4] for Complex SIMD, and [CudaRealf64] or
+    /// [CudaComplexf64] for CUDA output.
+    ///
+    /// # Examples
+    ///
+    /// Create a C++ library that evaluates the function `x + y` for `f64` inputs:
+    /// ```rust
+    /// use symbolica::{atom::AtomCore, parse};
+    /// use symbolica::evaluate::{CompiledNumber, FunctionMap, OptimizationSettings};
+    /// let fn_map = FunctionMap::new();
+    /// let params = vec![parse!("x"), parse!("y")];
+    /// let optimization_settings = OptimizationSettings::default();
+    /// let evaluator = parse!("x + y")
+    ///     .evaluator(&fn_map, &params, optimization_settings)
+    ///     .unwrap()
+    ///     .map_coeff(&|x| x.to_real().unwrap().to_f64());
+    ///
+    /// let code = evaluator.export_cpp::<f64>("output.cpp", "my_function", Default::default()).unwrap();
+    /// let lib = code.compile("out.so", f64::get_default_compile_options()).unwrap();
+    /// let mut compiled_eval = lib.load().unwrap();
+    ///
+    /// let mut res = [0.];
+    /// compiled_eval.evaluate(&[1., 2.], &mut res);
+    /// assert_eq!(res, [3.]);
+    /// ```
+    pub fn export_cpp<F: CompiledNumber>(
         &self,
-        filename: &str,
+        path: impl AsRef<Path>,
         function_name: &str,
-        include_header: bool,
-        inline_asm: InlineASM,
-    ) -> Result<ExportedCode, std::io::Error> {
-        let mut filename = filename.to_string();
-        if !filename.ends_with(".cpp") {
-            filename += ".cpp";
+        settings: ExportSettings,
+    ) -> Result<ExportedCode<F>, std::io::Error> {
+        let mut filename = path.as_ref().to_path_buf();
+        if filename.extension().map(|x| x != ".cpp").unwrap_or(false) {
+            filename.set_extension("cpp");
         }
 
-        let cpp = match inline_asm {
-            InlineASM::X64 => self.export_asm_str(function_name, include_header, inline_asm),
-            InlineASM::AArch64 => self.export_asm_str(function_name, include_header, inline_asm),
-            InlineASM::None => self.export_cpp_str(function_name, include_header),
-        };
+        let mut source_code = format!(
+            "// Auto-generated with Symbolica {}\n// Default build instructions: {} {}\n\n",
+            env!("CARGO_PKG_VERSION"),
+            F::get_default_compile_options().to_string(),
+            filename.to_string_lossy(),
+        );
 
-        std::fs::write(&filename, cpp)?;
-        Ok(ExportedCode {
-            source_filename: filename,
+        source_code += &self
+            .export_cpp_str::<F>(function_name, settings)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        std::fs::write(&filename, source_code)?;
+        Ok(ExportedCode::<F> {
+            path: filename,
             function_name: function_name.to_string(),
+            _phantom: std::marker::PhantomData,
         })
     }
 
-    pub fn export_cpp_str(&self, function_name: &str, include_header: bool) -> String {
+    /// Write the evaluation tree to a C++ source string.
+    pub fn export_cpp_str<F: CompiledNumber>(
+        &self,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        let function_name = F::construct_function_name(function_name);
+        F::export_cpp(self, &function_name, settings)
+    }
+
+    pub fn export_simd_str(
+        &self,
+        function_name: &str,
+        settings: ExportSettings,
+        complex: bool,
+        asm: InlineASM,
+    ) -> String {
         let mut res = String::new();
-        if include_header {
-            res += "#include <iostream>\n#include <complex>\n#include <cmath>\n\n";
+        if settings.include_header {
+            res += "#include \"xsimd/xsimd.hpp\"\n";
+        }
+
+        if complex {
+            res += "#include <complex>\n";
+            res += "using simd = xsimd::batch<std::complex<double>, xsimd::best_arch>;\n";
+        } else {
+            res += "using simd = xsimd::batch<double, xsimd::best_arch>;\n";
+        }
+
+        match asm {
+            InlineASM::AVX2 => {
+                res += &format!(
+                    "extern \"C\" unsigned long {}_get_buffer_len()\n{{\n\treturn {};\n}}\n\n",
+                    function_name,
+                    self.stack.len()
+                );
+
+                if complex {
+                    res += &format!(
+                        "static const simd {}_CONSTANTS_complex[{}] = {{{}}};\n\n",
+                        function_name,
+                        self.reserved_indices - self.param_count + 1,
+                        {
+                            let mut nums = (self.param_count..self.reserved_indices)
+                                .map(|i| format!("simd({})", self.stack[i].export()))
+                                .collect::<Vec<_>>();
+                            nums.push("-0.".to_string()); // used for inversion
+                            nums.join(",")
+                        }
+                    );
+                } else {
+                    res += &format!(
+                        "static const simd {}_CONSTANTS_double[{}] = {{{}}};\n\n",
+                        function_name,
+                        self.reserved_indices - self.param_count + 1,
+                        {
+                            let mut nums = (self.param_count..self.reserved_indices)
+                                .map(|i| format!("simd({})", self.stack[i].export()))
+                                .collect::<Vec<_>>();
+                            nums.push("1".to_string()); // used for inversion
+                            nums.join(",")
+                        }
+                    );
+                }
+
+                res += &format!(
+                    "\nextern \"C\" void {function_name}(simd *params, simd *Z, simd *out) {{\n"
+                );
+
+                if complex {
+                    self.export_asm_complex_impl(&self.instructions, function_name, asm, &mut res);
+                } else {
+                    self.export_asm_double_impl(&self.instructions, function_name, asm, &mut res);
+                }
+
+                res += "\treturn;\n}\n";
+            }
+            InlineASM::None => {
+                res += &self.export_generic_cpp_str(function_name, &settings, NumberClass::RealF64);
+
+                res += &format!(
+                    "\nextern \"C\" {{\n\tvoid {function_name}(simd *params, simd *buffer, simd *out) {{\n\t\t{function_name}_gen(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n"
+                );
+            }
+            _ => panic!("Bad inline ASM option: {:?}", asm),
+        }
+
+        res
+    }
+
+    pub fn export_cuda_str(
+        &self,
+        function_name: &str,
+        settings: ExportSettings,
+        number_class: NumberClass,
+    ) -> String {
+        let mut res = String::new();
+        if settings.include_header {
+            res += "#include <cuda_runtime.h>\n";
+            res += "#include <iostream>\n";
+            res += "#include <stdio.h>\n";
+            if number_class == NumberClass::ComplexF64 {
+                res += "#include <cuda/std/complex>\n";
+            } else {
+                res += "template<typename T> T conj(T a) { return a; }\n";
+            }
         };
+
+        res += &format!("#define ERRMSG_LEN {}\n", CUDA_ERRMSG_LEN);
+
+        if let Some(header) = &settings.custom_header {
+            res += header;
+            res += "\n\n";
+        }
+        if number_class == NumberClass::ComplexF64 {
+            res += "typedef cuda::std::complex<double> CudaNumber;\n";
+            res += "typedef std::complex<double> Number;\n";
+        } else if number_class == NumberClass::RealF64 {
+            res += "typedef double CudaNumber;\n";
+            res += "typedef double Number;\n";
+        }
+
+        res += &format!(
+            "\n__device__ void {}(CudaNumber* params, CudaNumber* out, size_t index) {{\n",
+            function_name
+        );
+
+        res += &format!(
+            "\tCudaNumber {};\n",
+            (0..self.stack.len())
+                .map(|x| format!("Z{}", x))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        res += &format!("\tint params_offset = index * {};\n", self.param_count);
+        res += &format!(
+            "\tint out_offset = index * {};\n",
+            self.result_indices.len()
+        );
+
+        self.export_cpp_impl("params_offset + ", "CudaNumber", false, &mut res);
+
+        for (i, r) in &mut self.result_indices.iter().enumerate() {
+            res += &format!("\tout[out_offset + {i}] = ");
+            res += &if *r < self.param_count {
+                format!("params[params_offset + {r}]")
+            } else if *r < self.reserved_indices {
+                self.stack[*r].export_wrapped_with("CudaNumber")
+            } else {
+                format!("Z{r}")
+            };
+
+            res += ";\n";
+        }
+
+        res += "\treturn;\n}\n";
+
+        res += &format!(
+            r#"
+struct {name}_EvaluationData {{
+    CudaNumber *params;
+    CudaNumber *out;
+    size_t n; // Number of evaluations
+    size_t block_size; // Number of threads per block
+    size_t in_dimension = {in_dimension}; // Number of input parameters
+    size_t out_dimension = {out_dimension}; // Number of output parameters
+    int last_error = 0; // Last error code
+    char last_error_msg[ERRMSG_LEN]; // error string buffer
+}};
+
+#define gpuErrchk(ans, data, context) gpuAssert((ans), data, __FILE__, __LINE__, context)
+inline int gpuAssert(cudaError_t code, {name}_EvaluationData* data, const char *file, int line, const char *context)
+{{
+   if (code != cudaSuccess)
+   {{
+       const char* msg = cudaGetErrorString(code);
+       if (msg) {{
+           snprintf(
+               data->last_error_msg,
+               ERRMSG_LEN,
+               "%s:%d:%s: CUDA error: %s",
+                file,
+                line,
+                context,
+                msg
+            );
+        }} else {{
+            snprintf(
+                data->last_error_msg,
+                ERRMSG_LEN,
+                "%s:%d:%s: CUDA error: unkown",
+                file,
+                line,
+                context
+            );
+        }}
+    }}
+    // should always be 0
+    if (data->last_error != 0) {{
+        fprintf(stderr,
+                "%s:%d:%s: CUDA fatal: previous error was not resolved",
+                file,
+                line,
+                context
+        );
+        // flush output
+        fflush(stderr);
+        // we crash the evaluation since previous failure was not sanitized
+        exit(-1);
+    }}
+    data->last_error = (int)code;
+    return data->last_error;
+}}
+
+
+
+extern "C" {{
+
+{name}_EvaluationData* {name}_init_data(size_t n, size_t block_size) {{
+    {name}_EvaluationData* data = ({name}_EvaluationData*)malloc(sizeof({name}_EvaluationData));
+    size_t in_dimension = {in_dimension};
+    size_t out_dimension = {out_dimension};
+    data->n = n;
+    data->in_dimension = in_dimension;
+    data->out_dimension = out_dimension;
+    data->block_size = block_size;
+    data->last_error = 0;
+    // return data early since second failure => abort/crash code
+    if(gpuErrchk(cudaMalloc((void**)&data->params, n*in_dimension * sizeof(CudaNumber)),data, "init_data_params")) return data;
+    if(gpuErrchk(cudaMalloc((void**)&data->out, n*out_dimension*sizeof(CudaNumber)),data, "init_data_out")) return data;
+    return data;
+}}
+
+int {name}_destroy_data({name}_EvaluationData* data) {{
+    // since we free the evaluationData no error can be returned through it
+    // neither a Result<(),String> return would make sense in rust drop
+    cudaError_t error;
+    error = cudaFree(data->params);
+    if (error != cudaSuccess) return (int)error;
+    error = cudaFree(data->out);
+    if (error != cudaSuccess) return (int)error;
+    free(data);
+    return 0;
+}}
+}}
+       "#,
+            name = function_name,
+            in_dimension = self.param_count,
+            out_dimension = self.result_indices.len()
+        );
+
+        res += &format!(
+            r#"
+extern "C" {{
+    __global__ void {name}_cuda(CudaNumber *params, CudaNumber *out, size_t n) {{
+        int index = blockIdx.x * blockDim.x + threadIdx.x;
+        if(index < n) {name}(params, out, index);
+        return;
+    }}
+}}
+"#,
+            name = function_name
+        );
+
+        res += &format!(
+            r#"
+extern "C" {{
+    void {name}_vec(Number *params, Number *out, {name}_EvaluationData* data) {{
+        size_t n = data->n;
+        size_t in_dimension = {in_dimension};
+        size_t out_dimension = {out_dimension};
+
+        if(gpuErrchk(cudaMemcpy(data->params, params, n*in_dimension * sizeof(CudaNumber), cudaMemcpyHostToDevice),data, "copy_data_params")) return;
+
+        int blockSize = data->block_size; // Number of threads per block
+        int gridSize = (n + blockSize - 1) / blockSize; // Number of blocks
+        {name}_cuda<<<gridSize,blockSize>>>(data->params, data->out,n);
+        // Collect launch errors
+        if(gpuErrchk(cudaPeekAtLastError(), data, "launch")) return;
+        // Collect runtime errors
+        if(gpuErrchk(cudaDeviceSynchronize(), data, "runtime")) return;
+
+        if(gpuErrchk(cudaMemcpy(out, data->out, n*out_dimension*sizeof(CudaNumber), cudaMemcpyDeviceToHost),data, "copy_data_out")) return;
+        return;
+    }}
+}}
+"#,
+            name = function_name,
+            in_dimension = self.param_count,
+            out_dimension = self.result_indices.len()
+        );
+
+        res
+    }
+
+    fn export_generic_cpp_str(
+        &self,
+        function_name: &str,
+        settings: &ExportSettings,
+        number_class: NumberClass,
+    ) -> String {
+        let mut res = String::new();
+        if settings.include_header {
+            res += "#include <iostream>\n#include <cmath>\n\n";
+            if number_class == NumberClass::ComplexF64 {
+                res += "#include <complex>\n";
+            } else {
+                res += "template<typename T> T conj(T a) { return a; }\n";
+            }
+        };
+
+        if number_class == NumberClass::ComplexF64 {
+            res += "typedef std::complex<double> Number;\n";
+        } else if number_class == NumberClass::RealF64 {
+            res += "typedef double Number;\n";
+        }
 
         res += &format!(
             "extern \"C\" unsigned long {}_get_buffer_len()\n{{\n\treturn {};\n}}\n\n",
@@ -1417,117 +2408,219 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
         );
 
         res += &format!(
-            "\ntemplate<typename T>\nvoid {}(T* params, T* Z, T* out) {{\n",
-            function_name
+            "\ntemplate<typename T>\nvoid {function_name}_gen(T* params, T* Z, T* out) {{\n"
         );
 
-        for i in 0..self.param_count {
-            res += &format!("\tZ[{}] = params[{}];\n", i, i);
-        }
-
-        for i in self.param_count..self.reserved_indices {
-            res += &format!("\tZ[{}] = {};\n", i, self.stack[i].export_wrapped());
-        }
-
-        Self::export_cpp_impl(&self.instructions, &mut res);
+        self.export_cpp_impl("", "T", true, &mut res);
 
         for (i, r) in &mut self.result_indices.iter().enumerate() {
-            res += &format!("\tout[{}] = Z[{}];\n", i, r);
+            res += &format!("\tout[{i}] = ");
+            res += &if *r < self.param_count {
+                format!("params[{r}]")
+            } else if *r < self.reserved_indices {
+                self.stack[*r].export_wrapped_with("T")
+            } else {
+                format!("Z[{r}]")
+            };
+
+            res += ";\n";
         }
 
         res += "\treturn;\n}\n";
 
-        if self.stack.iter().all(|x| x.is_real()) {
-            res += &format!(
-                "\nextern \"C\" {{\n\tvoid {0}_double(double *params, double *buffer, double *out) {{\n\t\t{0}(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n",
-                function_name
-            );
-        } else {
-            res += &format!(
-                "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n\tstd::cout << \"Cannot evaluate complex function with doubles\" << std::endl;\n\treturn; \n}}",
-                function_name
-            );
-        }
-
-        res += &format!(
-            "\nextern \"C\" {{\n\tvoid {0}_complex(std::complex<double> *params, std::complex<double> *buffer,  std::complex<double> *out) {{\n\t\t{0}(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n",
-            function_name
+        // if there are non-reals we can not use double evaluation
+        assert!(
+            !(!self.stack.iter().all(|x| x.is_real()) && number_class == NumberClass::RealF64),
+            "Cannot export complex function with real numbers"
         );
 
         res
     }
 
-    fn export_cpp_impl(instr: &[Instr], out: &mut String) {
-        for ins in instr {
+    fn export_cpp_impl(
+        &self,
+        param_offset: &str,
+        number_wrapper: &str,
+        tmp_array: bool,
+        out: &mut String,
+    ) {
+        macro_rules! get_input {
+            ($i:expr) => {
+                if $i < self.param_count {
+                    format!("params[{}{}]", param_offset, $i)
+                } else if $i < self.reserved_indices {
+                    self.stack[$i].export_wrapped_with(number_wrapper)
+                } else {
+                    // TODO: subtract reserved indices
+                    if tmp_array {
+                        format!("Z[{}]", $i)
+                    } else {
+                        format!("Z{}", $i)
+                    }
+                }
+            };
+        }
+
+        macro_rules! get_output {
+            ($i:expr) => {
+                if tmp_array {
+                    format!("Z[{}]", $i)
+                } else {
+                    format!("Z{}", $i)
+                }
+            };
+        }
+
+        for ins in &self.instructions {
             match ins {
                 Instr::Add(o, a) => {
                     let args = a
                         .iter()
-                        .map(|x| format!("Z[{}]", x))
+                        .map(|x| get_input!(*x))
                         .collect::<Vec<_>>()
                         .join("+");
 
-                    *out += format!("\tZ[{}] = {};\n", o, args).as_str();
+                    *out += format!("\t{} = {args};\n", get_output!(o)).as_str();
                 }
                 Instr::Mul(o, a) => {
                     let args = a
                         .iter()
-                        .map(|x| format!("Z[{}]", x))
+                        .map(|x| get_input!(*x))
                         .collect::<Vec<_>>()
                         .join("*");
 
-                    *out += format!("\tZ[{}] = {};\n", o, args).as_str();
+                    *out += format!("\t{} = {args};\n", get_output!(o)).as_str();
                 }
                 Instr::Pow(o, b, e) => {
-                    let base = format!("Z[{}]", b);
+                    let base = get_input!(*b);
                     if *e == -1 {
-                        *out += format!("\tZ[{}] = T(1) / {};\n", o, base).as_str();
+                        *out += format!("\t{} = T(1) / {base};\n", get_output!(o)).as_str();
                     } else {
-                        *out += format!("\tZ[{}] = pow({}, {});\n", o, base, e).as_str();
+                        *out += format!("\t{} = pow({base}, {e});\n", get_output!(o)).as_str();
                     }
                 }
                 Instr::Powf(o, b, e) => {
-                    let base = format!("Z[{}]", b);
-                    let exp = format!("Z[{}]", e);
-                    *out += format!("\tZ[{}] = pow({}, {});\n", o, base, exp).as_str();
+                    let base = get_input!(*b);
+                    let exp = get_input!(*e);
+                    *out += format!("\t{} = pow({base}, {exp});\n", get_output!(o)).as_str();
                 }
                 Instr::BuiltinFun(o, s, a) => match s.0 {
-                    Atom::EXP => {
-                        let arg = format!("Z[{}]", a);
-                        *out += format!("\tZ[{}] = exp({});\n", o, arg).as_str();
+                    Symbol::EXP => {
+                        let arg = get_input!(*a);
+                        *out += format!("\t{} = exp({arg});\n", get_output!(o)).as_str();
                     }
-                    Atom::LOG => {
-                        let arg = format!("Z[{}]", a);
-                        *out += format!("\tZ[{}] = log({});\n", o, arg).as_str();
+                    Symbol::LOG => {
+                        let arg = get_input!(*a);
+                        *out += format!("\t{} = log({arg});\n", get_output!(o)).as_str();
                     }
-                    Atom::SIN => {
-                        let arg = format!("Z[{}]", a);
-                        *out += format!("\tZ[{}] = sin({});\n", o, arg).as_str();
+                    Symbol::SIN => {
+                        let arg = get_input!(*a);
+                        *out += format!("\t{} = sin({arg});\n", get_output!(o)).as_str();
                     }
-                    Atom::COS => {
-                        let arg = format!("Z[{}]", a);
-                        *out += format!("\tZ[{}] = cos({});\n", o, arg).as_str();
+                    Symbol::COS => {
+                        let arg = get_input!(*a);
+                        *out += format!("\t{} = cos({arg});\n", get_output!(o)).as_str();
                     }
-                    Atom::SQRT => {
-                        let arg = format!("Z[{}]", a);
-                        *out += format!("\tZ[{}] = sqrt({});\n", o, arg).as_str();
+                    Symbol::SQRT => {
+                        let arg = get_input!(*a);
+                        *out += format!("\t{} = sqrt({arg});\n", get_output!(o)).as_str();
+                    }
+                    Symbol::CONJ => {
+                        let arg = get_input!(*a);
+                        *out += format!("\t{} = conj({arg});\n", get_output!(o)).as_str();
                     }
                     _ => unreachable!(),
                 },
+                Instr::ExternalFun(o, s, a) => {
+                    let name = &self.external_fns[*s];
+                    let args = a.iter().map(|x| get_input!(*x)).collect::<Vec<_>>();
+
+                    *out +=
+                        format!("\t{} = {}({});\n", get_output!(o), name, args.join(", ")).as_str();
+                }
+                Instr::IfElse(cond, _label) => {
+                    *out += &format!("\tif ({} != 0.) {{\n", get_input!(*cond));
+                }
+                Instr::Goto(..) => {
+                    *out += "\t} else {\n";
+                }
+                Instr::Label(..) => {}
+                Instr::Join(o, cond, a, b) => {
+                    *out += "\t}\n";
+                    let arg_a = get_input!(*a);
+                    let arg_b = get_input!(*b);
+                    *out += format!(
+                        "\t{} = ({} != 0.) ? {} : {};\n",
+                        get_output!(o),
+                        get_input!(*cond),
+                        arg_a,
+                        arg_b
+                    )
+                    .as_str();
+                }
             }
         }
     }
 
-    pub fn export_asm_str(
-        &self,
-        function_name: &str,
-        include_header: bool,
-        asm_flavour: InlineASM,
-    ) -> String {
+    fn export_asm_real_str(&self, function_name: &str, settings: &ExportSettings) -> String {
         let mut res = String::new();
-        if include_header {
+        if settings.include_header {
+            res += "#include <iostream>\n#include <cmath>\n\n";
+        };
+
+        if let Some(header) = &settings.custom_header {
+            res += header;
+        }
+
+        res += &format!(
+            "extern \"C\" unsigned long {}_get_buffer_len()\n{{\n\treturn {};\n}}\n\n",
+            function_name,
+            self.stack.len()
+        );
+
+        if self.stack.iter().all(|x| x.is_real()) {
+            res += &format!(
+                "static const double {}_CONSTANTS_double[{}] = {{{}}};\n\n",
+                function_name,
+                self.reserved_indices - self.param_count + 1,
+                {
+                    let mut nums = (self.param_count..self.reserved_indices)
+                        .map(|i| format!("double({})", self.stack[i].export()))
+                        .collect::<Vec<_>>();
+                    nums.push("1".to_string()); // used for inversion
+                    nums.join(",")
+                }
+            );
+
+            res += &format!(
+                "extern \"C\" void {function_name}(const double *params, double* Z, double *out)\n{{\n"
+            );
+
+            self.export_asm_double_impl(
+                &self.instructions,
+                function_name,
+                settings.inline_asm,
+                &mut res,
+            );
+
+            res += "\treturn;\n}\n";
+        } else {
+            res += &format!(
+                "extern \"C\" void {function_name}(const double *params, double* Z, double *out)\n{{\n\tstd::cout << \"Cannot evaluate complex function with doubles\" << std::endl;\n\treturn; \n}}",
+            );
+        }
+        res
+    }
+
+    fn export_asm_complex_str(&self, function_name: &str, settings: &ExportSettings) -> String {
+        let mut res = String::new();
+        if settings.include_header {
             res += "#include <iostream>\n#include <complex>\n#include <cmath>\n\n";
         };
+
+        if let Some(header) = &settings.custom_header {
+            res += header;
+        }
 
         res += &format!(
             "extern \"C\" unsigned long {}_get_buffer_len()\n{{\n\treturn {};\n}}\n\n",
@@ -1549,43 +2642,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
         );
 
         res += &format!(
-            "extern \"C\" void {}_complex(const std::complex<double> *params, std::complex<double> *Z, std::complex<double> *out)\n{{\n",
-            function_name
+            "extern \"C\" void {function_name}(const std::complex<double> *params, std::complex<double> *Z, std::complex<double> *out)\n{{\n"
         );
 
-        self.export_asm_complex_impl(&self.instructions, function_name, asm_flavour, &mut res);
+        self.export_asm_complex_impl(
+            &self.instructions,
+            function_name,
+            settings.inline_asm,
+            &mut res,
+        );
 
-        res += "\treturn;\n}\n\n";
-
-        if self.stack.iter().all(|x| x.is_real()) {
-            res += &format!(
-                "static const double {}_CONSTANTS_double[{}] = {{{}}};\n\n",
-                function_name,
-                self.reserved_indices - self.param_count + 1,
-                {
-                    let mut nums = (self.param_count..self.reserved_indices)
-                        .map(|i| format!("double({})", self.stack[i].export()))
-                        .collect::<Vec<_>>();
-                    nums.push("1".to_string()); // used for inversion
-                    nums.join(",")
-                }
-            );
-
-            res += &format!(
-                "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n",
-                function_name
-            );
-
-            self.export_asm_double_impl(&self.instructions, function_name, asm_flavour, &mut res);
-
-            res += "\treturn;\n}\n";
-        } else {
-            res += &format!(
-                "extern \"C\" void {}_double(const double *params, double* Z, double *out)\n{{\n\tstd::cout << \"Cannot evaluate complex function with doubles\" << std::endl;\n\treturn; \n}}",
-                function_name,
-            );
-        }
-        res
+        res + "\treturn;\n}\n\n"
     }
 
     fn export_asm_double_impl(
@@ -1625,6 +2692,16 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         } else {
                             // TODO: subtract reserved indices
                             format!("{}(%0)", $i * 8)
+                        }
+                    }
+                    InlineASM::AVX2 => {
+                        if $i < self.param_count {
+                            format!("{}(%2)", $i * 32)
+                        } else if $i < self.reserved_indices {
+                            format!("{}(%1)", ($i - self.param_count) * 32)
+                        } else {
+                            // TODO: subtract reserved indices
+                            format!("{}(%0)", $i * 32)
                         }
                     }
                     InlineASM::AArch64 => {
@@ -1697,6 +2774,9 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         InlineASM::X64 => {
                             *out += &format!("\t\t:\n\t\t: \"r\"(Z), \"r\"({}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"xmm0\", \"xmm1\", \"xmm2\", \"xmm3\", \"xmm4\", \"xmm5\", \"xmm6\", \"xmm7\", \"xmm8\", \"xmm9\", \"xmm10\", \"xmm11\", \"xmm12\", \"xmm13\", \"xmm14\", \"xmm15\");\n",  function_name);
                         }
+                        InlineASM::AVX2 => {
+                            *out += &format!("\t\t:\n\t\t: \"r\"(Z), \"r\"({}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"ymm0\", \"ymm1\", \"ymm2\", \"ymm3\", \"ymm4\", \"ymm5\", \"ymm6\", \"ymm7\", \"ymm8\", \"ymm9\", \"ymm10\", \"ymm11\", \"ymm12\", \"ymm13\", \"ymm14\", \"ymm15\");\n",  function_name);
+                        }
                         InlineASM::AArch64 => {
                             *out += &format!("\t\t:\n\t\t: \"r\"(Z), \"r\"({}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"x8\", \"d0\", \"d1\", \"d2\", \"d3\", \"d4\", \"d5\", \"d6\", \"d7\", \"d8\", \"d9\", \"d10\", \"d11\", \"d12\", \"d13\", \"d14\", \"d15\", \"d16\", \"d17\", \"d18\", \"d19\", \"d20\", \"d21\", \"d22\", \"d23\", \"d24\", \"d25\", \"d26\", \"d27\", \"d28\", \"d29\", \"d30\", \"d31\");\n",  function_name);
                         }
@@ -1712,7 +2792,7 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
 
         for (i, ins) in instr.iter().enumerate() {
             match ins {
-                Instr::Add(r, a) | Instr::Mul(r, a) => {
+                Instr::Add(r, a) | Instr::Mul(r, a) | Instr::ExternalFun(r, _, a) => {
                     for x in a {
                         if x >= &self.reserved_indices {
                             reg_last_use[stack_to_reg[x]] = i;
@@ -1742,6 +2822,24 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     }
                     stack_to_reg.insert(r, i);
                 }
+                Instr::IfElse(c, _) => {
+                    if c >= &self.reserved_indices {
+                        reg_last_use[stack_to_reg[c]] = i;
+                    }
+                }
+                Instr::Join(r, c, t, f) => {
+                    if c >= &self.reserved_indices {
+                        reg_last_use[stack_to_reg[c]] = i;
+                    }
+                    if t >= &self.reserved_indices {
+                        reg_last_use[stack_to_reg[t]] = i;
+                    }
+                    if f >= &self.reserved_indices {
+                        reg_last_use[stack_to_reg[f]] = i;
+                    }
+                    stack_to_reg.insert(r, i);
+                }
+                Instr::Goto(..) | Instr::Label(..) => {}
             }
         }
 
@@ -1764,6 +2862,11 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
             Pow(MemOrReg, u16, MemOrReg, i64),
             Powf(usize, usize, usize),
             BuiltinFun(usize, BuiltinSymbol, usize),
+            ExternalFun(usize, usize, Vec<usize>),
+            IfElse(usize),
+            Goto,
+            Label,
+            Join(usize, usize, usize, usize),
         }
 
         let mut new_instr: Vec<RegInstr> = instr
@@ -1784,6 +2887,11 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                 }
                 Instr::Powf(r, b, e) => RegInstr::Powf(*r, *b, *e),
                 Instr::BuiltinFun(r, s, a) => RegInstr::BuiltinFun(*r, *s, *a),
+                Instr::ExternalFun(r, s, a) => RegInstr::ExternalFun(*r, *s, a.clone()),
+                Instr::IfElse(c, _) => RegInstr::IfElse(*c),
+                Instr::Goto(_) => RegInstr::Goto,
+                Instr::Label(_) => RegInstr::Label,
+                Instr::Join(r, c, a, b) => RegInstr::Join(*r, *c, *a, *b),
             })
             .collect();
 
@@ -1870,6 +2978,22 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                 panic!("use outside of ASM block");
                             }
                         }
+                        RegInstr::ExternalFun(_, _, a) => {
+                            if a.contains(&old_reg) {
+                                panic!("use outside of ASM block");
+                            }
+                        }
+                        RegInstr::IfElse(c) => {
+                            if *c == old_reg {
+                                panic!("use outside of ASM block");
+                            }
+                        }
+                        RegInstr::Goto | RegInstr::Label => {}
+                        RegInstr::Join(_, c, a, b) => {
+                            if *c == old_reg || *a == old_reg || *b == old_reg {
+                                panic!("use outside of ASM block");
+                            }
+                        }
                     }
                 }
 
@@ -1904,14 +3028,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             MemOrReg::Reg(k) => match asm_flavour {
                                                 InlineASM::X64 => {
                                                     *out += &format!(
-                                                        "\t\t\"{}sd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                        oper, k, out_reg,
+                                                        "\t\t\"{oper}sd %%xmm{k}, %%xmm{out_reg}\\n\\t\"\n",
+                                                    );
+                                                }
+                                                InlineASM::AVX2 => {
+                                                    *out += &format!(
+                                                        "\t\t\"v{oper}pd %%ymm{k}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n",
                                                     );
                                                 }
                                                 InlineASM::AArch64 => {
                                                     *out += &format!(
-                                                        "\t\t\"f{} d{}, d{}, d{}\\n\\t\"\n",
-                                                        oper, out_reg, k, out_reg,
+                                                        "\t\t\"f{oper} d{out_reg}, d{k}, d{out_reg}\\n\\t\"\n",
                                                     );
                                                 }
                                                 InlineASM::None => unreachable!(),
@@ -1920,20 +3047,23 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 InlineASM::X64 => {
                                                     let addr = asm_load!(*k);
                                                     *out += &format!(
-                                                        "\t\t\"{}sd {}, %%xmm{}\\n\\t\"\n",
-                                                        oper, addr, out_reg
+                                                        "\t\t\"{oper}sd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                    );
+                                                }
+                                                InlineASM::AVX2 => {
+                                                    let addr = asm_load!(*k);
+                                                    *out += &format!(
+                                                        "\t\t\"v{oper}pd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                     );
                                                 }
                                                 InlineASM::AArch64 => {
                                                     let addr = asm_load!(*k);
                                                     *out += &format!(
-                                                        "\t\t\"ldr d31, {}\\n\\t\"\n",
-                                                        addr,
+                                                        "\t\t\"ldr d31, {addr}\\n\\t\"\n",
                                                     );
 
                                                     *out += &format!(
-                                                        "\t\t\"f{} d{}, d31, d{}\\n\\t\"\n",
-                                                        oper, out_reg, out_reg
+                                                        "\t\t\"f{oper} d{out_reg}, d31, d{out_reg}\\n\\t\"\n"
                                                     );
                                                 }
                                                 InlineASM::None => unreachable!(),
@@ -1948,13 +3078,16 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                 match asm_flavour {
                                     InlineASM::X64 => {
                                         *out += &format!(
-                                            "\t\t\"movapd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                            j, out_reg
+                                            "\t\t\"movapd %%xmm{j}, %%xmm{out_reg}\\n\\t\"\n"
+                                        );
+                                    }
+                                    InlineASM::AVX2 => {
+                                        *out += &format!(
+                                            "\t\t\"vmovapd %%ymm{j}, %%ymm{out_reg}\\n\\t\"\n"
                                         );
                                     }
                                     InlineASM::AArch64 => {
-                                        *out +=
-                                            &format!("\t\t\"fmov d{}, d{}\\n\\t\"\n", out_reg, j);
+                                        *out += &format!("\t\t\"fmov d{out_reg}, d{j}\\n\\t\"\n");
                                     }
                                     InlineASM::None => unreachable!(),
                                 }
@@ -1966,14 +3099,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             MemOrReg::Reg(k) => match asm_flavour {
                                                 InlineASM::X64 => {
                                                     *out += &format!(
-                                                        "\t\t\"{}sd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                        oper, k, out_reg,
+                                                        "\t\t\"{oper}sd %%xmm{k}, %%xmm{out_reg}\\n\\t\"\n",
+                                                    );
+                                                }
+                                                InlineASM::AVX2 => {
+                                                    *out += &format!(
+                                                        "\t\t\"v{oper}pd %%ymm{k}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n",
                                                     );
                                                 }
                                                 InlineASM::AArch64 => {
                                                     *out += &format!(
-                                                        "\t\t\"f{} d{}, d{}, d{}\\n\\t\"\n",
-                                                        oper, out_reg, k, out_reg,
+                                                        "\t\t\"f{oper} d{out_reg}, d{k}, d{out_reg}\\n\\t\"\n",
                                                     );
                                                 }
                                                 InlineASM::None => unreachable!(),
@@ -1982,20 +3118,23 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 InlineASM::X64 => {
                                                     let addr = asm_load!(*k);
                                                     *out += &format!(
-                                                        "\t\t\"{}sd {}, %%xmm{}\\n\\t\"\n",
-                                                        oper, addr, out_reg
+                                                        "\t\t\"{oper}sd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                    );
+                                                }
+                                                InlineASM::AVX2 => {
+                                                    let addr = asm_load!(*k);
+                                                    *out += &format!(
+                                                        "\t\t\"v{oper}pd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                     );
                                                 }
                                                 InlineASM::AArch64 => {
                                                     let addr = asm_load!(*k);
                                                     *out += &format!(
-                                                        "\t\t\"ldr d31, {}\\n\\t\"\n",
-                                                        addr,
+                                                        "\t\t\"ldr d31, {addr}\\n\\t\"\n",
                                                     );
 
                                                     *out += &format!(
-                                                        "\t\t\"f{} d{}, d31, d{}\\n\\t\"\n",
-                                                        oper, out_reg, out_reg
+                                                        "\t\t\"f{oper} d{out_reg}, d31, d{out_reg}\\n\\t\"\n"
                                                     );
                                                 }
                                                 InlineASM::None => unreachable!(),
@@ -2010,16 +3149,19 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                         InlineASM::X64 => {
                                             let addr = asm_load!(*k);
                                             *out += &format!(
-                                                "\t\t\"movsd {}, %%xmm{}\\n\\t\"\n",
-                                                addr, out_reg
+                                                "\t\t\"movsd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                            );
+                                        }
+                                        InlineASM::AVX2 => {
+                                            let addr = asm_load!(*k);
+                                            *out += &format!(
+                                                "\t\t\"vmovapd {addr}, %%ymm{out_reg}\\n\\t\"\n"
                                             );
                                         }
                                         InlineASM::AArch64 => {
                                             let addr = asm_load!(*k);
-                                            *out += &format!(
-                                                "\t\t\"ldr d{}, {}\\n\\t\"\n",
-                                                out_reg, addr,
-                                            );
+                                            *out +=
+                                                &format!("\t\t\"ldr d{out_reg}, {addr}\\n\\t\"\n",);
                                         }
                                         InlineASM::None => unreachable!(),
                                     }
@@ -2033,18 +3175,22 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             InlineASM::X64 => {
                                                 let addr = asm_load!(*k);
                                                 *out += &format!(
-                                                    "\t\t\"{}sd {}, %%xmm{}\\n\\t\"\n",
-                                                    oper, addr, out_reg
+                                                    "\t\t\"{oper}sd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                );
+                                            }
+                                            InlineASM::AVX2 => {
+                                                let addr = asm_load!(*k);
+                                                *out += &format!(
+                                                    "\t\t\"v{oper}pd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::AArch64 => {
                                                 let addr = asm_load!(*k);
                                                 *out +=
-                                                    &format!("\t\t\"ldr d31, {}\\n\\t\"\n", addr,);
+                                                    &format!("\t\t\"ldr d31, {addr}\\n\\t\"\n",);
 
                                                 *out += &format!(
-                                                    "\t\t\"f{} d{}, d31, d{}\\n\\t\"\n",
-                                                    oper, out_reg, out_reg
+                                                    "\t\t\"f{oper} d{out_reg}, d31, d{out_reg}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::None => unreachable!(),
@@ -2062,15 +3208,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                     match asm_flavour {
                                         InlineASM::X64 => {
                                             *out += &format!(
-                                                "\t\t\"movapd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                j, out_reg
+                                                "\t\t\"movapd %%xmm{j}, %%xmm{out_reg}\\n\\t\"\n"
+                                            );
+                                        }
+                                        InlineASM::AVX2 => {
+                                            *out += &format!(
+                                                "\t\t\"vmovapd %%ymm{j}, %%ymm{out_reg}\\n\\t\"\n"
                                             );
                                         }
                                         InlineASM::AArch64 => {
-                                            *out += &format!(
-                                                "\t\t\"fmov d{}, d{}\\n\\t\"\n",
-                                                out_reg, j
-                                            );
+                                            *out +=
+                                                &format!("\t\t\"fmov d{out_reg}, d{j}\\n\\t\"\n");
                                         }
                                         InlineASM::None => unreachable!(),
                                     }
@@ -2082,14 +3230,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 MemOrReg::Reg(k) => match asm_flavour {
                                                     InlineASM::X64 => {
                                                         *out += &format!(
-                                                            "\t\t\"{}sd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                            oper, k, out_reg
+                                                            "\t\t\"{oper}sd %%xmm{k}, %%xmm{out_reg}\\n\\t\"\n"
+                                                        );
+                                                    }
+                                                    InlineASM::AVX2 => {
+                                                        *out += &format!(
+                                                            "\t\t\"v{oper}pd %%ymm{k}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                         );
                                                     }
                                                     InlineASM::AArch64 => {
                                                         *out += &format!(
-                                                            "\t\t\"f{} d{}, d{}, d{}\\n\\t\"\n",
-                                                            oper, out_reg, k, out_reg
+                                                            "\t\t\"f{oper} d{out_reg}, d{k}, d{out_reg}\\n\\t\"\n"
                                                         );
                                                     }
                                                     InlineASM::None => unreachable!(),
@@ -2098,20 +3249,23 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                     InlineASM::X64 => {
                                                         let addr = asm_load!(*k);
                                                         *out += &format!(
-                                                            "\t\t\"{}sd {}, %%xmm{}\\n\\t\"\n",
-                                                            oper, addr, out_reg
+                                                            "\t\t\"{oper}sd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                        );
+                                                    }
+                                                    InlineASM::AVX2 => {
+                                                        let addr = asm_load!(*k);
+                                                        *out += &format!(
+                                                            "\t\t\"v{oper}pd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                         );
                                                     }
                                                     InlineASM::AArch64 => {
                                                         let addr = asm_load!(*k);
                                                         *out += &format!(
-                                                            "\t\t\"ldr d31, {}\\n\\t\"\n",
-                                                            addr,
+                                                            "\t\t\"ldr d31, {addr}\\n\\t\"\n",
                                                         );
 
                                                         *out += &format!(
-                                                            "\t\t\"f{} d{}, d31, d{}\\n\\t\"\n",
-                                                            oper, out_reg, out_reg
+                                                            "\t\t\"f{oper} d{out_reg}, d31, d{out_reg}\\n\\t\"\n"
                                                         );
                                                     }
                                                     InlineASM::None => unreachable!(),
@@ -2127,14 +3281,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                         match asm_flavour {
                                             InlineASM::X64 => {
                                                 *out += &format!(
-                                                    "\t\t\"movsd {}, %%xmm{}\\n\\t\"\n",
-                                                    addr, out_reg
+                                                    "\t\t\"movsd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                );
+                                            }
+                                            InlineASM::AVX2 => {
+                                                *out += &format!(
+                                                    "\t\t\"vmovapd {addr}, %%ymm{out_reg}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::AArch64 => {
                                                 *out += &format!(
-                                                    "\t\t\"ldr d{}, {}\\n\\t\"\n",
-                                                    out_reg, addr,
+                                                    "\t\t\"ldr d{out_reg}, {addr}\\n\\t\"\n",
                                                 );
                                             }
                                             InlineASM::None => unreachable!(),
@@ -2149,19 +3306,21 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             match asm_flavour {
                                                 InlineASM::X64 => {
                                                     *out += &format!(
-                                                        "\t\t\"{}sd {}, %%xmm{}\\n\\t\"\n",
-                                                        oper, addr, out_reg
+                                                        "\t\t\"{oper}sd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                    );
+                                                }
+                                                InlineASM::AVX2 => {
+                                                    *out += &format!(
+                                                        "\t\t\"v{oper}pd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                     );
                                                 }
                                                 InlineASM::AArch64 => {
                                                     *out += &format!(
-                                                        "\t\t\"ldr d31, {}\\n\\t\"\n",
-                                                        addr,
+                                                        "\t\t\"ldr d31, {addr}\\n\\t\"\n",
                                                     );
 
                                                     *out += &format!(
-                                                        "\t\t\"f{} d{}, d31, d{}\\n\\t\"\n",
-                                                        oper, out_reg, out_reg,
+                                                        "\t\t\"f{oper} d{out_reg}, d31, d{out_reg}\\n\\t\"\n",
                                                     );
                                                 }
                                                 InlineASM::None => unreachable!(),
@@ -2174,13 +3333,16 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                 match asm_flavour {
                                     InlineASM::X64 => {
                                         *out += &format!(
-                                            "\t\t\"movsd %%xmm{}, {}\\n\\t\"\n",
-                                            out_reg, addr
+                                            "\t\t\"movsd %%xmm{out_reg}, {addr}\\n\\t\"\n"
+                                        );
+                                    }
+                                    InlineASM::AVX2 => {
+                                        *out += &format!(
+                                            "\t\t\"vmovupd %%ymm{out_reg}, {addr}\\n\\t\"\n"
                                         );
                                     }
                                     InlineASM::AArch64 => {
-                                        *out +=
-                                            &format!("\t\t\"str d{}, {}\\n\\t\"\n", out_reg, addr,);
+                                        *out += &format!("\t\t\"str d{out_reg}, {addr}\\n\\t\"\n",);
                                     }
                                     InlineASM::None => unreachable!(),
                                 }
@@ -2208,8 +3370,7 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 (0..16).position(|k| free & (1 << k) != 0)
                                             {
                                                 *out += &format!(
-                                                    "\t\t\"movapd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                    out_reg, tmp_reg
+                                                    "\t\t\"movapd %%xmm{out_reg}, %%xmm{tmp_reg}\\n\\t\"\n"
                                                 );
 
                                                 *out += &format!(
@@ -2219,8 +3380,28 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 );
 
                                                 *out += &format!(
-                                                    "\t\t\"divsd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                    tmp_reg, out_reg
+                                                    "\t\t\"divsd %%xmm{tmp_reg}, %%xmm{out_reg}\\n\\t\"\n"
+                                                );
+                                            } else {
+                                                panic!("No free registers for division")
+                                            }
+                                        }
+                                        InlineASM::AVX2 => {
+                                            if let Some(tmp_reg) =
+                                                (0..16).position(|k| free & (1 << k) != 0)
+                                            {
+                                                *out += &format!(
+                                                    "\t\t\"vmovapd %%ymm{out_reg}, %%ymm{tmp_reg}\\n\\t\"\n"
+                                                );
+
+                                                *out += &format!(
+                                                    "\t\t\"vmovupd {}(%1), %%ymm{}\\n\\t\"\n",
+                                                    (self.reserved_indices - self.param_count) * 32,
+                                                    out_reg
+                                                );
+
+                                                *out += &format!(
+                                                    "\t\t\"vdivsd %%ymm{tmp_reg}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                 );
                                             } else {
                                                 panic!("No free registers for division")
@@ -2232,8 +3413,7 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 (self.reserved_indices - self.param_count) * 8
                                             );
                                             *out += &format!(
-                                                "\t\t\"fdiv d{}, d31, d{}\\n\\t\"\n",
-                                                out_reg, out_reg
+                                                "\t\t\"fdiv d{out_reg}, d31, d{out_reg}\\n\\t\"\n"
                                             );
                                         }
                                         InlineASM::None => unreachable!(),
@@ -2245,6 +3425,13 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             *out += &format!(
                                                 "\t\t\"movsd {}(%1), %%xmm{}\\n\\t\"\n",
                                                 (self.reserved_indices - self.param_count) * 8,
+                                                out_reg,
+                                            );
+                                        }
+                                        InlineASM::AVX2 => {
+                                            *out += &format!(
+                                                "\t\t\"vmovupd {}(%1), %%ymm{}\\n\\t\"\n",
+                                                (self.reserved_indices - self.param_count) * 32,
                                                 out_reg,
                                             );
                                         }
@@ -2262,14 +3449,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                         MemOrReg::Reg(j) => match asm_flavour {
                                             InlineASM::X64 => {
                                                 *out += &format!(
-                                                    "\t\t\"divsd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                    j, out_reg
+                                                    "\t\t\"divsd %%xmm{j}, %%xmm{out_reg}\\n\\t\"\n"
+                                                );
+                                            }
+                                            InlineASM::AVX2 => {
+                                                *out += &format!(
+                                                    "\t\t\"vdivpd %%ymm{j}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::AArch64 => {
                                                 *out += &format!(
-                                                    "\t\t\"fdiv d{}, d{}, d{}\\n\\t\"\n",
-                                                    out_reg, out_reg, j
+                                                    "\t\t\"fdiv d{out_reg}, d{out_reg}, d{j}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::None => unreachable!(),
@@ -2278,18 +3468,21 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             InlineASM::X64 => {
                                                 let addr = asm_load!(*k);
                                                 *out += &format!(
-                                                    "\t\t\"divsd {}, %%xmm{}\\n\\t\"\n",
-                                                    addr, out_reg,
+                                                    "\t\t\"divsd {addr}, %%xmm{out_reg}\\n\\t\"\n",
+                                                );
+                                            }
+                                            InlineASM::AVX2 => {
+                                                let addr = asm_load!(*k);
+                                                *out += &format!(
+                                                    "\t\t\"vdivpd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n",
                                                 );
                                             }
                                             InlineASM::AArch64 => {
                                                 let addr = asm_load!(*k);
-                                                *out +=
-                                                    &format!("\t\t\"ldr d31, {}\\n\\t\"\n", addr);
+                                                *out += &format!("\t\t\"ldr d31, {addr}\\n\\t\"\n");
 
                                                 *out += &format!(
-                                                    "\t\t\"fdiv d{}, d{}, d31\\n\\t\"\n",
-                                                    out_reg, out_reg
+                                                    "\t\t\"fdiv d{out_reg}, d{out_reg}, d31\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::None => unreachable!(),
@@ -2307,6 +3500,13 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                                 out_reg
                                             );
                                         }
+                                        InlineASM::AVX2 => {
+                                            *out += &format!(
+                                                "\t\t\"vmovupd {}(%1), %%ymm{}\\n\\t\"\n",
+                                                (self.reserved_indices - self.param_count) * 32,
+                                                out_reg
+                                            );
+                                        }
                                         InlineASM::AArch64 => {
                                             *out += &format!(
                                                 "\t\t\"ldr d{}, [%1, {}]\\n\\t\"\n",
@@ -2321,14 +3521,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                         MemOrReg::Reg(j) => match asm_flavour {
                                             InlineASM::X64 => {
                                                 *out += &format!(
-                                                    "\t\t\"divsd %%xmm{}, %%xmm{}\\n\\t\"\n",
-                                                    j, out_reg
+                                                    "\t\t\"divsd %%xmm{j}, %%xmm{out_reg}\\n\\t\"\n"
+                                                );
+                                            }
+                                            InlineASM::AVX2 => {
+                                                *out += &format!(
+                                                    "\t\t\"vdivpd %%ymm{j}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::AArch64 => {
                                                 *out += &format!(
-                                                    "\t\t\"fdiv d{}, d{}, d{}\\n\\t\"\n",
-                                                    out_reg, out_reg, j
+                                                    "\t\t\"fdiv d{out_reg}, d{out_reg}, d{j}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::None => unreachable!(),
@@ -2337,18 +3540,22 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                             InlineASM::X64 => {
                                                 let addr = asm_load!(*k);
                                                 *out += &format!(
-                                                    "\t\t\"divsd {}, %%xmm{}\\n\\t\"\n",
-                                                    addr, out_reg
+                                                    "\t\t\"divsd {addr}, %%xmm{out_reg}\\n\\t\"\n"
+                                                );
+                                            }
+                                            InlineASM::AVX2 => {
+                                                let addr = asm_load!(*k);
+                                                *out += &format!(
+                                                    "\t\t\"vdivpd {addr}, %%ymm{out_reg}, %%ymm{out_reg}\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::AArch64 => {
                                                 let addr = asm_load!(*k);
                                                 *out +=
-                                                    &format!("\t\t\"ldr d31, {}\\n\\t\"\n", addr,);
+                                                    &format!("\t\t\"ldr d31, {addr}\\n\\t\"\n",);
 
                                                 *out += &format!(
-                                                    "\t\t\"fdiv d{}, d31, d{}\\n\\t\"\n",
-                                                    out_reg, out_reg
+                                                    "\t\t\"fdiv d{out_reg}, d{out_reg}, d31\\n\\t\"\n"
                                                 );
                                             }
                                             InlineASM::None => unreachable!(),
@@ -2359,15 +3566,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                     match asm_flavour {
                                         InlineASM::X64 => {
                                             *out += &format!(
-                                                "\t\t\"movsd %%xmm{}, {}\\n\\t\"\n",
-                                                out_reg, addr
+                                                "\t\t\"movsd %%xmm{out_reg}, {addr}\\n\\t\"\n"
+                                            );
+                                        }
+                                        InlineASM::AVX2 => {
+                                            *out += &format!(
+                                                "\t\t\"vmovupd %%ymm{out_reg}, {addr}\\n\\t\"\n"
                                             );
                                         }
                                         InlineASM::AArch64 => {
-                                            *out += &format!(
-                                                "\t\t\"str d{}, {}\\n\\t\"\n",
-                                                out_reg, addr,
-                                            );
+                                            *out +=
+                                                &format!("\t\t\"str d{out_reg}, {addr}\\n\\t\"\n",);
                                         }
                                         InlineASM::None => unreachable!(),
                                     }
@@ -2389,7 +3598,7 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
 
                     let base = get_input!(*b);
                     let exp = get_input!(*e);
-                    *out += format!("\tZ[{}] = pow({}, {});\n", o, base, exp).as_str();
+                    *out += format!("\tZ[{o}] = pow({base}, {exp});\n").as_str();
                 }
                 RegInstr::BuiltinFun(o, s, a) => {
                     end_asm_block!(in_asm_block);
@@ -2397,22 +3606,71 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     let arg = get_input!(*a);
 
                     match s.0 {
-                        Atom::EXP => {
-                            *out += format!("\tZ[{}] = exp({});\n", o, arg).as_str();
+                        Symbol::EXP => {
+                            *out += format!("\tZ[{o}] = exp({arg});\n").as_str();
                         }
-                        Atom::LOG => {
-                            *out += format!("\tZ[{}] = log({});\n", o, arg).as_str();
+                        Symbol::LOG => {
+                            *out += format!("\tZ[{o}] = log({arg});\n").as_str();
                         }
-                        Atom::SIN => {
-                            *out += format!("\tZ[{}] = sin({});\n", o, arg).as_str();
+                        Symbol::SIN => {
+                            *out += format!("\tZ[{o}] = sin({arg});\n").as_str();
                         }
-                        Atom::COS => {
-                            *out += format!("\tZ[{}] = cos({});\n", o, arg).as_str();
+                        Symbol::COS => {
+                            *out += format!("\tZ[{o}] = cos({arg});\n").as_str();
                         }
-                        Atom::SQRT => {
-                            *out += format!("\tZ[{}] = sqrt({});\n", o, arg).as_str();
+                        Symbol::SQRT => {
+                            *out += format!("\tZ[{o}] = sqrt({arg});\n").as_str();
+                        }
+                        Symbol::CONJ => {
+                            *out += format!("\tZ[{o}] = {arg};\n").as_str();
                         }
                         _ => unreachable!(),
+                    }
+                }
+                RegInstr::ExternalFun(o, s, a) => {
+                    end_asm_block!(in_asm_block);
+
+                    let name = &self.external_fns[*s];
+                    let args = a.iter().map(|x| get_input!(*x)).collect::<Vec<_>>();
+
+                    *out += format!("\tZ[{}] = {}({});\n", o, name, args.join(", ")).as_str();
+                }
+                RegInstr::IfElse(cond) => {
+                    end_asm_block!(in_asm_block);
+
+                    if asm_flavour == InlineASM::AVX2 {
+                        *out += &format!("\tif (all({} != 0.)) {{\n", get_input!(*cond));
+                    } else {
+                        *out += &format!("\tif ({} != 0.) {{\n", get_input!(*cond));
+                    }
+                }
+                RegInstr::Goto => {
+                    end_asm_block!(in_asm_block);
+                    *out += "\t} else {\n";
+                }
+                RegInstr::Label => {}
+                RegInstr::Join(o, cond, a, b) => {
+                    end_asm_block!(in_asm_block);
+                    *out += "\t}\n";
+                    let arg_a = get_input!(*a);
+                    let arg_b = get_input!(*b);
+
+                    if asm_flavour == InlineASM::AVX2 {
+                        *out += &format!(
+                            "\tZ[{}] = (all({} != 0.)) ? {} : {};\n",
+                            o,
+                            get_input!(*cond),
+                            arg_a,
+                            arg_b
+                        );
+                    } else {
+                        *out += &format!(
+                            "\tZ[{}] = ({} != 0.) ? {} : {};\n",
+                            o,
+                            get_input!(*cond),
+                            arg_a,
+                            arg_b
+                        );
                     }
                 }
             }
@@ -2428,6 +3686,10 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     InlineASM::X64 => {
                         *out += &format!("\t\t\"movsd {}(%3), %%xmm{}\\n\\t\"\n", r * 8, regcount);
                     }
+                    InlineASM::AVX2 => {
+                        *out +=
+                            &format!("\t\t\"vmovupd {}(%3), %%ymm{}\\n\\t\"\n", r * 32, regcount);
+                    }
                     InlineASM::AArch64 => {
                         *out += &format!("\t\t\"ldr d{}, [%3, {}]\\n\\t\"\n", regcount, r * 8);
                     }
@@ -2439,6 +3701,13 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         *out += &format!(
                             "\t\t\"movsd {}(%2), %%xmm{}\\n\\t\"\n",
                             (r - self.param_count) * 8,
+                            regcount
+                        );
+                    }
+                    InlineASM::AVX2 => {
+                        *out += &format!(
+                            "\t\t\"vmovupd {}(%2), %%ymm{}\\n\\t\"\n",
+                            (r - self.param_count) * 32,
                             regcount
                         );
                     }
@@ -2456,6 +3725,10 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     InlineASM::X64 => {
                         *out += &format!("\t\t\"movsd {}(%1), %%xmm{}\\n\\t\"\n", r * 8, regcount);
                     }
+                    InlineASM::AVX2 => {
+                        *out +=
+                            &format!("\t\t\"vmovupd {}(%1), %%ymm{}\\n\\t\"\n", r * 32, regcount);
+                    }
                     InlineASM::AArch64 => {
                         *out += &format!("\t\t\"ldr d{}, [%1, {}]\\n\\t\"\n", regcount, r * 8);
                     }
@@ -2466,6 +3739,9 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
             match asm_flavour {
                 InlineASM::X64 => {
                     *out += &format!("\t\t\"movsd %%xmm{}, {}(%0)\\n\\t\"\n", regcount, i * 8);
+                }
+                InlineASM::AVX2 => {
+                    *out += &format!("\t\t\"vmovupd %%ymm{}, {}(%0)\\n\\t\"\n", regcount, i * 32);
                 }
                 InlineASM::AArch64 => {
                     *out += &format!("\t\t\"str d{}, [%0, {}]\\n\\t\"\n", regcount, i * 8);
@@ -2478,14 +3754,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
         match asm_flavour {
             InlineASM::X64 => {
                 *out += &format!(
-                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"xmm0\", \"xmm1\", \"xmm2\", \"xmm3\", \"xmm4\", \"xmm5\", \"xmm6\", \"xmm7\", \"xmm8\", \"xmm9\", \"xmm10\", \"xmm11\", \"xmm12\", \"xmm13\", \"xmm14\", \"xmm15\");\n",
-                    function_name
+                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({function_name}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"xmm0\", \"xmm1\", \"xmm2\", \"xmm3\", \"xmm4\", \"xmm5\", \"xmm6\", \"xmm7\", \"xmm8\", \"xmm9\", \"xmm10\", \"xmm11\", \"xmm12\", \"xmm13\", \"xmm14\", \"xmm15\");\n"
+                );
+            }
+            InlineASM::AVX2 => {
+                *out += &format!(
+                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({function_name}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"ymm0\", \"ymm1\", \"ymm2\", \"ymm3\", \"ymm4\", \"ymm5\", \"ymm6\", \"ymm7\", \"ymm8\", \"ymm9\", \"ymm10\", \"ymm11\", \"ymm12\", \"ymm13\", \"ymm14\", \"ymm15\");\n"
                 );
             }
             InlineASM::AArch64 => {
                 *out += &format!(
-                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"d0\", \"d1\", \"d2\", \"d3\", \"d4\", \"d5\", \"d6\", \"d7\", \"d8\", \"d9\", \"d10\", \"d11\", \"d12\", \"d13\", \"d14\", \"d15\", \"d16\", \"d17\", \"d18\", \"d19\", \"d20\", \"d21\", \"d22\", \"d23\", \"d24\", \"d25\", \"d26\", \"d27\", \"d28\", \"d29\", \"d30\", \"d31\");\n",
-                    function_name
+                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({function_name}_CONSTANTS_double), \"r\"(params)\n\t\t: \"memory\", \"d0\", \"d1\", \"d2\", \"d3\", \"d4\", \"d5\", \"d6\", \"d7\", \"d8\", \"d9\", \"d10\", \"d11\", \"d12\", \"d13\", \"d14\", \"d15\", \"d16\", \"d17\", \"d18\", \"d19\", \"d20\", \"d21\", \"d22\", \"d23\", \"d24\", \"d25\", \"d26\", \"d27\", \"d28\", \"d29\", \"d30\", \"d31\");\n"
                 );
             }
             InlineASM::None => unreachable!(),
@@ -2533,6 +3812,19 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         } else {
                             // TODO: subtract reserved indices
                             (format!("{}(%0)", $i * 16), String::new())
+                        }
+                    }
+                    InlineASM::AVX2 => {
+                        if $i < self.param_count {
+                            (format!("{}(%2)", $i * 64), format!("{}(%2)", $i * 64 + 32))
+                        } else if $i < self.reserved_indices {
+                            (
+                                format!("{}(%1)", ($i - self.param_count) * 64),
+                                format!("{}(%1)", ($i - self.param_count) * 64 + 32),
+                            )
+                        } else {
+                            // TODO: subtract reserved indices
+                            (format!("{}(%0)", $i * 64), format!("{}(%0)", $i * 64 + 32))
                         }
                     }
                     InlineASM::AArch64 => {
@@ -2605,6 +3897,9 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         InlineASM::X64 => {
                             *out += &format!("\t\t:\n\t\t: \"r\"(Z), \"r\"({}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"xmm0\", \"xmm1\", \"xmm2\", \"xmm3\", \"xmm4\", \"xmm5\", \"xmm6\", \"xmm7\", \"xmm8\", \"xmm9\", \"xmm10\", \"xmm11\", \"xmm12\", \"xmm13\", \"xmm14\", \"xmm15\");\n",  function_name);
                         }
+                        InlineASM::AVX2 => {
+                            *out += &format!("\t\t:\n\t\t: \"r\"(Z), \"r\"({}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"ymm0\", \"ymm1\", \"ymm2\", \"ymm3\", \"ymm4\", \"ymm5\", \"ymm6\", \"ymm7\", \"ymm8\", \"ymm9\", \"ymm10\", \"ymm11\", \"ymm12\", \"ymm13\", \"ymm14\", \"ymm15\");\n",  function_name);
+                        }
                         InlineASM::AArch64 => {
                             *out += &format!("\t\t:\n\t\t: \"r\"(Z), \"r\"({}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"x8\", \"d0\", \"d1\", \"d2\", \"d3\", \"d4\", \"d5\", \"d6\", \"d7\", \"d8\", \"d9\", \"d10\", \"d11\", \"d12\", \"d13\", \"d14\", \"d15\", \"d16\", \"d17\", \"d18\", \"d19\", \"d20\", \"d21\", \"d22\", \"d23\", \"d24\", \"d25\", \"d26\", \"d27\", \"d28\", \"d29\", \"d30\", \"d31\");\n",  function_name);
                         }
@@ -2631,29 +3926,45 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                             // TODO: try loading in multiple registers for better instruction-level parallelism?
                             for i in a {
                                 let (addr, _) = asm_load!(*i);
-                                *out += &format!("\t\t\"addpd {}, %%xmm0\\n\\t\"\n", addr);
+                                *out += &format!("\t\t\"addpd {addr}, %%xmm0\\n\\t\"\n");
                             }
                             let (addr, _) = asm_load!(*o);
-                            *out += &format!("\t\t\"movupd %%xmm0, {}\\n\\t\"\n", addr);
+                            *out += &format!("\t\t\"movupd %%xmm0, {addr}\\n\\t\"\n");
+                        }
+                        InlineASM::AVX2 => {
+                            let (addr, comp_addr) = asm_load!(a[0]);
+                            *out += &format!("\t\t\"vmovupd {addr}, %%ymm0\\n\\t\"\n");
+                            *out += &format!("\t\t\"vmovupd {comp_addr}, %%ymm1\\n\\t\"\n");
+
+                            // TODO: try loading in multiple registers for better instruction-level parallelism?
+                            for i in &a[1..] {
+                                let (addr, imag_addr) = asm_load!(*i);
+                                *out += &format!("\t\t\"vaddpd {addr}, %%ymm0, %%ymm0\\n\\t\"\n");
+                                *out +=
+                                    &format!("\t\t\"vaddpd {imag_addr}, %%ymm1, %%ymm1\\n\\t\"\n");
+                            }
+                            let (addr, imag_addr) = asm_load!(*o);
+                            *out += &format!("\t\t\"vmovupd %%ymm0, {addr}\\n\\t\"\n");
+                            *out += &format!("\t\t\"vmovupd %%ymm1, {imag_addr}\\n\\t\"\n");
                         }
                         InlineASM::AArch64 => {
                             let (addr, _) = asm_load!(a[0]);
-                            *out += &format!("\t\t\"ldr q0, {}\\n\\t\"\n", addr);
+                            *out += &format!("\t\t\"ldr q0, {addr}\\n\\t\"\n");
 
                             for i in &a[1..] {
                                 let (addr, _) = asm_load!(*i);
-                                *out += &format!("\t\t\"ldr q1, {}\\n\\t\"\n", addr);
+                                *out += &format!("\t\t\"ldr q1, {addr}\\n\\t\"\n");
                                 *out += "\t\t\"fadd v0.2d, v1.2d, v0.2d\\n\\t\"\n";
                             }
 
                             let (addr, _) = asm_load!(*o);
-                            *out += &format!("\t\t\"str q0, {}\\n\\t\"\n", addr);
+                            *out += &format!("\t\t\"str q0, {addr}\\n\\t\"\n");
                         }
                         InlineASM::None => unreachable!(),
                     }
                 }
                 Instr::Mul(o, a) => {
-                    if a.len() < 15 {
+                    if !matches!(asm_flavour, InlineASM::AVX2) && a.len() < 15 || a.len() < 8 {
                         if !in_asm_block {
                             *out += "\t__asm__(\n";
                             in_asm_block = true;
@@ -2668,6 +3979,18 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                         "\t\t\"movupd {}, %%xmm{}\\n\\t\"\n",
                                         addr_re,
                                         i + 1,
+                                    );
+                                }
+                                InlineASM::AVX2 => {
+                                    *out += &format!(
+                                        "\t\t\"vmovupd {}, %%ymm{}\\n\\t\"\n",
+                                        addr_re,
+                                        2 * i,
+                                    );
+                                    *out += &format!(
+                                        "\t\t\"vmovupd {}, %%ymm{}\\n\\t\"\n",
+                                        addr_im,
+                                        2 * i + 1,
                                     );
                                 }
                                 InlineASM::AArch64 => {
@@ -2709,6 +4032,18 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                         i + 1
                                     );
                                 }
+                                InlineASM::AVX2 => {
+                                    *out += &format!(
+                                        "\t\t\"vmulpd %%ymm0, %%ymm{0}, %%ymm14\\n\\t\"
+\t\t\"vmulpd %%ymm0, %%ymm{1}, %%ymm15\\n\\t\"
+\t\t\"vmulpd %%ymm1, %%ymm{1}, %%ymm0\\n\\t\"
+\t\t\"vmulpd %%ymm1, %%ymm{0}, %%ymm{1}\\n\\t\"
+\t\t\"vsubpd %%ymm0, %%ymm14, %%ymm0\\n\\t\"
+\t\t\"vaddpd %%ymm15, %%ymm{1}, %%ymm1\\n\\t\"\n",
+                                        2 * i,
+                                        2 * i + 1,
+                                    );
+                                }
                                 InlineASM::AArch64 => {
                                     *out += &format!(
                                         "
@@ -2727,14 +4062,18 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         let (addr_re, addr_im) = asm_load!(*o);
                         match asm_flavour {
                             InlineASM::X64 => {
-                                *out += &format!("\t\t\"movupd %%xmm1, {}\\n\\t\"\n", addr_re);
+                                *out += &format!("\t\t\"movupd %%xmm1, {addr_re}\\n\\t\"\n");
+                            }
+                            InlineASM::AVX2 => {
+                                *out += &format!("\t\t\"vmovupd %%ymm0, {addr_re}\\n\\t\"\n");
+                                *out += &format!("\t\t\"vmovupd %%ymm1, {addr_im}\\n\\t\"\n");
                             }
                             InlineASM::AArch64 => {
                                 if *o * 16 < 450 {
-                                    *out += &format!("\t\t\"stp d2, d3, {}\\n\\t\"\n", addr_re);
+                                    *out += &format!("\t\t\"stp d2, d3, {addr_re}\\n\\t\"\n");
                                 } else {
-                                    *out += &format!("\t\t\"str d2, {}\\n\\t\"\n", addr_re);
-                                    *out += &format!("\t\t\"str d3, {}\\n\\t\"\n", addr_im);
+                                    *out += &format!("\t\t\"str d2, {addr_re}\\n\\t\"\n");
+                                    *out += &format!("\t\t\"str d3, {addr_im}\\n\\t\"\n");
                                 }
                             }
                             InlineASM::None => unreachable!(),
@@ -2750,7 +4089,7 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                             .collect::<Vec<_>>()
                             .join("*");
 
-                        *out += format!("\tZ[{}] = {};\n", o, args).as_str();
+                        *out += format!("\tZ[{o}] = {args};\n").as_str();
                     }
                 }
                 Instr::Pow(o, b, e) => {
@@ -2776,6 +4115,27 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                                     addr_b.0,
                                     (self.reserved_indices - self.param_count) * 16,
                                     addr_o.0
+                                );
+                            }
+                            InlineASM::AVX2 => {
+                                // TODO: do FMA on top?
+                                *out += &format!(
+                                    "\t\t\"vmovupd {0}, %%ymm0\\n\\t\"
+\t\t\"vmovupd {1}, %%ymm1\\n\\t\"
+\t\t\"vmulpd %%ymm0, %%ymm0, %%ymm3\\n\\t\"
+\t\t\"vmulpd %%ymm1, %%ymm1, %%ymm4\\n\\t\"
+\t\t\"vaddpd %%ymm3, %%ymm4, %%ymm3\\n\\t\"
+\t\t\"vdivpd %%ymm3, %%ymm0, %%ymm0\\n\\t\"
+\t\t\"vbroadcastsd {2}(%1), %%ymm4\\n\\t\"
+\t\t\"vxorpd %%ymm4, %%ymm1, %%ymm1\\n\\t\"
+\t\t\"vdivpd %%ymm3, %%ymm1, %%ymm1\\n\\t\"
+\t\t\"vmovupd %%ymm0, {3}\\n\\t\"
+\t\t\"vmovupd %%ymm1, {4}\\n\\t\"\n",
+                                    addr_b.0,
+                                    addr_b.1,
+                                    (self.reserved_indices - self.param_count) * 64,
+                                    addr_o.0,
+                                    addr_o.1
                                 );
                             }
                             InlineASM::AArch64 => {
@@ -2806,14 +4166,14 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         end_asm_block!(in_asm_block);
 
                         let base = get_input!(*b);
-                        *out += format!("\tZ[{}] = pow({}, {});\n", o, base, e).as_str();
+                        *out += format!("\tZ[{o}] = pow({base}, {e});\n").as_str();
                     }
                 }
                 Instr::Powf(o, b, e) => {
                     end_asm_block!(in_asm_block);
                     let base = get_input!(*b);
                     let exp = get_input!(*e);
-                    *out += format!("\tZ[{}] = pow({}, {});\n", o, base, exp).as_str();
+                    *out += format!("\tZ[{o}] = pow({base}, {exp});\n").as_str();
                 }
                 Instr::BuiltinFun(o, s, a) => {
                     end_asm_block!(in_asm_block);
@@ -2821,22 +4181,71 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     let arg = get_input!(*a);
 
                     match s.0 {
-                        Atom::EXP => {
-                            *out += format!("\tZ[{}] = exp({});\n", o, arg).as_str();
+                        Symbol::EXP => {
+                            *out += format!("\tZ[{o}] = exp({arg});\n").as_str();
                         }
-                        Atom::LOG => {
-                            *out += format!("\tZ[{}] = log({});\n", o, arg).as_str();
+                        Symbol::LOG => {
+                            *out += format!("\tZ[{o}] = log({arg});\n").as_str();
                         }
-                        Atom::SIN => {
-                            *out += format!("\tZ[{}] = sin({});\n", o, arg).as_str();
+                        Symbol::SIN => {
+                            *out += format!("\tZ[{o}] = sin({arg});\n").as_str();
                         }
-                        Atom::COS => {
-                            *out += format!("\tZ[{}] = cos({});\n", o, arg).as_str();
+                        Symbol::COS => {
+                            *out += format!("\tZ[{o}] = cos({arg});\n").as_str();
                         }
-                        Atom::SQRT => {
-                            *out += format!("\tZ[{}] = sqrt({});\n", o, arg).as_str();
+                        Symbol::SQRT => {
+                            *out += format!("\tZ[{o}] = sqrt({arg});\n").as_str();
+                        }
+                        Symbol::CONJ => {
+                            *out += format!("\tZ[{o}] = conj({arg});\n").as_str();
                         }
                         _ => unreachable!(),
+                    }
+                }
+                Instr::ExternalFun(o, s, a) => {
+                    end_asm_block!(in_asm_block);
+
+                    let name = &self.external_fns[*s];
+                    let args = a.iter().map(|x| get_input!(*x)).collect::<Vec<_>>();
+
+                    *out += format!("\tZ[{}] = {}({});\n", o, name, args.join(", ")).as_str();
+                }
+                Instr::IfElse(cond, _) => {
+                    end_asm_block!(in_asm_block);
+
+                    if asm_flavour == InlineASM::AVX2 {
+                        *out += &format!("\tif (all({} != 0.)) {{\n", get_input!(*cond));
+                    } else {
+                        *out += &format!("\tif ({} != 0.) {{\n", get_input!(*cond));
+                    }
+                }
+                Instr::Goto(_) => {
+                    end_asm_block!(in_asm_block);
+                    *out += "\t} else {\n";
+                }
+                Instr::Label(_) => {}
+                Instr::Join(o, cond, a, b) => {
+                    end_asm_block!(in_asm_block);
+                    *out += "\t}\n";
+                    let arg_a = get_input!(*a);
+                    let arg_b = get_input!(*b);
+
+                    if asm_flavour == InlineASM::AVX2 {
+                        *out += &format!(
+                            "\tZ[{}] = (all({} != 0.)) ? {} : {};\n",
+                            o,
+                            get_input!(*cond),
+                            arg_a,
+                            arg_b
+                        );
+                    } else {
+                        *out += &format!(
+                            "\tZ[{}] = ({} != 0.) ? {} : {};\n",
+                            o,
+                            get_input!(*cond),
+                            arg_a,
+                            arg_b
+                        );
                     }
                 }
             }
@@ -2851,6 +4260,10 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     InlineASM::X64 => {
                         *out += &format!("\t\t\"movupd {}(%3), %%xmm0\\n\\t\"\n", r * 16);
                     }
+                    InlineASM::AVX2 => {
+                        *out += &format!("\t\t\"vmovupd {}(%3), %%ymm0\\n\\t\"\n", r * 64);
+                        *out += &format!("\t\t\"vmovupd {}(%3), %%ymm1\\n\\t\"\n", r * 64 + 32);
+                    }
                     InlineASM::AArch64 => {
                         *out += &format!("\t\t\"ldr q0, [%3, {}]\\n\\t\"\n", r * 16);
                     }
@@ -2862,6 +4275,16 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                         *out += &format!(
                             "\t\t\"movupd {}(%2), %%xmm0\\n\\t\"\n",
                             (r - self.param_count) * 16
+                        );
+                    }
+                    InlineASM::AVX2 => {
+                        *out += &format!(
+                            "\t\t\"vmovupd {}(%2), %%ymm0\\n\\t\"\n",
+                            (r - self.param_count) * 64
+                        );
+                        *out += &format!(
+                            "\t\t\"vmovupd {}(%2), %%ymm1\\n\\t\"\n",
+                            (r - self.param_count) * 64 + 32
                         );
                     }
                     InlineASM::AArch64 => {
@@ -2878,6 +4301,10 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                     InlineASM::X64 => {
                         *out += &format!("\t\t\"movupd {}(%1), %%xmm0\\n\\t\"\n", r * 16);
                     }
+                    InlineASM::AVX2 => {
+                        *out += &format!("\t\t\"vmovupd {}(%1), %%ymm0\\n\\t\"\n", r * 64);
+                        *out += &format!("\t\t\"vmovupd {}(%1), %%ymm1\\n\\t\"\n", r * 64 + 32);
+                    }
                     InlineASM::AArch64 => {
                         *out += &format!("\t\t\"ldr q0, [%1, {}]\\n\\t\"\n", r * 16);
                     }
@@ -2889,6 +4316,10 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
                 InlineASM::X64 => {
                     *out += &format!("\t\t\"movupd %%xmm0, {}(%0)\\n\\t\"\n", i * 16);
                 }
+                InlineASM::AVX2 => {
+                    *out += &format!("\t\t\"vmovupd %%ymm0, {}(%0)\\n\\t\"\n", i * 64);
+                    *out += &format!("\t\t\"vmovupd %%ymm1, {}(%0)\\n\\t\"\n", i * 64 + 32);
+                }
                 InlineASM::AArch64 => {
                     *out += &format!("\t\t\"str q0, [%0, {}]\\n\\t\"\n", i * 16);
                 }
@@ -2899,14 +4330,17 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
         match asm_flavour {
             InlineASM::X64 => {
                 *out += &format!(
-                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"xmm0\", \"xmm1\", \"xmm2\", \"xmm3\", \"xmm4\", \"xmm5\", \"xmm6\", \"xmm7\", \"xmm8\", \"xmm9\", \"xmm10\", \"xmm11\", \"xmm12\", \"xmm13\", \"xmm14\", \"xmm15\");\n",
-                    function_name
+                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({function_name}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"xmm0\", \"xmm1\", \"xmm2\", \"xmm3\", \"xmm4\", \"xmm5\", \"xmm6\", \"xmm7\", \"xmm8\", \"xmm9\", \"xmm10\", \"xmm11\", \"xmm12\", \"xmm13\", \"xmm14\", \"xmm15\");\n"
+                );
+            }
+            InlineASM::AVX2 => {
+                *out += &format!(
+                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({function_name}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"ymm0\", \"ymm1\", \"ymm2\", \"ymm3\", \"ymm4\", \"ymm5\", \"ymm6\", \"ymm7\", \"ymm8\", \"ymm9\", \"ymm10\", \"ymm11\", \"ymm12\", \"ymm13\", \"ymm14\", \"ymm15\");\n"
                 );
             }
             InlineASM::AArch64 => {
                 *out += &format!(
-                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"d0\", \"d1\", \"d2\", \"d3\", \"d4\", \"d5\", \"d6\", \"d7\", \"d8\", \"d9\", \"d10\", \"d11\", \"d12\", \"d13\", \"d14\", \"d15\", \"d16\", \"d17\", \"d18\", \"d19\", \"d20\", \"d21\", \"d22\", \"d23\", \"d24\", \"d25\", \"d26\", \"d27\", \"d28\", \"d29\", \"d30\", \"d31\");\n",
-                    function_name
+                    "\t\t:\n\t\t: \"r\"(out), \"r\"(Z), \"r\"({function_name}_CONSTANTS_complex), \"r\"(params)\n\t\t: \"memory\", \"d0\", \"d1\", \"d2\", \"d3\", \"d4\", \"d5\", \"d6\", \"d7\", \"d8\", \"d9\", \"d10\", \"d11\", \"d12\", \"d13\", \"d14\", \"d15\", \"d16\", \"d17\", \"d18\", \"d19\", \"d20\", \"d21\", \"d22\", \"d23\", \"d24\", \"d25\", \"d26\", \"d27\", \"d28\", \"d29\", \"d30\", \"d31\");\n"
                 );
             }
             InlineASM::None => unreachable!(),
@@ -2916,10 +4350,138 @@ impl<T: ExportNumber + SingleFloat> ExpressionEvaluator<T> {
     }
 }
 
+/// An optimized evaluator for expressions that can evaluate expressions with parameters
+/// and some registered external functions.
+pub struct ExpressionEvaluatorWithExternalFunctions<T> {
+    stack: Vec<T>,
+    param_count: usize,
+    instructions: Vec<Instr>,
+    result_indices: Vec<usize>,
+    external_fns: Vec<(Vec<T>, Box<dyn Fn(&[T]) -> T + Send + Sync>)>,
+}
+
+impl<T: Real> ExpressionEvaluatorWithExternalFunctions<T> {
+    #[allow(dead_code)]
+    pub(crate) fn update_stack(&mut self, e: ExpressionEvaluator<T>) {
+        self.stack = e.stack;
+        self.param_count = e.param_count;
+        self.instructions = e.instructions;
+        self.result_indices = e.result_indices;
+    }
+
+    pub fn evaluate_single(&mut self, params: &[T]) -> T {
+        if self.result_indices.len() != 1 {
+            panic!(
+                "Evaluator does not return a single result but {} results",
+                self.result_indices.len()
+            );
+        }
+
+        let mut res = T::new_zero();
+        self.evaluate(params, std::slice::from_mut(&mut res));
+        res
+    }
+
+    pub fn evaluate(&mut self, params: &[T], out: &mut [T]) {
+        if self.param_count != params.len() {
+            panic!(
+                "Parameter count mismatch: expected {}, got {}",
+                self.param_count,
+                params.len()
+            );
+        }
+
+        for (t, p) in self.stack.iter_mut().zip(params) {
+            *t = p.clone();
+        }
+
+        let mut tmp;
+        let mut i = 0;
+        while i < self.instructions.len() {
+            let instr = unsafe { self.instructions.get_unchecked(i) };
+            match instr {
+                Instr::Add(r, v) => {
+                    tmp = self.stack[v[0]].clone();
+                    for x in &v[1..] {
+                        let e = self.stack[*x].clone();
+                        tmp += e;
+                    }
+                    std::mem::swap(&mut self.stack[*r], &mut tmp);
+                }
+                Instr::Mul(r, v) => {
+                    tmp = self.stack[v[0]].clone();
+                    for x in &v[1..] {
+                        let e = self.stack[*x].clone();
+                        tmp *= e;
+                    }
+                    std::mem::swap(&mut self.stack[*r], &mut tmp);
+                }
+                Instr::Pow(r, b, e) => {
+                    if *e >= 0 {
+                        self.stack[*r] = self.stack[*b].pow(*e as u64);
+                    } else {
+                        self.stack[*r] = self.stack[*b].pow(e.unsigned_abs()).inv();
+                    }
+                }
+                Instr::Powf(r, b, e) => {
+                    self.stack[*r] = self.stack[*b].powf(&self.stack[*e]);
+                }
+                Instr::BuiltinFun(r, s, arg) => match s.0 {
+                    Symbol::EXP => self.stack[*r] = self.stack[*arg].exp(),
+                    Symbol::LOG => self.stack[*r] = self.stack[*arg].log(),
+                    Symbol::SIN => self.stack[*r] = self.stack[*arg].sin(),
+                    Symbol::COS => self.stack[*r] = self.stack[*arg].cos(),
+                    Symbol::SQRT => self.stack[*r] = self.stack[*arg].sqrt(),
+                    Symbol::CONJ => self.stack[*r] = self.stack[*arg].conj(),
+                    _ => unreachable!(),
+                },
+                Instr::ExternalFun(r, s, args) => {
+                    let (cache, f) = &mut self.external_fns[*s];
+
+                    if cache.len() < args.len() {
+                        cache.resize(args.len(), self.stack[0].clone());
+                    }
+
+                    for (i, v) in cache.iter_mut().zip(args) {
+                        *i = self.stack[*v].clone();
+                    }
+
+                    self.stack[*r] = (f)(&cache[..args.len()]);
+                }
+                Instr::IfElse(n, label) => {
+                    // jump to else block
+                    if self.stack[*n].is_fully_zero() {
+                        i = label.0;
+                        continue;
+                    }
+                }
+                Instr::Goto(label) => {
+                    i = label.0;
+                    continue;
+                }
+                Instr::Label(_) => {}
+                Instr::Join(r, c, a, b) => {
+                    if !self.stack[*c].is_fully_zero() {
+                        self.stack[*r] = self.stack[*a].clone();
+                    } else {
+                        self.stack[*r] = self.stack[*b].clone();
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        for (o, i) in out.iter_mut().zip(&self.result_indices) {
+            *o = self.stack[*i].clone();
+        }
+    }
+}
+
 /// A slot in a list that contains a numerical value.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Slot {
     /// An entry in the list of parameters.
     Param(usize),
@@ -2934,10 +4496,21 @@ pub enum Slot {
 impl std::fmt::Display for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Slot::Param(i) => write!(f, "p{}", i),
-            Slot::Const(i) => write!(f, "c{}", i),
-            Slot::Temp(i) => write!(f, "t{}", i),
-            Slot::Out(i) => write!(f, "o{}", i),
+            Slot::Param(i) => write!(f, "p{i}"),
+            Slot::Const(i) => write!(f, "c{i}"),
+            Slot::Temp(i) => write!(f, "t{i}"),
+            Slot::Out(i) => write!(f, "o{i}"),
+        }
+    }
+}
+
+impl Slot {
+    pub fn index(&self, index: usize) -> Slot {
+        match self {
+            Slot::Param(i) => Slot::Param(*i + index),
+            Slot::Const(i) => Slot::Const(*i + index),
+            Slot::Temp(i) => Slot::Temp(*i + index),
+            Slot::Out(i) => Slot::Out(*i + index),
         }
     }
 }
@@ -2958,6 +4531,18 @@ pub enum Instruction {
     /// `Fun(o, s, a)` means `o = s(a)`, where `s` is assumed to
     /// be a built-in function such as `sin`.
     Fun(Slot, BuiltinSymbol, Slot),
+    /// `ExternalFun(o, s, a,...)` means `o = s(a, ...)`, where `s` is an external function.
+    ExternalFun(Slot, String, Vec<Slot>),
+    /// `Assign(o, v)` means `o = v`.
+    Assign(Slot, Slot),
+    /// `IfElse(cond, label)` means jump to `label` if `cond` is zero.
+    IfElse(Slot, usize),
+    /// Unconditional jump to `label`.
+    Goto(usize),
+    /// A position in the instruction list to jump to.
+    Label(usize),
+    /// `Join(o, cond, t, f)` means `o = cond ? t : f`.
+    Join(Slot, Slot, Slot, Slot),
 }
 
 impl std::fmt::Display for Instruction {
@@ -2986,13 +4571,40 @@ impl std::fmt::Display for Instruction {
                 )
             }
             Instruction::Pow(o, b, e) => {
-                write!(f, "{} = {}^{}", o, b, e)
+                write!(f, "{o} = {b}^{e}")
             }
             Instruction::Powf(o, b, e) => {
-                write!(f, "{} = {}^{}", o, b, e)
+                write!(f, "{o} = {b}^{e}")
             }
             Instruction::Fun(o, s, a) => {
                 write!(f, "{} = {}({})", o, s.0, a)
+            }
+            Instruction::ExternalFun(o, s, a) => {
+                write!(
+                    f,
+                    "{} = {}({})",
+                    o,
+                    s,
+                    a.iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            Instruction::Assign(o, v) => {
+                write!(f, "{} = {}", o, v)
+            }
+            Instruction::IfElse(cond, label) => {
+                write!(f, "if {} == 0 goto L{}", cond, label)
+            }
+            Instruction::Goto(label) => {
+                write!(f, "goto L{}", label)
+            }
+            Instruction::Label(label) => {
+                write!(f, "L{}:", label)
+            }
+            Instruction::Join(o, cond, a, b) => {
+                write!(f, "{} = {} ? {} : {}", o, cond, a, b)
             }
         }
     }
@@ -3048,6 +4660,36 @@ impl<T: Clone> ExpressionEvaluator<T> {
                 Instr::BuiltinFun(o, s, a) => {
                     instr.push(Instruction::Fun(get_slot!(*o), *s, get_slot!(*a)));
                 }
+                Instr::ExternalFun(o, f, a) => {
+                    instr.push(Instruction::ExternalFun(
+                        get_slot!(*o),
+                        self.external_fns[*f].clone(),
+                        a.iter().map(|x| get_slot!(*x)).collect(),
+                    ));
+                }
+                Instr::IfElse(cond, label) => {
+                    instr.push(Instruction::IfElse(get_slot!(*cond), label.0));
+                }
+                Instr::Goto(label) => {
+                    instr.push(Instruction::Goto(label.0));
+                }
+                Instr::Label(label) => {
+                    instr.push(Instruction::Label(label.0));
+                }
+                Instr::Join(o, cond, a, b) => {
+                    instr.push(Instruction::Join(
+                        get_slot!(*o),
+                        get_slot!(*cond),
+                        get_slot!(*a),
+                        get_slot!(*b),
+                    ));
+                }
+            }
+        }
+
+        for (out, i) in self.result_indices.iter().enumerate() {
+            if get_slot!(*i) != Slot::Out(out) {
+                instr.push(Instruction::Assign(Slot::Out(out), get_slot!(*i)));
             }
         }
 
@@ -3055,6 +4697,746 @@ impl<T: Clone> ExpressionEvaluator<T> {
     }
 }
 
+impl<T: Default + Clone + std::fmt::Debug> ExpressionEvaluator<T> {
+    /// Redefine every operation to take `n` components in and
+    /// yield `n` components. This can be used to define efficient
+    /// evaluation over dual numbers.
+    ///
+    /// # Example
+    ///
+    /// Create a dual number and evaluate an expression over it:
+    /// ```
+    /// use symbolica::{
+    ///     atom::{Atom, AtomCore},
+    ///     create_hyperdual_single_derivative,
+    ///     domains::{
+    ///         float::{Complex, Float, FloatLike},
+    ///         rational::Rational,
+    ///     },
+    ///     evaluate::{FunctionMap, OptimizationSettings},
+    ///     parse,
+    /// };
+    ///
+    /// create_hyperdual_single_derivative!(Dual2, 2);
+    ///
+    /// let ev = parse!("sin(x+y)^2+cos(x+y)^2 - 1")
+    ///     .evaluator(
+    ///         &FunctionMap::new(),
+    ///         &[parse!("x"), parse!("y")],
+    ///         OptimizationSettings::default(),
+    ///    )
+    ///    .unwrap();
+    ///
+    /// let vec_ev = ev.vectorize(&Dual2::<Complex<Rational>>::new_zero());
+    ///
+    /// let mut vec_f = vec_ev.map_coeff(&|x| x.re.to_f64());
+    /// let mut dest = vec![0.; 3];
+    /// vec_f.evaluate(&[2.0, 1.0, 0., 3.0, 1.0, 1.], &mut dest);
+    ///
+    /// assert!(dest.iter().all(|x| x.abs() < 1e-10));
+    /// ```
+    pub fn vectorize<V: Vectorize<T>>(mut self, v: &V) -> ExpressionEvaluator<T> {
+        self.undo_stack_optimization();
+
+        // unfold every instruction to a single operation
+        let mut new_instr = vec![];
+        for x in &mut self.instructions {
+            match x {
+                Instr::Add(o, a) => {
+                    new_instr.push(Instr::Add(*o, vec![a[0], a[1]]));
+                    for x in a.iter().skip(2) {
+                        new_instr.push(Instr::Add(*o, vec![*o, *x]));
+                    }
+                }
+                Instr::Mul(o, a) => {
+                    new_instr.push(Instr::Mul(*o, vec![a[0], a[1]]));
+                    for x in a.iter().skip(2) {
+                        new_instr.push(Instr::Mul(*o, vec![*o, *x]));
+                    }
+                }
+                _ => new_instr.push(x.clone()),
+            }
+        }
+
+        self.instructions = new_instr;
+
+        let mut constants = vec![];
+        for c in &self.stack[self.param_count..self.reserved_indices] {
+            constants.extend(v.map_coeff(c.clone()));
+        }
+        let old_constants_num = constants.len();
+
+        let mut slot_map = HashMap::default();
+        for x in 0..self.reserved_indices {
+            slot_map.insert(x, x * v.get_dimension()); // set the start of the vector
+        }
+
+        self.param_count *= v.get_dimension();
+        self.reserved_indices *= v.get_dimension();
+        macro_rules! get_slot {
+            ($i:expr) => {
+                if $i < self.param_count {
+                    Slot::Param($i)
+                } else if $i < self.reserved_indices {
+                    Slot::Const($i - self.param_count)
+                } else {
+                    Slot::Temp($i - self.reserved_indices)
+                }
+            };
+        }
+
+        macro_rules! from_slot {
+            ($i:expr) => {
+                match $i {
+                    Slot::Param(x) => x,
+                    Slot::Const(x) => x + self.param_count,
+                    Slot::Temp(x) => x + self.reserved_indices,
+                    Slot::Out(_) => unreachable!(),
+                }
+            };
+        }
+
+        let mut ins = InstructionList {
+            instructions: vec![],
+            constants,
+            dim: v.get_dimension(),
+        };
+
+        for i in self.instructions.drain(..) {
+            let (o, instr) = match i {
+                Instr::Add(o, a) => (
+                    o,
+                    VectorInstruction::Add(get_slot!(slot_map[&a[0]]), get_slot!(slot_map[&a[1]])),
+                ),
+                Instr::Mul(o, a) => (
+                    o,
+                    VectorInstruction::Mul(get_slot!(slot_map[&a[0]]), get_slot!(slot_map[&a[1]])),
+                ),
+                Instr::Pow(o, a, e) => (o, VectorInstruction::Pow(get_slot!(slot_map[&a]), e)),
+                Instr::Powf(o, b, e) => (
+                    o,
+                    VectorInstruction::Powf(get_slot!(slot_map[&b]), get_slot!(slot_map[&e])),
+                ),
+                Instr::BuiltinFun(o, f, a) => {
+                    (o, VectorInstruction::BuiltinFun(f, get_slot!(slot_map[&a])))
+                }
+                Instr::ExternalFun(o, f, a) => (
+                    o,
+                    VectorInstruction::ExternalFun(
+                        f,
+                        a.iter().map(|x| get_slot!(slot_map[x])).collect(),
+                    ),
+                ),
+                Instr::Goto(l) => {
+                    ins.instructions.push(VectorInstruction::Goto(l));
+                    continue;
+                }
+                Instr::Label(l) => {
+                    ins.instructions.push(VectorInstruction::Label(l));
+                    continue;
+                }
+                Instr::IfElse(c, l) => {
+                    ins.instructions
+                        .push(VectorInstruction::IfElse(get_slot!(slot_map[&c]), l));
+                    continue;
+                }
+                Instr::Join(o, c, t, f) => (
+                    o,
+                    VectorInstruction::Join(
+                        get_slot!(slot_map[&c]),
+                        get_slot!(slot_map[&t]),
+                        get_slot!(slot_map[&f]),
+                    ),
+                ),
+            };
+
+            let r = v.map_instruction(&instr, &mut ins);
+            assert_eq!(r.len(), v.get_dimension());
+            for ii in r {
+                ins.add(ii);
+            }
+
+            slot_map.insert(
+                o,
+                ins.instructions.len() + self.reserved_indices - v.get_dimension(),
+            );
+        }
+
+        self.stack.clear();
+        self.stack.resize(self.param_count, T::default());
+        self.stack.extend(ins.constants);
+
+        let stack_shift = self.stack.len() - old_constants_num - self.param_count;
+
+        let mut new_result_indices = vec![];
+        for x in 0..self.result_indices.len() {
+            let mut p = slot_map[&self.result_indices[x]];
+            if p >= self.reserved_indices {
+                p += stack_shift;
+            }
+
+            for i in 0..v.get_dimension() {
+                new_result_indices.push(p + i);
+            }
+        }
+
+        self.reserved_indices += stack_shift;
+        self.result_indices = new_result_indices;
+
+        for i in ins.instructions {
+            let out = self.instructions.len() + self.reserved_indices;
+            match i {
+                VectorInstruction::Add(slot, slot1) => {
+                    let mut s1 = from_slot!(slot);
+                    let mut s2 = from_slot!(slot1);
+                    if s1 > s2 {
+                        (s1, s2) = (s2, s1);
+                    }
+
+                    self.instructions.push(Instr::Add(out, vec![s1, s2]));
+                }
+                VectorInstruction::Assign(slot) => {
+                    self.instructions
+                        .push(Instr::Add(out, vec![from_slot!(slot)]));
+                }
+                VectorInstruction::Mul(slot, slot1) => {
+                    let mut s1 = from_slot!(slot);
+                    let mut s2 = from_slot!(slot1);
+                    if s1 > s2 {
+                        (s1, s2) = (s2, s1);
+                    }
+
+                    self.instructions.push(Instr::Mul(out, vec![s1, s2]));
+                }
+                VectorInstruction::Pow(slot, e) => {
+                    self.instructions.push(Instr::Pow(out, from_slot!(slot), e));
+                }
+                VectorInstruction::Powf(slot, slot1) => {
+                    self.instructions
+                        .push(Instr::Powf(out, from_slot!(slot), from_slot!(slot1)));
+                }
+                VectorInstruction::BuiltinFun(builtin_symbol, slot) => {
+                    self.instructions.push(Instr::BuiltinFun(
+                        out,
+                        builtin_symbol,
+                        from_slot!(slot),
+                    ));
+                }
+                VectorInstruction::ExternalFun(f, args) => {
+                    self.instructions.push(Instr::ExternalFun(
+                        out,
+                        f,
+                        args.iter().map(|x| from_slot!(*x)).collect(),
+                    ));
+                }
+                VectorInstruction::IfElse(cond, label) => {
+                    self.instructions
+                        .push(Instr::IfElse(from_slot!(cond), label));
+                }
+                VectorInstruction::Goto(label) => {
+                    self.instructions.push(Instr::Goto(label));
+                }
+                VectorInstruction::Label(label) => {
+                    self.instructions.push(Instr::Label(label));
+                }
+                VectorInstruction::Join(cond, t, f) => {
+                    self.instructions.push(Instr::Join(
+                        out,
+                        from_slot!(cond),
+                        from_slot!(t),
+                        from_slot!(f),
+                    ));
+                }
+            }
+        }
+
+        self.stack.resize(
+            self.reserved_indices + self.instructions.len(),
+            T::default(),
+        );
+
+        self.remove_common_pairs();
+        self.optimize_stack();
+
+        self
+    }
+}
+
+/// A trait to define how to vectorize coefficients and instructions.
+/// Every slot is mapped to `n` slots and every instruction is mapped to `n` instructions, where `n` is the dimension.
+pub trait Vectorize<T> {
+    /// Map a coefficient to a vector of coefficients of [Vectorize::get_dimension] length.
+    fn map_coeff(&self, coeff: T) -> Vec<T>;
+
+    /// Map an instruction applied to a vector of slots (components accessible with [Slot::index])
+    /// to a vector of instructions of [Vectorize::get_dimension] length.
+    fn map_instruction(
+        &self,
+        instr: &VectorInstruction,
+        instr_addr: &mut InstructionList<T>,
+    ) -> Vec<VectorInstruction>;
+
+    /// Get the dimension of the vectorization.
+    fn get_dimension(&self) -> usize;
+}
+
+impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for T {
+    fn map_coeff(&self, coeff: Complex<Rational>) -> Vec<Complex<Rational>> {
+        let mut r = vec![coeff.clone()];
+        for _ in 1..self.get_len() {
+            r.push(Complex::new_zero());
+        }
+        r
+    }
+
+    fn map_instruction(
+        &self,
+        i: &VectorInstruction,
+        instrs: &mut InstructionList<Complex<Rational>>,
+    ) -> Vec<VectorInstruction> {
+        fn scalar_add(a: &Slot, b: &Slot, instrs: &mut InstructionList<Complex<Rational>>) -> Slot {
+            if instrs.is_zero(a) {
+                *b
+            } else if instrs.is_zero(b) {
+                *a
+            } else {
+                instrs.add(VectorInstruction::Add(*a, *b))
+            }
+        }
+
+        fn scalar_yield_add(
+            a: &Slot,
+            b: &Slot,
+            instrs: &mut InstructionList<Complex<Rational>>,
+        ) -> VectorInstruction {
+            if instrs.is_zero(a) {
+                VectorInstruction::Assign(*b)
+            } else if instrs.is_zero(b) {
+                VectorInstruction::Assign(*a)
+            } else {
+                VectorInstruction::Add(*a, *b)
+            }
+        }
+
+        fn scalar_mul(a: &Slot, b: &Slot, instrs: &mut InstructionList<Complex<Rational>>) -> Slot {
+            if instrs.is_zero(a) || instrs.is_one(b) {
+                *a
+            } else if instrs.is_zero(b) || instrs.is_one(a) {
+                *b
+            } else {
+                instrs.add(VectorInstruction::Mul(*a, *b))
+            }
+        }
+
+        fn scalar_yield_mul(
+            a: &Slot,
+            b: &Slot,
+            instrs: &mut InstructionList<Complex<Rational>>,
+        ) -> VectorInstruction {
+            if instrs.is_zero(a) || instrs.is_one(b) {
+                VectorInstruction::Assign(*a)
+            } else if instrs.is_zero(b) || instrs.is_one(a) {
+                VectorInstruction::Assign(*b)
+            } else {
+                VectorInstruction::Mul(*a, *b)
+            }
+        }
+
+        fn rescale(
+            a: &[Slot],
+            c: &Slot,
+            instrs: &mut InstructionList<Complex<Rational>>,
+        ) -> Vec<Slot> {
+            a.iter().map(|x| scalar_mul(x, c, instrs)).collect()
+        }
+
+        fn add(
+            a: &[Slot],
+            b: &[Slot],
+            instrs: &mut InstructionList<Complex<Rational>>,
+        ) -> Vec<Slot> {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| scalar_add(x, y, instrs))
+                .collect()
+        }
+
+        fn mul(
+            a: &[Slot],
+            b: &[Slot],
+            table: &[(usize, usize, usize)],
+            instrs: &mut InstructionList<Complex<Rational>>,
+        ) -> Vec<Slot> {
+            let mut current_index = vec![];
+            for j in 0..a.len() {
+                current_index.push(scalar_mul(&a[j], &b[0], instrs));
+            }
+
+            for (si, oi, index) in table.iter() {
+                let tmp = scalar_mul(&a[*si], &b[*oi], instrs);
+                current_index[*index] = scalar_add(&current_index[*index], &tmp, instrs);
+            }
+            current_index
+        }
+
+        let mult_table = self.get_multiplication_table();
+
+        match i {
+            VectorInstruction::Add(a, b) => (0..self.get_len())
+                .map(|j| scalar_yield_add(&a.index(j), &b.index(j), instrs))
+                .collect(),
+            VectorInstruction::Mul(a, b) => {
+                let mut current_index = vec![];
+                for j in 0..self.get_len() {
+                    current_index.push(scalar_mul(&a.index(j), b, instrs));
+                }
+
+                for (si, oi, index) in self.get_multiplication_table().iter() {
+                    let tmp = scalar_mul(&a.index(*si), &b.index(*oi), instrs);
+                    current_index[*index] = scalar_add(&current_index[*index], &tmp, instrs);
+                }
+
+                current_index
+                    .iter()
+                    .map(|x| VectorInstruction::Assign(*x))
+                    .collect()
+            }
+            VectorInstruction::BuiltinFun(f, a) => match f.get_symbol() {
+                Symbol::SQRT => {
+                    let e = instrs.add(VectorInstruction::BuiltinFun(*f, *a));
+                    let norm = instrs.add(VectorInstruction::Pow(*a, -1)); // TODO: check 0?
+
+                    let zero = instrs.add_repeated_constant(Complex::new_zero());
+                    let mut r = vec![zero];
+                    r.extend((1..self.get_len()).map(|j| scalar_mul(&a.index(j), &norm, instrs)));
+
+                    let one =
+                        instrs.add_constant_in_first_component(Complex::from(Rational::one()));
+
+                    let mut accum = (0..self.get_len())
+                        .map(|j| one.index(j))
+                        .collect::<Vec<_>>();
+                    let mut res = (0..self.get_len())
+                        .map(|j| one.index(j))
+                        .collect::<Vec<_>>();
+                    let mut num = Complex::from(Rational::one());
+
+                    let mut scale = 1;
+                    for p in 1..self.get_max_depth() + 1 {
+                        scale *= p;
+                        num = num.clone()
+                            * (num.from_usize(2).inv() - &num.from_usize(p as usize - 1));
+                        accum = mul(&accum, &r, mult_table, instrs);
+
+                        let c = instrs
+                            .add_constant_in_first_component(&num * &num.from_usize(scale).inv());
+
+                        res = add(&res, &rescale(&accum, &c, instrs), instrs);
+                    }
+
+                    res.iter()
+                        .map(|x| scalar_yield_mul(x, &e, instrs))
+                        .collect()
+                }
+                Symbol::EXP => {
+                    let e = instrs.add(VectorInstruction::BuiltinFun(*f, *a));
+
+                    let one =
+                        instrs.add_constant_in_first_component(Complex::from(Rational::one()));
+
+                    let mut accum = (0..self.get_len())
+                        .map(|j| one.index(j))
+                        .collect::<Vec<_>>();
+                    let mut res = (0..self.get_len())
+                        .map(|j| one.index(j))
+                        .collect::<Vec<_>>();
+
+                    let zero = instrs.add_repeated_constant(Complex::new_zero());
+                    let mut r = vec![zero];
+                    r.extend((1..self.get_len()).map(|j| a.index(j)));
+
+                    let mut scale = Complex::from(Rational::one());
+                    for p in 0..self.get_max_depth() {
+                        scale *= Rational::from(p + 1);
+                        accum = mul(&accum, &r, mult_table, instrs);
+
+                        let c = instrs.add_constant_in_first_component(scale.inv());
+
+                        res = add(&res, &rescale(&accum, &c, instrs), instrs);
+                    }
+
+                    res.iter()
+                        .map(|x| scalar_yield_mul(x, &e, instrs))
+                        .collect()
+                }
+                Symbol::LOG => {
+                    let e = instrs.add(VectorInstruction::BuiltinFun(*f, *a));
+
+                    let norm = instrs.add(VectorInstruction::Pow(*a, -1)); // TODO: check 0?
+
+                    let zero = instrs.add_repeated_constant(Complex::new_zero());
+                    let mut r = vec![zero];
+                    r.extend((1..self.get_len()).map(|j| scalar_mul(&a.index(j), &norm, instrs)));
+
+                    let mut accum = r.clone();
+
+                    let mut res = (0..self.get_len()).map(|_| zero).collect::<Vec<_>>();
+                    res[0] = e;
+
+                    let mut scale = Complex::from(Rational::from(-1));
+                    for p in 1..self.get_max_depth() + 1 {
+                        scale *= Rational::from(-1);
+
+                        let c = instrs
+                            .add_constant_in_first_component((&scale * Rational::from(p)).inv());
+
+                        res = add(&res, &rescale(&accum, &c, instrs), instrs);
+                        accum = mul(&accum, &r, mult_table, instrs);
+                    }
+
+                    res.iter().map(|x| VectorInstruction::Assign(*x)).collect()
+                }
+                Symbol::SIN => {
+                    let s = instrs.add(VectorInstruction::BuiltinFun(*f, *a));
+                    let c = instrs.add(VectorInstruction::BuiltinFun(
+                        BuiltinSymbol(Symbol::COS),
+                        *a,
+                    ));
+
+                    let zero = instrs.add_repeated_constant(Complex::new_zero());
+                    let mut p = vec![zero];
+                    p.extend((1..self.get_len()).map(|j| a.index(j)));
+
+                    let mut e = (0..self.get_len()).map(|_| zero).collect::<Vec<_>>();
+                    e[0] = s;
+
+                    let mut sp = p.clone();
+                    let mut scale = Complex::from(Rational::one());
+                    for i in 1..self.get_max_depth() + 1 {
+                        scale *= Rational::from(i);
+                        let b = if i % 2 == 1 { c.clone() } else { s.clone() };
+
+                        let sc = instrs.add_constant_in_first_component(if i % 4 >= 2 {
+                            -scale.inv()
+                        } else {
+                            scale.inv()
+                        });
+
+                        let s = rescale(&sp, &scalar_mul(&b, &sc, instrs), instrs);
+
+                        sp = mul(&sp, &p, mult_table, instrs);
+
+                        e = add(&e, &s, instrs);
+                    }
+
+                    e.iter().map(|x| VectorInstruction::Assign(*x)).collect()
+                }
+                Symbol::COS => {
+                    let s = instrs.add(VectorInstruction::BuiltinFun(
+                        BuiltinSymbol(Symbol::SIN),
+                        *a,
+                    ));
+                    let c = instrs.add(VectorInstruction::BuiltinFun(*f, *a));
+
+                    let zero = instrs.add_repeated_constant(Complex::new_zero());
+                    let mut p = vec![zero];
+                    p.extend((1..self.get_len()).map(|j| a.index(j)));
+
+                    let mut e = (0..self.get_len()).map(|_| zero).collect::<Vec<_>>();
+                    e[0] = c;
+
+                    let mut sp = p.clone();
+                    let mut scale = Complex::from(Rational::one());
+                    for i in 1..self.get_max_depth() + 1 {
+                        scale *= Rational::from(i);
+                        let b = if i % 2 == 1 { s.clone() } else { c.clone() };
+
+                        let sc =
+                            instrs.add_constant_in_first_component(if (i % 2 == 0) ^ (i % 4 < 2) {
+                                -scale.inv()
+                            } else {
+                                scale.inv()
+                            });
+
+                        let s = rescale(&sp, &scalar_mul(&b, &sc, instrs), instrs);
+
+                        sp = mul(&sp, &p, mult_table, instrs);
+
+                        e = add(&e, &s, instrs);
+                    }
+
+                    e.iter().map(|x| VectorInstruction::Assign(*x)).collect()
+                }
+                Symbol::CONJ => {
+                    // assume variables are real
+                    (0..self.get_len())
+                        .map(|j| VectorInstruction::BuiltinFun(*f, a.index(j)))
+                        .collect()
+                }
+                _ => unimplemented!(
+                    "Vectorization not implemented for built-in function {}",
+                    f.get_symbol().get_name()
+                ),
+            },
+            VectorInstruction::Pow(a, b) => {
+                assert_eq!(*b, -1); // only b = -1 is used in practice
+                let a_inv = instrs.add(VectorInstruction::Pow(*a, -1));
+
+                let zero = instrs.add_repeated_constant(Complex::new_zero());
+                let mut r = vec![zero];
+                r.extend((1..self.get_len()).map(|j| scalar_mul(&a.index(j), &a_inv, instrs)));
+
+                let one = instrs.add_constant_in_first_component(Complex::from(Rational::one()));
+
+                let neg_one = instrs.add_repeated_constant(Complex::from(Rational::from(-1)));
+                let neg_one_v = (0..self.get_len())
+                    .map(|j| neg_one.index(j))
+                    .collect::<Vec<_>>();
+
+                let mut accum = (0..self.get_len())
+                    .map(|j| one.index(j))
+                    .collect::<Vec<_>>();
+                let mut res = (0..self.get_len())
+                    .map(|j| one.index(j))
+                    .collect::<Vec<_>>();
+
+                for i in 1..self.get_max_depth() + 1 {
+                    accum = mul(&accum, &r, mult_table, instrs);
+                    if i % 2 == 0 {
+                        res = add(&res, &accum, instrs);
+                    } else {
+                        res = add(&res, &mul(&accum, &neg_one_v, mult_table, instrs), instrs);
+                    }
+                }
+
+                res.iter()
+                    .map(|x| scalar_yield_mul(x, &a_inv, instrs))
+                    .collect()
+            }
+            VectorInstruction::Powf(b, e) => {
+                let input = VectorInstruction::BuiltinFun(BuiltinSymbol(Symbol::LOG), *b);
+                let log: Vec<_> = self
+                    .map_instruction(&input, instrs)
+                    .into_iter()
+                    .map(|x| instrs.add(x))
+                    .collect();
+                let e = (0..self.get_len()).map(|j| e.index(j)).collect::<Vec<_>>();
+                let r = mul(&log, &e, mult_table, instrs);
+
+                // exp needs adjacent slots
+                let adjacent: Vec<_> = r
+                    .into_iter()
+                    .map(|x| instrs.add(VectorInstruction::Assign(x)))
+                    .collect();
+                let exp_in = VectorInstruction::BuiltinFun(BuiltinSymbol(Symbol::EXP), adjacent[0]);
+                self.map_instruction(&exp_in, instrs)
+            }
+            VectorInstruction::ExternalFun(_, _) => {
+                todo!("External functions not supported as they return a single value")
+            }
+            VectorInstruction::Join(c, a, b) => (0..self.get_len())
+                .map(|j| VectorInstruction::Join(c.index(j), a.index(j), b.index(j)))
+                .collect(),
+            VectorInstruction::Assign(a) => (0..self.get_len())
+                .map(|j| VectorInstruction::Assign(a.index(j)))
+                .collect(),
+            VectorInstruction::Goto(_)
+            | VectorInstruction::Label(_)
+            | VectorInstruction::IfElse(..) => {
+                unreachable!()
+            }
+        }
+    }
+
+    fn get_dimension(&self) -> usize {
+        self.get_len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VectorInstruction {
+    Add(Slot, Slot),
+    Assign(Slot),
+    Mul(Slot, Slot),
+    Pow(Slot, i64),
+    Powf(Slot, Slot),
+    BuiltinFun(BuiltinSymbol, Slot),
+    ExternalFun(usize, Vec<Slot>),
+    IfElse(Slot, Label),
+    Goto(Label),
+    Label(Label),
+    Join(Slot, Slot, Slot),
+}
+
+pub struct InstructionList<T> {
+    instructions: Vec<VectorInstruction>,
+    constants: Vec<T>,
+    dim: usize,
+}
+
+impl<T> InstructionList<T> {
+    pub fn add(&mut self, instr: VectorInstruction) -> Slot {
+        self.instructions.push(instr);
+        Slot::Temp(self.instructions.len() - 1)
+    }
+}
+
+impl<T: PartialEq + Clone + std::fmt::Debug> InstructionList<T> {
+    pub fn add_constant(&mut self, value: Vec<T>) -> Slot {
+        assert_eq!(value.len(), self.dim);
+        if let Some(c) = self.constants.chunks(self.dim).position(|x| x == &value) {
+            Slot::Const(c * self.dim)
+        } else {
+            self.constants.extend(value);
+            Slot::Const(self.constants.len() - self.dim)
+        }
+    }
+
+    pub fn add_repeated_constant(&mut self, value: T) -> Slot {
+        if let Some(c) = self
+            .constants
+            .chunks(self.dim)
+            .position(|x| x.iter().all(|x| *x == value))
+        {
+            Slot::Const(c * self.dim)
+        } else {
+            for _ in 0..self.dim {
+                self.constants.push(value.clone());
+            }
+            Slot::Const(self.constants.len() - self.dim)
+        }
+    }
+}
+
+impl<T: SingleFloat> InstructionList<T> {
+    pub fn is_zero(&self, slot: &Slot) -> bool {
+        match slot {
+            Slot::Const(c) => self.constants[*c].is_zero(),
+            _ => false,
+        }
+    }
+
+    pub fn is_one(&self, slot: &Slot) -> bool {
+        match slot {
+            Slot::Const(c) => self.constants[*c].is_one(),
+            _ => false,
+        }
+    }
+
+    pub fn add_constant_in_first_component(&mut self, value: T) -> Slot {
+        let mut v = vec![value.clone()];
+        v.extend((1..self.dim).map(|_| value.zero()));
+        self.add_constant(v)
+    }
+}
+
+/// A label in the instruction list.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Label(usize);
+
+/// An evaluation instruction.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
 #[derive(Debug, Clone, PartialEq)]
@@ -3064,6 +5446,11 @@ enum Instr {
     Pow(usize, usize, i64),
     Powf(usize, usize, usize),
     BuiltinFun(usize, BuiltinSymbol, usize),
+    ExternalFun(usize, usize, Vec<usize>),
+    IfElse(usize, Label),
+    Goto(Label),
+    Label(Label),
+    Join(usize, usize, usize, usize),
 }
 
 impl<T: Clone + PartialEq> SplitExpression<T> {
@@ -3102,6 +5489,18 @@ impl<T: Clone + PartialEq> Expression<T> {
             Expression::ReadArg(s) => Expression::ReadArg(*s),
             Expression::BuiltinFun(s, a) => Expression::BuiltinFun(*s, Box::new(a.map_coeff(f))),
             Expression::SubExpression(i) => Expression::SubExpression(*i),
+            Expression::ExternalFun(s, a) => {
+                let new_args = a.iter().map(|x| x.map_coeff(f)).collect();
+                Expression::ExternalFun(*s, new_args)
+            }
+            Expression::IfElse(b) => {
+                let (cond, then_expr, else_expr) = &**b;
+                Expression::IfElse(Box::new((
+                    cond.map_coeff(f),
+                    then_expr.map_coeff(f),
+                    else_expr.map_coeff(f),
+                )))
+            }
         }
     }
 
@@ -3138,6 +5537,16 @@ impl<T: Clone + PartialEq> Expression<T> {
                 a.strip_constants(stack, param_len);
             }
             Expression::SubExpression(_) => {}
+            Expression::ExternalFun(_, a) => {
+                for arg in a {
+                    arg.strip_constants(stack, param_len);
+                }
+            }
+            Expression::IfElse(b) => {
+                b.0.strip_constants(stack, param_len);
+                b.1.strip_constants(stack, param_len);
+                b.2.strip_constants(stack, param_len);
+            }
         }
     }
 }
@@ -3164,6 +5573,7 @@ impl<T: Clone + PartialEq> EvalTree<T> {
                 .iter()
                 .map(|(s, a, e)| (s.clone(), a.clone(), e.map_coeff(f)))
                 .collect(),
+            external_functions: self.external_functions.clone(),
             param_count: self.param_count,
         }
     }
@@ -3171,7 +5581,7 @@ impl<T: Clone + PartialEq> EvalTree<T> {
 
 impl<T: Clone + Default + PartialEq> EvalTree<T> {
     /// Create a linear version of the tree that can be evaluated more efficiently.
-    pub fn linearize(mut self, cpe_rounds: Option<usize>) -> ExpressionEvaluator<T> {
+    pub fn linearize(mut self, cpe_rounds: Option<usize>, verbose: bool) -> ExpressionEvaluator<T> {
         let mut stack = vec![T::default(); self.param_count];
 
         // strip every constant and move them into the stack after the params
@@ -3191,6 +5601,7 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
                 &mut instructions,
                 &mut sub_expr_pos,
                 &[],
+                false,
             );
             result_indices.push(result_index);
         }
@@ -3201,11 +5612,20 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
             reserved_indices,
             instructions,
             result_indices,
+            external_fns: self.external_functions.clone(),
         };
 
         for _ in 0..cpe_rounds.unwrap_or(usize::MAX) {
-            if e.remove_common_pairs() == 0 {
+            let r = e.remove_common_pairs();
+            if r == 0 {
                 break;
+            }
+            if verbose {
+                let (add_count, mul_count) = e.count_operations();
+                info!(
+                    "Removed {} common pairs: {} + and {} ×",
+                    r, add_count, mul_count
+                );
             }
         }
 
@@ -3242,6 +5662,7 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
         instr: &mut Vec<Instr>,
         sub_expr_pos: &mut HashMap<usize, usize>,
         args: &[usize],
+        in_branch: bool,
     ) -> usize {
         match tree {
             Expression::Const(t) => {
@@ -3254,7 +5675,15 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
                 let new_args: Vec<_> = e_args
                     .iter()
                     .map(|x| {
-                        self.linearize_impl(x, subexpressions, stack, instr, sub_expr_pos, args)
+                        self.linearize_impl(
+                            x,
+                            subexpressions,
+                            stack,
+                            instr,
+                            sub_expr_pos,
+                            args,
+                            in_branch,
+                        )
                     })
                     .collect();
 
@@ -3267,15 +5696,25 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
                     instr,
                     &mut sub_expr_pos,
                     &new_args,
+                    in_branch,
                 )
             }
             Expression::Add(a) => {
-                let args = a
+                let mut args: Vec<_> = a
                     .iter()
                     .map(|x| {
-                        self.linearize_impl(x, subexpressions, stack, instr, sub_expr_pos, args)
+                        self.linearize_impl(
+                            x,
+                            subexpressions,
+                            stack,
+                            instr,
+                            sub_expr_pos,
+                            args,
+                            in_branch,
+                        )
                     })
                     .collect();
+                args.sort();
 
                 stack.push(T::default());
                 let res = stack.len() - 1;
@@ -3286,12 +5725,21 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
                 res
             }
             Expression::Mul(m) => {
-                let args = m
+                let mut args: Vec<_> = m
                     .iter()
                     .map(|x| {
-                        self.linearize_impl(x, subexpressions, stack, instr, sub_expr_pos, args)
+                        self.linearize_impl(
+                            x,
+                            subexpressions,
+                            stack,
+                            instr,
+                            sub_expr_pos,
+                            args,
+                            in_branch,
+                        )
                     })
                     .collect();
+                args.sort();
 
                 stack.push(T::default());
                 let res = stack.len() - 1;
@@ -3302,20 +5750,49 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
                 res
             }
             Expression::Pow(p) => {
-                let b = self.linearize_impl(&p.0, subexpressions, stack, instr, sub_expr_pos, args);
+                let b = self.linearize_impl(
+                    &p.0,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    in_branch,
+                );
                 stack.push(T::default());
-                let res = stack.len() - 1;
+                let mut res = stack.len() - 1;
 
                 if p.1 > 1 {
                     instr.push(Instr::Mul(res, vec![b; p.1 as usize]));
+                } else if p.1 < -1 {
+                    instr.push(Instr::Mul(res, vec![b; -p.1 as usize]));
+                    stack.push(T::default());
+                    res += 1;
+                    instr.push(Instr::Pow(res, res - 1, -1));
                 } else {
                     instr.push(Instr::Pow(res, b, p.1));
                 }
                 res
             }
             Expression::Powf(p) => {
-                let b = self.linearize_impl(&p.0, subexpressions, stack, instr, sub_expr_pos, args);
-                let e = self.linearize_impl(&p.1, subexpressions, stack, instr, sub_expr_pos, args);
+                let b = self.linearize_impl(
+                    &p.0,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    in_branch,
+                );
+                let e = self.linearize_impl(
+                    &p.1,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    in_branch,
+                );
                 stack.push(T::default());
                 let res = stack.len() - 1;
 
@@ -3324,7 +5801,15 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
             }
             Expression::ReadArg(a) => args[*a],
             Expression::BuiltinFun(s, v) => {
-                let arg = self.linearize_impl(v, subexpressions, stack, instr, sub_expr_pos, args);
+                let arg = self.linearize_impl(
+                    v,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    in_branch,
+                );
                 stack.push(T::default());
                 let c = Instr::BuiltinFun(stack.len() - 1, *s, arg);
                 instr.push(c);
@@ -3341,10 +5826,93 @@ impl<T: Clone + Default + PartialEq> EvalTree<T> {
                         instr,
                         sub_expr_pos,
                         args,
+                        in_branch,
                     );
-                    sub_expr_pos.insert(*id, res);
+
+                    // only register the subexpression as computed when it is not
+                    // computed in a branch, as the sub expression may not be computed
+                    // in the other branch
+                    if !in_branch {
+                        sub_expr_pos.insert(*id, res);
+                    }
+
                     res
                 }
+            }
+            Expression::ExternalFun(s, v) => {
+                let args: Vec<_> = v
+                    .iter()
+                    .map(|x| {
+                        self.linearize_impl(
+                            x,
+                            subexpressions,
+                            stack,
+                            instr,
+                            sub_expr_pos,
+                            args,
+                            in_branch,
+                        )
+                    })
+                    .collect();
+
+                stack.push(T::default());
+                let res = stack.len() - 1;
+
+                let f = Instr::ExternalFun(res, *s, args);
+                instr.push(f);
+
+                res
+            }
+            Expression::IfElse(b) => {
+                let cond = self.linearize_impl(
+                    &b.0,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    in_branch,
+                );
+
+                let label_else = Label(instr.len());
+                stack.push(T::default());
+                instr.push(Instr::IfElse(cond, label_else));
+
+                let then_branch = self.linearize_impl(
+                    &b.1,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    true,
+                );
+
+                let label_end = Label(instr.len());
+                stack.push(T::default());
+                instr.push(Instr::Goto(label_end));
+                stack.push(T::default());
+                instr.push(Instr::Label(label_else));
+
+                let else_branch = self.linearize_impl(
+                    &b.2,
+                    subexpressions,
+                    stack,
+                    instr,
+                    sub_expr_pos,
+                    args,
+                    true,
+                );
+
+                stack.push(T::default());
+                instr.push(Instr::Label(label_end));
+
+                stack.push(T::default());
+                let res = stack.len() - 1;
+
+                instr.push(Instr::Join(res, cond, then_branch, else_branch));
+
+                res
             }
         }
     }
@@ -3356,14 +5924,11 @@ impl EvalTree<Complex<Rational>> {
     /// and `n_cores` cores. Optionally, a starting scheme can be provided.
     pub fn optimize(
         &mut self,
-        iterations: usize,
-        n_cores: usize,
-        start_scheme: Option<Vec<Expression<Complex<Rational>>>>,
-        verbose: bool,
+        settings: &OptimizationSettings,
     ) -> ExpressionEvaluator<Complex<Rational>> {
-        let _ = self.optimize_horner_scheme(iterations, n_cores, start_scheme, verbose);
+        let _ = self.optimize_horner_scheme(settings);
         self.common_subexpression_elimination();
-        self.clone().linearize(None)
+        self.clone().linearize(None, settings.verbose)
     }
 
     /// Write the expressions in a Horner scheme where the variables
@@ -3393,13 +5958,10 @@ impl EvalTree<Complex<Rational>> {
     /// and `n_cores` cores. Optionally, a starting scheme can be provided.
     pub fn optimize_horner_scheme(
         &mut self,
-        iterations: usize,
-        n_cores: usize,
-        start_scheme: Option<Vec<Expression<Complex<Rational>>>>,
-        verbose: bool,
+        settings: &OptimizationSettings,
     ) -> Vec<Expression<Complex<Rational>>> {
-        let v = match start_scheme {
-            Some(a) => a,
+        let v = match &settings.hot_start {
+            Some(a) => a.clone(),
             None => {
                 let mut v = HashMap::default();
 
@@ -3420,13 +5982,8 @@ impl EvalTree<Complex<Rational>> {
             }
         };
 
-        let scheme = Expression::optimize_horner_scheme_multiple(
-            &self.expressions.tree,
-            &v,
-            iterations,
-            n_cores,
-            verbose,
-        );
+        let scheme =
+            Expression::optimize_horner_scheme_multiple(&self.expressions.tree, &v, settings);
         for e in &mut self.expressions.tree {
             e.apply_horner_scheme(&scheme);
         }
@@ -3447,9 +6004,7 @@ impl EvalTree<Complex<Rational>> {
             v.sort_by_key(|k| std::cmp::Reverse(k.1));
             let v = v.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
 
-            let scheme = Expression::optimize_horner_scheme_multiple(
-                &e.tree, &v, iterations, n_cores, verbose,
-            );
+            let scheme = Expression::optimize_horner_scheme_multiple(&e.tree, &v, settings);
 
             for t in &mut e.tree {
                 t.apply_horner_scheme(&scheme);
@@ -3510,7 +6065,7 @@ impl Expression<Complex<Rational>> {
                 let mut pow_counter = 0;
                 for y in m {
                     if let Expression::Pow(p) = y {
-                        if p.0 == scheme[0] {
+                        if p.0 == scheme[0] && p.1 > 0 {
                             pow_counter += p.1;
                         }
                     } else if y == &scheme[0] {
@@ -3520,6 +6075,10 @@ impl Expression<Complex<Rational>> {
 
                 if pow_counter > 0 && (max_pow.is_none() || pow_counter < max_pow.unwrap()) {
                     max_pow = Some(pow_counter);
+                }
+            } else if let Expression::Pow(p) = x {
+                if p.0 == scheme[0] && p.1 > 0 && (max_pow.is_none() || p.1 < max_pow.unwrap()) {
+                    max_pow = Some(p.1);
                 }
             } else if x == &scheme[0] {
                 max_pow = Some(1);
@@ -3543,7 +6102,7 @@ impl Expression<Complex<Rational>> {
 
                 m.retain(|y| {
                     if let Expression::Pow(p) = y {
-                        if p.0 == scheme[0] {
+                        if p.0 == scheme[0] && p.1 > 0 {
                             pow_counter += p.1;
                             false
                         } else {
@@ -3577,6 +6136,17 @@ impl Expression<Complex<Rational>> {
                 }
 
                 found = pow_counter > 0;
+            } else if let Expression::Pow(p) = &mut x {
+                if p.0 == scheme[0] && p.1 > 0 {
+                    if p.1 > max_pow + 1 {
+                        p.1 -= max_pow;
+                    } else if p.1 - max_pow == 1 {
+                        x = scheme[0].clone();
+                    } else {
+                        x = Expression::Const(Complex::new_one());
+                    }
+                    found = true;
+                }
             } else if x == scheme[0] {
                 found = true;
                 x = Expression::Const(Complex::new_one());
@@ -3716,31 +6286,31 @@ impl Expression<Complex<Rational>> {
                 a.occurrence_order_horner_scheme();
             }
             Expression::SubExpression(_) => {}
+            Expression::ExternalFun(_, a) => {
+                for arg in a {
+                    arg.occurrence_order_horner_scheme();
+                }
+            }
+            Expression::IfElse(b) => {
+                b.0.occurrence_order_horner_scheme();
+                b.1.occurrence_order_horner_scheme();
+                b.2.occurrence_order_horner_scheme();
+            }
         }
     }
 
     pub fn optimize_horner_scheme(
         &self,
         vars: &[Self],
-        iterations: usize,
-        n_cores: usize,
-        verbose: bool,
+        settings: &OptimizationSettings,
     ) -> Vec<Self> {
-        Self::optimize_horner_scheme_multiple(
-            std::slice::from_ref(self),
-            vars,
-            iterations,
-            n_cores,
-            verbose,
-        )
+        Self::optimize_horner_scheme_multiple(std::slice::from_ref(self), vars, settings)
     }
 
     pub fn optimize_horner_scheme_multiple(
         expressions: &[Self],
         vars: &[Self],
-        iterations: usize,
-        n_cores: usize,
-        verbose: bool,
+        settings: &OptimizationSettings,
     ) -> Vec<Self> {
         if vars.is_empty() {
             return vars.to_vec();
@@ -3761,8 +6331,8 @@ impl Expression<Complex<Rational>> {
             best_ops = (best_ops.0 + ops.0, best_ops.1 + ops.1);
         }
 
-        if verbose {
-            println!(
+        if settings.verbose {
+            info!(
                 "Initial ops: {} additions and {} multiplications",
                 best_ops.0, best_ops.1
             );
@@ -3772,22 +6342,25 @@ impl Expression<Complex<Rational>> {
         let best_add = Arc::new(AtomicUsize::new(best_ops.0));
         let best_scheme = Arc::new(Mutex::new(vars.to_vec()));
 
-        let permutations =
-            if vars.len() < 10 && Integer::factorial(vars.len() as u32) <= iterations.max(1) {
-                let v: Vec<_> = (0..vars.len()).collect();
-                Some(unique_permutations(&v).1)
-            } else {
-                None
-            };
+        let permutations = if vars.len() < 10
+            && Integer::factorial(vars.len() as u32) <= settings.horner_iterations.max(1)
+        {
+            let v: Vec<_> = (0..vars.len()).collect();
+            Some(unique_permutations(&v).1)
+        } else {
+            None
+        };
         let p_ref = &permutations;
 
         let n_cores = if LicenseManager::is_licensed() {
-            n_cores
+            settings.n_cores
         } else {
             1
         };
 
         std::thread::scope(|s| {
+            let abort = Arc::new(AtomicBool::new(false));
+
             for i in 0..n_cores {
                 let mut rng = MonteCarloRng::new(0, i);
 
@@ -3797,8 +6370,31 @@ impl Expression<Complex<Rational>> {
                 let best_add = best_add.clone();
                 let mut last_mul = usize::MAX;
                 let mut last_add = usize::MAX;
-                s.spawn(move || {
-                    for j in 0..iterations / n_cores {
+                let abort = abort.clone();
+
+                let mut op = move || {
+                    for j in 0..settings.horner_iterations / n_cores {
+                        if abort.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        if i == n_cores - 1
+                            && let Some(a) = &settings.abort_check
+                            && a()
+                        {
+                            abort.store(true, Ordering::Relaxed);
+
+                            if settings.verbose {
+                                info!(
+                                    "Aborting Horner optimization at step {}/{}.",
+                                    j,
+                                    settings.horner_iterations / n_cores
+                                );
+                            }
+
+                            return;
+                        }
+
                         // try a random swap
                         let mut t1 = 0;
                         let mut t2 = 0;
@@ -3835,11 +6431,11 @@ impl Expression<Complex<Rational>> {
 
                         // prefer fewer multiplications
                         if cur_ops.1 <= last_mul || cur_ops.1 == last_mul && cur_ops.0 <= last_add {
-                            if verbose {
-                                println!(
+                            if settings.verbose {
+                                info!(
                                     "Accept move at step {}/{}: {} + and {} ×",
                                     j,
-                                    iterations / n_cores,
+                                    settings.horner_iterations / n_cores,
                                     cur_ops.0,
                                     cur_ops.1
                                 );
@@ -3877,12 +6473,20 @@ impl Expression<Complex<Rational>> {
                             cvars.swap(t1, t2);
                         }
                     }
-                });
+                };
+
+                if i + 1 < n_cores {
+                    s.spawn(op);
+                } else {
+                    // execute in the main thread and do the abort check on the main thread
+                    // this helps with catching ctrl-c
+                    op()
+                }
             }
         });
 
-        if verbose {
-            println!(
+        if settings.verbose {
+            info!(
                 "Final scheme: {} + and {} ×",
                 best_add.load(Ordering::Relaxed),
                 best_mul.load(Ordering::Relaxed)
@@ -3942,6 +6546,16 @@ impl Expression<Complex<Rational>> {
                 a.find_all_variables(vars);
             }
             Expression::SubExpression(_) => {}
+            Expression::ExternalFun(_, a) => {
+                for arg in a {
+                    arg.find_all_variables(vars);
+                }
+            }
+            Expression::IfElse(b) => {
+                b.0.find_all_variables(vars);
+                b.1.find_all_variables(vars);
+                b.2.find_all_variables(vars);
+            }
         }
     }
 }
@@ -4076,6 +6690,16 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrder
             Expression::SubExpression(i) => {
                 *self = Expression::SubExpression(*subexp.get(i).unwrap());
             }
+            Expression::ExternalFun(_, a) => {
+                for arg in a {
+                    arg.rename_subexpression(subexp);
+                }
+            }
+            Expression::IfElse(b) => {
+                b.0.rename_subexpression(subexp);
+                b.1.rename_subexpression(subexp);
+                b.2.rename_subexpression(subexp);
+            }
         }
     }
 
@@ -4104,6 +6728,16 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrder
             }
             Expression::SubExpression(i) => {
                 dep.push(*i);
+            }
+            Expression::ExternalFun(_, a) => {
+                for arg in a {
+                    arg.get_dependent_subexpressions(dep);
+                }
+            }
+            Expression::IfElse(b) => {
+                b.0.get_dependent_subexpressions(dep);
+                b.1.get_dependent_subexpressions(dep);
+                b.2.get_dependent_subexpressions(dep);
             }
         }
     }
@@ -4179,6 +6813,22 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrder
             Expression::ReadArg(_) => (0, 0),
             Expression::BuiltinFun(_, b) => b.count_operations(), // not clear how to count this, third arg?
             Expression::SubExpression(_) => (0, 0),
+            Expression::ExternalFun(_, args) => {
+                let mut add = 0;
+                let mut mul = 0;
+                for arg in args {
+                    let (a, m) = arg.count_operations();
+                    add += a;
+                    mul += m;
+                }
+                (add, mul)
+            }
+            Expression::IfElse(b) => {
+                let (a1, m1) = b.0.count_operations();
+                let (a2, m2) = b.1.count_operations();
+                let (a3, m3) = b.2.count_operations();
+                (a1 + a2 + a3, m1 + m2 + m3)
+            }
         }
     }
 
@@ -4196,7 +6846,6 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrder
         }
 
         if sub_expr.contains_key(self) {
-            //println!("SUB {:?}", self);
             return (0, 0);
         }
 
@@ -4247,6 +6896,22 @@ impl<T: Clone + Default + std::fmt::Debug + Eq + std::hash::Hash + InternalOrder
             Expression::ReadArg(_) => (0, 0),
             Expression::BuiltinFun(_, b) => b.count_operations_with_subexpression(sub_expr), // not clear how to count this, third arg?
             Expression::SubExpression(_) => (0, 0),
+            Expression::ExternalFun(_, args) => {
+                let mut add = 0;
+                let mut mul = 0;
+                for arg in args {
+                    let (a, m) = arg.count_operations_with_subexpression(sub_expr);
+                    add += a;
+                    mul += m;
+                }
+                (add, mul)
+            }
+            Expression::IfElse(b) => {
+                let (a1, m1) = b.0.count_operations_with_subexpression(sub_expr);
+                let (a2, m2) = b.1.count_operations_with_subexpression(sub_expr);
+                let (a3, m3) = b.2.count_operations_with_subexpression(sub_expr);
+                (a1 + a2 + a3, m1 + m2 + m3)
+            }
         }
     }
 }
@@ -4312,11 +6977,12 @@ impl<T: Real> EvalTree<T> {
             Expression::BuiltinFun(s, a) => {
                 let arg = self.evaluate_impl(a, subexpressions, params, args);
                 match s.0 {
-                    Atom::EXP => arg.exp(),
-                    Atom::LOG => arg.log(),
-                    Atom::SIN => arg.sin(),
-                    Atom::COS => arg.cos(),
-                    Atom::SQRT => arg.sqrt(),
+                    Symbol::EXP => arg.exp(),
+                    Symbol::LOG => arg.log(),
+                    Symbol::SIN => arg.sin(),
+                    Symbol::COS => arg.cos(),
+                    Symbol::SQRT => arg.sqrt(),
+                    Symbol::CONJ => arg.conj(),
                     _ => unreachable!(),
                 }
             }
@@ -4324,180 +6990,731 @@ impl<T: Real> EvalTree<T> {
                 // TODO: cache
                 self.evaluate_impl(&subexpressions[*s], subexpressions, params, args)
             }
+            Expression::ExternalFun(name, _args) => {
+                unimplemented!(
+                    "External function calls not implemented for EvalTree: {}",
+                    name
+                );
+            }
+            Expression::IfElse(b) => {
+                let cond = self.evaluate_impl(&b.0, subexpressions, params, args);
+                if !cond.is_fully_zero() {
+                    self.evaluate_impl(&b.1, subexpressions, params, args)
+                } else {
+                    self.evaluate_impl(&b.2, subexpressions, params, args)
+                }
+            }
         }
     }
 }
 
-pub struct ExportedCode {
-    source_filename: String,
+/// Represents exported code that can be compiled with [Self::compile].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
+#[derive(Debug, Clone)]
+pub struct ExportedCode<T: CompiledNumber> {
+    path: PathBuf,
     function_name: String,
-}
-pub struct CompiledCode {
-    library_filename: String,
-    function_name: String,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl CompiledCode {
+/// Represents a library that can be loaded with [Self::load].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
+#[derive(Debug, Clone)]
+pub struct CompiledCode<T: CompiledNumber> {
+    path: PathBuf,
+    function_name: String,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+/// Maximum length stored in the error message buffer
+const CUDA_ERRMSG_LEN: usize = 256;
+/// Struct representing the data created for the CUDA evaluation.
+#[repr(C)]
+pub struct CudaEvaluationData {
+    pub params: *mut c_void,
+    pub out: *mut c_void,
+    pub n: usize,             // Number of evaluations
+    pub block_size: usize,    // Number of threads per block
+    pub in_dimension: usize,  // Number of input parameters
+    pub out_dimension: usize, // Number of output parameters
+    pub last_error: i32,
+    pub errmsg: [std::os::raw::c_char; CUDA_ERRMSG_LEN],
+}
+
+impl CudaEvaluationData {
+    pub fn check_for_error(&self) -> Result<(), String> {
+        unsafe {
+            if self.last_error != 0 {
+                let err_msg = std::ffi::CStr::from_ptr(self.errmsg.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
+                return Err(format!("CUDA error: {}", err_msg));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Settings for CUDA.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
+#[derive(Debug, Clone)]
+pub struct CudaLoadSettings {
+    pub number_of_evaluations: usize,
+    /// The number of threads per block for CUDA evaluation.
+    pub block_size: usize,
+}
+
+impl Default for CudaLoadSettings {
+    fn default() -> Self {
+        CudaLoadSettings {
+            number_of_evaluations: 1,
+            block_size: 256, // default CUDA block size
+        }
+    }
+}
+
+impl<T: CompiledNumber> CompiledCode<T> {
     /// Load the evaluator from the compiled shared library.
-    pub fn load(&self) -> Result<CompiledEvaluator, String> {
-        CompiledEvaluator::load(&self.library_filename, &self.function_name)
+    pub fn load(&self) -> Result<T::Evaluator, String> {
+        T::Evaluator::load(&self.path, &self.function_name)
+    }
+
+    /// Load the evaluator from the compiled shared library.
+    pub fn load_with_settings(&self, settings: T::Settings) -> Result<T::Evaluator, String> {
+        T::Evaluator::load_with_settings(&self.path, &self.function_name, settings)
+    }
+}
+
+type EvalTypeWithBuffer<'a, T> =
+    libloading::Symbol<'a, unsafe extern "C" fn(params: *const T, buffer: *mut T, out: *mut T)>;
+type CudaEvalType<'a, T> = libloading::Symbol<
+    'a,
+    unsafe extern "C" fn(params: *const T, out: *mut T, data: *const CudaEvaluationData),
+>;
+type CudaInitDataType<'a> = libloading::Symbol<
+    'a,
+    unsafe extern "C" fn(n: usize, block_size: usize) -> *const CudaEvaluationData,
+>;
+type CudaDestroyDataType<'a> =
+    libloading::Symbol<'a, unsafe extern "C" fn(data: *const CudaEvaluationData) -> i32>;
+type GetBufferLenType<'a> = libloading::Symbol<'a, unsafe extern "C" fn() -> c_ulong>;
+
+struct EvaluatorFunctionsRealf64<'lib> {
+    eval: EvalTypeWithBuffer<'lib, f64>,
+    get_buffer_len: GetBufferLenType<'lib>,
+}
+
+impl<'lib> EvaluatorFunctionsRealf64<'lib> {
+    fn new(lib: &'lib libloading::Library, function_name: &str) -> Result<Self, String> {
+        let function_name = f64::construct_function_name(function_name);
+        unsafe {
+            let eval: EvalTypeWithBuffer<'lib, f64> = lib
+                .get(function_name.to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
+            let get_buffer_len: GetBufferLenType<'lib> = lib
+                .get(format!("{}_get_buffer_len", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(EvaluatorFunctionsRealf64 {
+                eval,
+                get_buffer_len,
+            })
+        }
     }
 }
 
 type L = std::sync::Arc<libloading::Library>;
 
-struct EvaluatorFunctions<'a> {
-    eval_double: libloading::Symbol<
-        'a,
-        unsafe extern "C" fn(params: *const f64, buffer: *mut f64, out: *mut f64),
-    >,
-    eval_complex: libloading::Symbol<
-        'a,
-        unsafe extern "C" fn(
-            params: *const Complex<f64>,
-            buffer: *mut Complex<f64>,
-            out: *mut Complex<f64>,
-        ),
-    >,
-    get_buffer_len: libloading::Symbol<'a, unsafe extern "C" fn() -> c_ulong>,
-}
-
-pub struct CompiledEvaluator {
-    fn_name: String,
-    library: Library,
-    buffer_double: Vec<f64>,
-    buffer_complex: Vec<Complex<f64>>,
-}
-
 self_cell!(
-    struct Library {
+    struct LibraryRealf64 {
         owner: L,
 
         #[covariant]
-        dependent: EvaluatorFunctions,
+        dependent: EvaluatorFunctionsRealf64,
     }
 );
 
-unsafe impl Send for CompiledEvaluator {}
-
-impl std::fmt::Debug for CompiledEvaluator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CompiledEvaluator({})", self.fn_name)
-    }
+struct EvaluatorFunctionsSimdRealf64<'lib> {
+    eval: EvalTypeWithBuffer<'lib, wide::f64x4>,
+    get_buffer_len: GetBufferLenType<'lib>,
 }
 
-impl Clone for CompiledEvaluator {
-    fn clone(&self) -> Self {
-        self.load_new_function(&self.fn_name).unwrap()
-    }
-}
-
-/// A floating point type that can be used for compiled evaluation.
-pub trait CompiledEvaluatorFloat: Sized {
-    fn evaluate(eval: &mut CompiledEvaluator, args: &[Self], out: &mut [Self]);
-}
-
-impl CompiledEvaluatorFloat for f64 {
-    #[inline(always)]
-    fn evaluate(eval: &mut CompiledEvaluator, args: &[Self], out: &mut [Self]) {
-        eval.evaluate_double(args, out);
-    }
-}
-
-impl CompiledEvaluatorFloat for Complex<f64> {
-    #[inline(always)]
-    fn evaluate(eval: &mut CompiledEvaluator, args: &[Self], out: &mut [Self]) {
-        eval.evaluate_complex(args, out);
-    }
-}
-
-impl CompiledEvaluator {
-    /// Load a new function from the same library.
-    pub fn load_new_function(&self, function_name: &str) -> Result<CompiledEvaluator, String> {
-        let library = unsafe {
-            Library::try_new::<String>(self.library.borrow_owner().clone(), |lib| {
-                Ok(EvaluatorFunctions {
-                    eval_double: lib
-                        .get(format!("{}_double", function_name).as_bytes())
-                        .map_err(|e| e.to_string())?,
-                    eval_complex: lib
-                        .get(format!("{}_complex", function_name).as_bytes())
-                        .map_err(|e| e.to_string())?,
-                    get_buffer_len: lib
-                        .get(format!("{}_get_buffer_len", function_name).as_bytes())
-                        .map_err(|e| e.to_string())?,
-                })
+impl<'lib> EvaluatorFunctionsSimdRealf64<'lib> {
+    fn new(lib: &'lib libloading::Library, function_name: &str) -> Result<Self, String> {
+        let function_name = wide::f64x4::construct_function_name(function_name);
+        unsafe {
+            let eval: EvalTypeWithBuffer<'lib, wide::f64x4> = lib
+                .get(function_name.to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
+            let get_buffer_len: GetBufferLenType<'lib> = lib
+                .get(format!("{}_get_buffer_len", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(EvaluatorFunctionsSimdRealf64 {
+                eval,
+                get_buffer_len,
             })
-        }?;
+        }
+    }
+}
 
-        let len = unsafe { (library.borrow_dependent().get_buffer_len)() } as usize;
+self_cell!(
+    struct LibrarySimdComplexf64 {
+        owner: L,
 
-        Ok(CompiledEvaluator {
-            fn_name: function_name.to_string(),
-            buffer_double: vec![0.; len],
-            buffer_complex: vec![Complex::new(0., 0.); len],
-            library,
+        #[covariant]
+        dependent: EvaluatorFunctionsSimdComplexf64,
+    }
+);
+
+struct EvaluatorFunctionsSimdComplexf64<'lib> {
+    eval: EvalTypeWithBuffer<'lib, Complex<wide::f64x4>>,
+    get_buffer_len: GetBufferLenType<'lib>,
+}
+
+impl<'lib> EvaluatorFunctionsSimdComplexf64<'lib> {
+    fn new(lib: &'lib libloading::Library, function_name: &str) -> Result<Self, String> {
+        let function_name = Complex::<wide::f64x4>::construct_function_name(function_name);
+        unsafe {
+            let eval: EvalTypeWithBuffer<'lib, Complex<wide::f64x4>> = lib
+                .get(function_name.to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
+            let get_buffer_len: GetBufferLenType<'lib> = lib
+                .get(format!("{}_get_buffer_len", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(EvaluatorFunctionsSimdComplexf64 {
+                eval,
+                get_buffer_len,
+            })
+        }
+    }
+}
+
+self_cell!(
+    struct LibrarySimdRealf64 {
+        owner: L,
+
+        #[covariant]
+        dependent: EvaluatorFunctionsSimdRealf64,
+    }
+);
+
+struct EvaluatorFunctionsComplexf64<'lib> {
+    eval: EvalTypeWithBuffer<'lib, Complex<f64>>,
+    get_buffer_len: GetBufferLenType<'lib>,
+}
+
+impl<'lib> EvaluatorFunctionsComplexf64<'lib> {
+    fn new(lib: &'lib libloading::Library, function_name: &str) -> Result<Self, String> {
+        let function_name = Complex::<f64>::construct_function_name(function_name);
+        unsafe {
+            let eval: EvalTypeWithBuffer<'lib, Complex<f64>> = lib
+                .get(function_name.to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
+            let get_buffer_len: GetBufferLenType<'lib> = lib
+                .get(format!("{}_get_buffer_len", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(EvaluatorFunctionsComplexf64 {
+                eval,
+                get_buffer_len,
+            })
+        }
+    }
+}
+
+self_cell!(
+    struct LibraryComplexf64 {
+        owner: L,
+
+        #[covariant]
+        dependent: EvaluatorFunctionsComplexf64,
+    }
+);
+
+struct EvaluatorFunctionsCudaRealf64<'lib> {
+    eval: CudaEvalType<'lib, f64>,
+    init_data: CudaInitDataType<'lib>,
+    destroy_data: CudaDestroyDataType<'lib>,
+}
+
+impl<'lib> EvaluatorFunctionsCudaRealf64<'lib> {
+    fn new(lib: &'lib libloading::Library, function_name: &str) -> Result<Self, String> {
+        let function_name = CudaRealf64::construct_function_name(function_name);
+        unsafe {
+            let eval: CudaEvalType<'lib, f64> = lib
+                .get(format!("{}_vec", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            let init_data: CudaInitDataType<'lib> = lib
+                .get(format!("{}_init_data", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            let destroy_data: CudaDestroyDataType<'lib> = lib
+                .get(format!("{}_destroy_data", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(EvaluatorFunctionsCudaRealf64 {
+                eval,
+                init_data,
+                destroy_data,
+            })
+        }
+    }
+}
+
+self_cell!(
+    struct LibraryCudaRealf64 {
+        owner: L,
+
+        #[covariant]
+        dependent: EvaluatorFunctionsCudaRealf64,
+    }
+);
+
+struct EvaluatorFunctionsCudaComplexf64<'lib> {
+    eval: CudaEvalType<'lib, Complex<f64>>,
+    init_data: CudaInitDataType<'lib>,
+    destroy_data: CudaDestroyDataType<'lib>,
+}
+
+impl<'lib> EvaluatorFunctionsCudaComplexf64<'lib> {
+    fn new(lib: &'lib libloading::Library, function_name: &str) -> Result<Self, String> {
+        let function_name = CudaComplexf64::construct_function_name(function_name);
+        unsafe {
+            let eval: CudaEvalType<'lib, Complex<f64>> = lib
+                .get(format!("{}_vec", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            let init_data: CudaInitDataType<'lib> = lib
+                .get(format!("{}_init_data", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            let destroy_data: CudaDestroyDataType<'lib> = lib
+                .get(format!("{}_destroy_data", function_name).as_bytes())
+                .map_err(|e| e.to_string())?;
+            Ok(EvaluatorFunctionsCudaComplexf64 {
+                eval,
+                init_data,
+                destroy_data,
+            })
+        }
+    }
+}
+
+self_cell!(
+    struct LibraryCudaComplexf64 {
+        owner: L,
+
+        #[covariant]
+        dependent: EvaluatorFunctionsCudaComplexf64,
+    }
+);
+
+/// A number type that can be used to call a compiled evaluator.
+pub trait CompiledNumber: Sized {
+    type Evaluator: EvaluatorLoader<Self>;
+    type Settings: Default;
+    /// A unique suffix for the evaluation function for this particular number type.
+    // NOTE: a rename of any suffix will prevent loading older libraries.
+    const SUFFIX: &'static str;
+
+    /// Export an evaluator to C++ code for this number type.
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String>;
+
+    fn construct_function_name(function_name: &str) -> String {
+        format!("{}_{}", function_name, Self::SUFFIX)
+    }
+
+    /// Get the default compilation options for C++ code generated
+    /// for this number type.
+    fn get_default_compile_options() -> CompileOptions;
+}
+
+/// Load a compiled evaluator from a shared library, optionally with settings.
+pub trait EvaluatorLoader<T: CompiledNumber>: Sized {
+    /// Load a compiled evaluator from a shared library.
+    fn load(file: impl AsRef<Path>, function_name: &str) -> Result<Self, String> {
+        Self::load_with_settings(file, function_name, T::Settings::default())
+    }
+    fn load_with_settings(
+        file: impl AsRef<Path>,
+        function_name: &str,
+        settings: T::Settings,
+    ) -> Result<Self, String>;
+}
+
+/// Batch-evaluate the compiled code with basic types such as [f64] or [`Complex<f64>`],
+/// automatically reorganizing the batches if necessary.
+pub trait BatchEvaluator<T: CompiledNumber> {
+    /// Evaluate the compiled code with batched input with the given input parameters, writing the results to `out`.
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[T],
+        out: &mut [T],
+    ) -> Result<(), String>;
+}
+
+impl CompiledNumber for f64 {
+    type Evaluator = CompiledRealEvaluator;
+    type Settings = ();
+    const SUFFIX: &'static str = "realf64";
+
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        if !eval.stack.iter().all(|x| x.is_real()) {
+            return Err(
+                "Cannot create real evaluator with complex coefficients. Use Complex<f64>".into(),
+            );
+        }
+
+        Ok(match settings.inline_asm {
+            InlineASM::X64 => eval.export_asm_real_str(function_name, &settings),
+            InlineASM::AArch64 => eval.export_asm_real_str(function_name, &settings),
+            InlineASM::AVX2 => {
+                Err("AVX2 not supported for complexf64: use Complex<f64x6> instead".to_owned())?
+            }
+            InlineASM::None => {
+                let r = eval.export_generic_cpp_str(function_name, &settings, NumberClass::RealF64);
+                r + format!("\nextern \"C\" {{\n\tvoid {function_name}(double *params, double *buffer, double *out) {{\n\t\t{function_name}_gen(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n").as_str()
+            }
         })
     }
 
-    /// Load a compiled evaluator from a shared library.
-    pub fn load(file: &str, function_name: &str) -> Result<CompiledEvaluator, String> {
-        unsafe {
-            let lib = match libloading::Library::new(file) {
-                Ok(lib) => lib,
-                Err(_) => {
-                    libloading::Library::new("./".to_string() + file).map_err(|e| e.to_string())?
-                }
-            };
+    fn get_default_compile_options() -> CompileOptions {
+        CompileOptions::default()
+    }
+}
 
-            let library = Library::try_new::<String>(std::sync::Arc::new(lib), |lib| {
-                Ok(EvaluatorFunctions {
-                    eval_double: lib
-                        .get(format!("{}_double", function_name).as_bytes())
-                        .map_err(|e| e.to_string())?,
-                    eval_complex: lib
-                        .get(format!("{}_complex", function_name).as_bytes())
-                        .map_err(|e| e.to_string())?,
-                    get_buffer_len: lib
-                        .get(format!("{}_get_buffer_len", function_name).as_bytes())
-                        .map_err(|e| e.to_string())?,
-                })
+impl BatchEvaluator<f64> for CompiledRealEvaluator {
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        if !params.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Parameter length {} not divisible by batch size {}",
+                params.len(),
+                batch_size
+            ));
+        }
+        if !out.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Output length {} not divisible by batch size {}",
+                out.len(),
+                batch_size
+            ));
+        }
+
+        let n_params = params.len() / batch_size;
+        let n_out = out.len() / batch_size;
+        for (o, i) in out.chunks_mut(n_out).zip(params.chunks(n_params)) {
+            self.evaluate(i, o);
+        }
+
+        Ok(())
+    }
+}
+
+impl CompiledNumber for Complex<f64> {
+    type Evaluator = CompiledComplexEvaluator;
+    type Settings = ();
+    const SUFFIX: &'static str = "complexf64";
+
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        Ok(match settings.inline_asm {
+            InlineASM::X64 => eval.export_asm_complex_str(function_name, &settings),
+            InlineASM::AArch64 => eval.export_asm_complex_str(function_name, &settings),
+            InlineASM::AVX2 => {
+                Err("AVX2 not supported for complexf64: use Complex<f64x6> instead".to_owned())?
+            }
+            InlineASM::None => {
+                let r =
+                    eval.export_generic_cpp_str(function_name, &settings, NumberClass::ComplexF64);
+                r + format!("\nextern \"C\" {{\n\tvoid {function_name}(std::complex<double> *params, std::complex<double> *buffer, std::complex<double> *out) {{\n\t\t{function_name}_gen(params, buffer, out);\n\t\treturn;\n\t}}\n}}\n").as_str()
+            }
+        })
+    }
+
+    fn get_default_compile_options() -> CompileOptions {
+        CompileOptions::default()
+    }
+}
+
+impl BatchEvaluator<Complex<f64>> for CompiledComplexEvaluator {
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[Complex<f64>],
+        out: &mut [Complex<f64>],
+    ) -> Result<(), String> {
+        if !params.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Parameter length {} not divisible by batch size {}",
+                params.len(),
+                batch_size
+            ));
+        }
+        if !out.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Output length {} not divisible by batch size {}",
+                out.len(),
+                batch_size
+            ));
+        }
+
+        let n_params = params.len() / batch_size;
+        let n_out = out.len() / batch_size;
+        for (o, i) in out.chunks_mut(n_out).zip(params.chunks(n_params)) {
+            self.evaluate(i, o);
+        }
+
+        Ok(())
+    }
+}
+
+/// Efficient evaluator for compiled real-valued functions.
+pub struct CompiledRealEvaluator {
+    library: LibraryRealf64,
+    path: PathBuf,
+    fn_name: String,
+    buffer_double: Vec<f64>,
+}
+
+impl EvaluatorLoader<f64> for CompiledRealEvaluator {
+    fn load_with_settings(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        _settings: (),
+    ) -> Result<Self, String> {
+        CompiledRealEvaluator::load(path, function_name)
+    }
+}
+
+impl CompiledRealEvaluator {
+    pub fn load_new_function(&self, function_name: &str) -> Result<CompiledRealEvaluator, String> {
+        let library = LibraryRealf64::try_new(self.library.borrow_owner().clone(), |lib| {
+            EvaluatorFunctionsRealf64::new(lib, function_name)
+        })?;
+
+        let len = unsafe { (library.borrow_dependent().get_buffer_len)() } as usize;
+
+        Ok(CompiledRealEvaluator {
+            path: self.path.clone(),
+            fn_name: function_name.to_string(),
+            buffer_double: vec![0.; len],
+            library,
+        })
+    }
+    pub fn load(
+        path: impl AsRef<Path>,
+        function_name: &str,
+    ) -> Result<CompiledRealEvaluator, String> {
+        unsafe {
+            let lib = match libloading::Library::new(path.as_ref()) {
+                Ok(lib) => lib,
+                Err(_) => libloading::Library::new(PathBuf::new().join("./").join(&path))
+                    .map_err(|e| e.to_string())?,
+            };
+            let library = LibraryRealf64::try_new(std::sync::Arc::new(lib), |lib| {
+                EvaluatorFunctionsRealf64::new(lib, function_name)
             })?;
 
             let len = (library.borrow_dependent().get_buffer_len)() as usize;
 
-            Ok(CompiledEvaluator {
+            Ok(CompiledRealEvaluator {
                 fn_name: function_name.to_string(),
+                path: path.as_ref().to_path_buf(),
                 buffer_double: vec![0.; len],
-                buffer_complex: vec![Complex::new(0., 0.); len],
                 library,
             })
         }
     }
-
-    /// Evaluate the compiled code.
-    #[inline(always)]
-    pub fn evaluate<T: CompiledEvaluatorFloat>(&mut self, args: &[T], out: &mut [T]) {
-        T::evaluate(self, args, out);
-    }
-
     /// Evaluate the compiled code with double-precision floating point numbers.
     #[inline(always)]
-    pub fn evaluate_double(&mut self, args: &[f64], out: &mut [f64]) {
+    pub fn evaluate(&mut self, args: &[f64], out: &mut [f64]) {
         unsafe {
-            (self.library.borrow_dependent().eval_double)(
+            (self.library.borrow_dependent().eval)(
                 args.as_ptr(),
                 self.buffer_double.as_mut_ptr(),
                 out.as_mut_ptr(),
             )
         }
     }
+}
 
-    /// Evaluate the compiled code with complex numbers.
-    #[inline(always)]
-    pub fn evaluate_complex(&mut self, args: &[Complex<f64>], out: &mut [Complex<f64>]) {
+unsafe impl Send for CompiledRealEvaluator {}
+
+impl std::fmt::Debug for CompiledRealEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompiledRealEvaluator({})", self.fn_name)
+    }
+}
+
+impl Clone for CompiledRealEvaluator {
+    fn clone(&self) -> Self {
+        self.load_new_function(&self.fn_name).unwrap()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledRealEvaluator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.path, &self.fn_name).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledRealEvaluator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (file, fn_name) = <(PathBuf, String)>::deserialize(deserializer)?;
+        CompiledRealEvaluator::load(&file, &fn_name).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl bincode::Encode for CompiledRealEvaluator {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.path, encoder)?;
+        bincode::Encode::encode(&self.fn_name, encoder)
+    }
+}
+
+#[cfg(feature = "bincode")]
+bincode::impl_borrow_decode!(CompiledRealEvaluator);
+#[cfg(feature = "bincode")]
+impl<Context> bincode::Decode<Context> for CompiledRealEvaluator {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let file: PathBuf = bincode::Decode::decode(decoder)?;
+        let fn_name: String = bincode::Decode::decode(decoder)?;
+        CompiledRealEvaluator::load(&file, &fn_name)
+            .map_err(|e| bincode::error::DecodeError::OtherString(e))
+    }
+}
+
+/// Efficient evaluator for compiled complex-valued functions.
+pub struct CompiledComplexEvaluator {
+    path: PathBuf,
+    fn_name: String,
+    library: LibraryComplexf64,
+    buffer_complex: Vec<Complex<f64>>,
+}
+
+impl EvaluatorLoader<Complex<f64>> for CompiledComplexEvaluator {
+    fn load_with_settings(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        _settings: (),
+    ) -> Result<Self, String> {
+        CompiledComplexEvaluator::load(path, function_name)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledComplexEvaluator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.path, &self.fn_name).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledComplexEvaluator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (file, fn_name) = <(PathBuf, String)>::deserialize(deserializer)?;
+        CompiledComplexEvaluator::load(&file, &fn_name).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl bincode::Encode for CompiledComplexEvaluator {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.path, encoder)?;
+        bincode::Encode::encode(&self.fn_name, encoder)
+    }
+}
+
+#[cfg(feature = "bincode")]
+bincode::impl_borrow_decode!(CompiledComplexEvaluator);
+#[cfg(feature = "bincode")]
+impl<Context> bincode::Decode<Context> for CompiledComplexEvaluator {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let file: PathBuf = bincode::Decode::decode(decoder)?;
+        let fn_name: String = bincode::Decode::decode(decoder)?;
+        CompiledComplexEvaluator::load(&file, &fn_name)
+            .map_err(|e| bincode::error::DecodeError::OtherString(e))
+    }
+}
+
+impl CompiledComplexEvaluator {
+    /// Load a new function from the same library.
+    pub fn load_new_function(
+        &self,
+        function_name: &str,
+    ) -> Result<CompiledComplexEvaluator, String> {
+        let library = LibraryComplexf64::try_new(self.library.borrow_owner().clone(), |lib| {
+            EvaluatorFunctionsComplexf64::new(lib, function_name)
+        })?;
+
+        let len = unsafe { (library.borrow_dependent().get_buffer_len)() } as usize;
+
+        Ok(CompiledComplexEvaluator {
+            path: self.path.clone(),
+            fn_name: function_name.to_string(),
+            buffer_complex: vec![Complex::new_zero(); len],
+            library,
+        })
+    }
+
+    /// Load a compiled evaluator from a shared library.
+    pub fn load(
+        path: impl AsRef<Path>,
+        function_name: &str,
+    ) -> Result<CompiledComplexEvaluator, String> {
         unsafe {
-            (self.library.borrow_dependent().eval_complex)(
+            let lib = match libloading::Library::new(path.as_ref()) {
+                Ok(lib) => lib,
+                Err(_) => libloading::Library::new(PathBuf::new().join("./").join(&path))
+                    .map_err(|e| e.to_string())?,
+            };
+
+            let library = LibraryComplexf64::try_new(std::sync::Arc::new(lib), |lib| {
+                EvaluatorFunctionsComplexf64::new(lib, function_name)
+            })?;
+
+            let len = (library.borrow_dependent().get_buffer_len)() as usize;
+
+            Ok(CompiledComplexEvaluator {
+                path: path.as_ref().to_path_buf(),
+                fn_name: function_name.to_string(),
+                buffer_complex: vec![Complex::default(); len],
+                library,
+            })
+        }
+    }
+    /// Evaluate the compiled code.
+    #[inline(always)]
+    pub fn evaluate(&mut self, args: &[Complex<f64>], out: &mut [Complex<f64>]) {
+        unsafe {
+            (self.library.borrow_dependent().eval)(
                 args.as_ptr(),
                 self.buffer_complex.as_mut_ptr(),
                 out.as_mut_ptr(),
@@ -4506,79 +7723,1203 @@ impl CompiledEvaluator {
     }
 }
 
+unsafe impl Send for CompiledComplexEvaluator {}
+
+impl std::fmt::Debug for CompiledComplexEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompiledComplexEvaluator({})", self.fn_name)
+    }
+}
+
+impl Clone for CompiledComplexEvaluator {
+    fn clone(&self) -> Self {
+        self.load_new_function(&self.fn_name).unwrap()
+    }
+}
+
+/// Evaluate 4 double-precision floating point numbers in parallel using SIMD instructions.
+/// Make sure you add arguments such as `-march=native` to enable full SIMD support for your platform.
+///
+/// Failure to add this, may result in only two double-precision numbers being evaluated in parallel.
+///
+/// The compilation requires the `xsimd` C++ library to be installed.
+impl CompiledNumber for wide::f64x4 {
+    type Evaluator = CompiledSimdRealEvaluator;
+    type Settings = ();
+    const SUFFIX: &'static str = "simd_realf64";
+
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        if !eval.stack.iter().all(|x| x.is_real()) {
+            return Err(
+                "Cannot create real evaluator with complex coefficients. Use Complex<f64>".into(),
+            );
+        }
+
+        Ok(match settings.inline_asm {
+            // assume AVX2 for X64
+            InlineASM::X64 => eval.export_simd_str(function_name, settings, false, InlineASM::AVX2),
+            InlineASM::AArch64 => {
+                Err("Inline assembly not supported yet for SIMD f64x4".to_owned())?
+            }
+            asm @ InlineASM::AVX2 | asm @ InlineASM::None => {
+                eval.export_simd_str(function_name, settings, false, asm)
+            }
+        })
+    }
+
+    fn get_default_compile_options() -> CompileOptions {
+        CompileOptions::default()
+    }
+}
+
+impl BatchEvaluator<f64> for CompiledSimdRealEvaluator {
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        if !params.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Parameter length {} not divisible by batch size {}",
+                params.len(),
+                batch_size
+            ));
+        }
+        if !out.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Output length {} not divisible by batch size {}",
+                out.len(),
+                batch_size
+            ));
+        }
+
+        let n_params = params.len() / batch_size;
+        let n_out = out.len() / batch_size;
+
+        self.batch_input_buffer
+            .resize(batch_size.div_ceil(4) * n_params, wide::f64x4::ZERO);
+
+        for (dest, i) in self
+            .batch_input_buffer
+            .chunks_mut(n_params)
+            .zip(params.chunks(4 * n_params))
+        {
+            if i.len() / n_params == 4 {
+                for (j, d) in dest.iter_mut().enumerate() {
+                    *d = wide::f64x4::from([
+                        i[j],
+                        i[j + n_params],
+                        i[j + 2 * n_params],
+                        i[j + 3 * n_params],
+                    ]);
+                }
+            } else {
+                for (j, d) in dest.iter_mut().enumerate() {
+                    *d = wide::f64x4::from([
+                        i[j],
+                        if j + n_params < i.len() {
+                            i[j + n_params]
+                        } else {
+                            0.0
+                        },
+                        if j + 2 * n_params < i.len() {
+                            i[j + 2 * n_params]
+                        } else {
+                            0.0
+                        },
+                        if j + 3 * n_params < i.len() {
+                            i[j + 3 * n_params]
+                        } else {
+                            0.0
+                        },
+                    ]);
+                }
+            }
+        }
+
+        self.batch_output_buffer
+            .resize(batch_size.div_ceil(4) * n_out, wide::f64x4::ZERO);
+
+        let param_buffer = std::mem::take(&mut self.batch_input_buffer);
+        let mut output_buffer = std::mem::take(&mut self.batch_output_buffer);
+
+        for (o, i) in output_buffer
+            .chunks_mut(n_out)
+            .zip(param_buffer.chunks(n_params))
+        {
+            self.evaluate(i, o);
+        }
+
+        for (o, i) in out.chunks_mut(4 * n_out).zip(&output_buffer) {
+            o.copy_from_slice(&i.as_array()[..o.len()]);
+        }
+
+        self.batch_input_buffer = param_buffer;
+        self.batch_output_buffer = output_buffer;
+
+        Ok(())
+    }
+}
+
+/// Efficient evaluator using simd for compiled real-valued functions.
+pub struct CompiledSimdRealEvaluator {
+    path: PathBuf,
+    fn_name: String,
+    library: LibrarySimdRealf64,
+    buffer: Vec<wide::f64x4>,
+    batch_input_buffer: Vec<wide::f64x4>,
+    batch_output_buffer: Vec<wide::f64x4>,
+}
+
+impl EvaluatorLoader<wide::f64x4> for CompiledSimdRealEvaluator {
+    fn load(path: impl AsRef<Path>, function_name: &str) -> Result<Self, String> {
+        CompiledSimdRealEvaluator::load_with_settings(path, function_name, ())
+    }
+
+    fn load_with_settings(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        _settings: (),
+    ) -> Result<Self, String> {
+        CompiledSimdRealEvaluator::load(path, function_name)
+    }
+}
+
+impl CompiledSimdRealEvaluator {
+    pub fn load_new_function(
+        &self,
+        function_name: &str,
+    ) -> Result<CompiledSimdRealEvaluator, String> {
+        let library = LibrarySimdRealf64::try_new(self.library.borrow_owner().clone(), |lib| {
+            EvaluatorFunctionsSimdRealf64::new(lib, function_name)
+        })?;
+
+        Ok(CompiledSimdRealEvaluator {
+            path: self.path.clone(),
+            fn_name: function_name.to_string(),
+            buffer: vec![
+                wide::f64x4::ZERO;
+                unsafe { (library.borrow_dependent().get_buffer_len)() } as usize
+            ],
+            batch_input_buffer: Vec::new(),
+            batch_output_buffer: Vec::new(),
+            library,
+        })
+    }
+
+    pub fn load(
+        path: impl AsRef<Path>,
+        function_name: &str,
+    ) -> Result<CompiledSimdRealEvaluator, String> {
+        unsafe {
+            let lib = match libloading::Library::new(path.as_ref()) {
+                Ok(lib) => lib,
+                Err(_) => libloading::Library::new(PathBuf::new().join("./").join(&path))
+                    .map_err(|e| e.to_string())?,
+            };
+            let library = LibrarySimdRealf64::try_new(std::sync::Arc::new(lib), |lib| {
+                EvaluatorFunctionsSimdRealf64::new(lib, function_name)
+            })?;
+
+            Ok(CompiledSimdRealEvaluator {
+                path: path.as_ref().to_path_buf(),
+                fn_name: function_name.to_string(),
+                buffer: vec![
+                    wide::f64x4::ZERO;
+                    (library.borrow_dependent().get_buffer_len)() as usize
+                ],
+                batch_input_buffer: Vec::new(),
+                batch_output_buffer: Vec::new(),
+                library,
+            })
+        }
+    }
+
+    /// Evaluate the compiled code with 4 double-precision floating point numbers.
+    /// The `args` must be of length `number_of_evaluations * input`, where `input` is the number of inputs to the function.
+    /// The `out` must be of length `number_of_evaluations * output`,
+    /// where `output` is the number of outputs of the function.
+    #[inline(always)]
+    pub fn evaluate(&mut self, args: &[wide::f64x4], out: &mut [wide::f64x4]) {
+        unsafe {
+            (self.library.borrow_dependent().eval)(
+                args.as_ptr(),
+                self.buffer.as_mut_ptr(),
+                out.as_mut_ptr(),
+            )
+        }
+    }
+}
+
+unsafe impl Send for CompiledSimdRealEvaluator {}
+
+impl std::fmt::Debug for CompiledSimdRealEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompiledSimdRealEvaluator({})", self.fn_name)
+    }
+}
+
+impl Clone for CompiledSimdRealEvaluator {
+    fn clone(&self) -> Self {
+        self.load_new_function(&self.fn_name).unwrap()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledSimdRealEvaluator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.path, &self.fn_name).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledSimdRealEvaluator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (file, fn_name) = <(PathBuf, String)>::deserialize(deserializer)?;
+        CompiledSimdRealEvaluator::load(&file, &fn_name).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl bincode::Encode for CompiledSimdRealEvaluator {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.path, encoder)?;
+        bincode::Encode::encode(&self.fn_name, encoder)
+    }
+}
+
+#[cfg(feature = "bincode")]
+bincode::impl_borrow_decode!(CompiledSimdRealEvaluator);
+#[cfg(feature = "bincode")]
+impl<Context> bincode::Decode<Context> for CompiledSimdRealEvaluator {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let file: PathBuf = bincode::Decode::decode(decoder)?;
+        let fn_name: String = bincode::Decode::decode(decoder)?;
+        CompiledSimdRealEvaluator::load(&file, &fn_name)
+            .map_err(|e| bincode::error::DecodeError::OtherString(e))
+    }
+}
+
+/// Evaluate 4 double-precision floating point numbers in parallel using SIMD instructions.
+/// Make sure you add arguments such as `-march=native` to enable full SIMD support for your platform.
+///
+/// Failure to add this, may result in only two double-precision numbers being evaluated in parallel.
+///
+/// The compilation requires the `xsimd` C++ library to be installed.
+impl CompiledNumber for Complex<wide::f64x4> {
+    type Evaluator = CompiledSimdComplexEvaluator;
+    type Settings = ();
+    const SUFFIX: &'static str = "simd_complexf64";
+
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        if !eval.stack.iter().all(|x| x.is_real()) {
+            return Err(
+                "Cannot create real evaluator with complex coefficients. Use Complex<f64>".into(),
+            );
+        }
+
+        Ok(match settings.inline_asm {
+            // assume AVX2 for X64
+            InlineASM::X64 => eval.export_simd_str(function_name, settings, true, InlineASM::AVX2),
+            InlineASM::AArch64 => {
+                Err("X64 inline assembly not supported for SIMD f64x4: use AVX2".to_owned())?
+            }
+            asm @ InlineASM::AVX2 | asm @ InlineASM::None => {
+                eval.export_simd_str(function_name, settings, true, asm)
+            }
+        })
+    }
+
+    fn get_default_compile_options() -> CompileOptions {
+        CompileOptions::default()
+    }
+}
+
+impl BatchEvaluator<Complex<f64>> for CompiledSimdComplexEvaluator {
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[Complex<f64>],
+        out: &mut [Complex<f64>],
+    ) -> Result<(), String> {
+        if !params.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Parameter length {} not divisible by batch size {}",
+                params.len(),
+                batch_size
+            ));
+        }
+        if !out.len().is_multiple_of(batch_size) {
+            return Err(format!(
+                "Output length {} not divisible by batch size {}",
+                out.len(),
+                batch_size
+            ));
+        }
+
+        let n_params = params.len() / batch_size;
+        let n_out = out.len() / batch_size;
+
+        self.batch_input_buffer.resize(
+            batch_size.div_ceil(4) * n_params,
+            Complex::new(wide::f64x4::ZERO, wide::f64x4::ZERO),
+        );
+
+        for (dest, i) in self
+            .batch_input_buffer
+            .chunks_mut(n_params)
+            .zip(params.chunks(4 * n_params))
+        {
+            if i.len() / n_params == 4 {
+                for (j, d) in dest.iter_mut().enumerate() {
+                    d.re = wide::f64x4::from([
+                        i[j].re,
+                        i[j + n_params].re,
+                        i[j + 2 * n_params].re,
+                        i[j + 3 * n_params].re,
+                    ]);
+                    d.im = wide::f64x4::from([
+                        i[j].im,
+                        i[j + n_params].im,
+                        i[j + 2 * n_params].im,
+                        i[j + 3 * n_params].im,
+                    ]);
+                }
+            } else {
+                for (j, d) in dest.iter_mut().enumerate() {
+                    d.re = wide::f64x4::from([
+                        i[j].re,
+                        if j + n_params < i.len() {
+                            i[j + n_params].re
+                        } else {
+                            0.0
+                        },
+                        if j + 2 * n_params < i.len() {
+                            i[j + 2 * n_params].re
+                        } else {
+                            0.0
+                        },
+                        if j + 3 * n_params < i.len() {
+                            i[j + 3 * n_params].re
+                        } else {
+                            0.0
+                        },
+                    ]);
+                    d.im = wide::f64x4::from([
+                        i[j].im,
+                        if j + n_params < i.len() {
+                            i[j + n_params].im
+                        } else {
+                            0.0
+                        },
+                        if j + 2 * n_params < i.len() {
+                            i[j + 2 * n_params].im
+                        } else {
+                            0.0
+                        },
+                        if j + 3 * n_params < i.len() {
+                            i[j + 3 * n_params].im
+                        } else {
+                            0.0
+                        },
+                    ]);
+                }
+            }
+        }
+
+        self.batch_output_buffer.resize(
+            batch_size.div_ceil(4) * n_out,
+            Complex::new(wide::f64x4::ZERO, wide::f64x4::ZERO),
+        );
+
+        let param_buffer = std::mem::take(&mut self.batch_input_buffer);
+        let mut output_buffer = std::mem::take(&mut self.batch_output_buffer);
+
+        for (o, i) in output_buffer
+            .chunks_mut(n_out)
+            .zip(param_buffer.chunks(n_params))
+        {
+            self.evaluate(i, o);
+        }
+
+        for (o, i) in out.chunks_mut(4 * n_out).zip(&output_buffer) {
+            for (j, d) in o.iter_mut().enumerate() {
+                d.re = i.re.as_array()[j];
+                d.im = i.im.as_array()[j];
+            }
+        }
+
+        self.batch_input_buffer = param_buffer;
+        self.batch_output_buffer = output_buffer;
+
+        Ok(())
+    }
+}
+
+/// Efficient evaluator using simd for compiled complex-valued functions.
+pub struct CompiledSimdComplexEvaluator {
+    path: PathBuf,
+    fn_name: String,
+    library: LibrarySimdComplexf64,
+    buffer: Vec<Complex<wide::f64x4>>,
+    batch_input_buffer: Vec<Complex<wide::f64x4>>,
+    batch_output_buffer: Vec<Complex<wide::f64x4>>,
+}
+
+impl EvaluatorLoader<Complex<wide::f64x4>> for CompiledSimdComplexEvaluator {
+    fn load(path: impl AsRef<Path>, function_name: &str) -> Result<Self, String> {
+        CompiledSimdComplexEvaluator::load_with_settings(path, function_name, ())
+    }
+
+    fn load_with_settings(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        _settings: (),
+    ) -> Result<Self, String> {
+        CompiledSimdComplexEvaluator::load(path, function_name)
+    }
+}
+
+impl CompiledSimdComplexEvaluator {
+    pub fn load_new_function(
+        &self,
+        function_name: &str,
+    ) -> Result<CompiledSimdComplexEvaluator, String> {
+        let library = LibrarySimdComplexf64::try_new(self.library.borrow_owner().clone(), |lib| {
+            EvaluatorFunctionsSimdComplexf64::new(lib, function_name)
+        })?;
+
+        Ok(CompiledSimdComplexEvaluator {
+            path: self.path.clone(),
+            fn_name: function_name.to_string(),
+            buffer: vec![
+                Complex::new(wide::f64x4::ZERO, wide::f64x4::ZERO);
+                unsafe { (library.borrow_dependent().get_buffer_len)() } as usize
+            ],
+            batch_input_buffer: Vec::new(),
+            batch_output_buffer: Vec::new(),
+            library,
+        })
+    }
+
+    pub fn load(
+        path: impl AsRef<Path>,
+        function_name: &str,
+    ) -> Result<CompiledSimdComplexEvaluator, String> {
+        unsafe {
+            let lib = match libloading::Library::new(path.as_ref()) {
+                Ok(lib) => lib,
+                Err(_) => libloading::Library::new(PathBuf::new().join("./").join(&path))
+                    .map_err(|e| e.to_string())?,
+            };
+            let library = LibrarySimdComplexf64::try_new(std::sync::Arc::new(lib), |lib| {
+                EvaluatorFunctionsSimdComplexf64::new(lib, function_name)
+            })?;
+
+            Ok(CompiledSimdComplexEvaluator {
+                path: path.as_ref().to_path_buf(),
+                fn_name: function_name.to_string(),
+                buffer: vec![
+                    Complex::new(wide::f64x4::ZERO, wide::f64x4::ZERO);
+                    (library.borrow_dependent().get_buffer_len)() as usize
+                ],
+                batch_input_buffer: Vec::new(),
+                batch_output_buffer: Vec::new(),
+                library,
+            })
+        }
+    }
+
+    /// Evaluate the compiled code with 4 double-precision floating point numbers.
+    /// The `args` must be of length `number_of_evaluations * input`, where `input` is the number of inputs to the function.
+    /// The `out` must be of length `number_of_evaluations * output`,
+    /// where `output` is the number of outputs of the function.
+    #[inline(always)]
+    pub fn evaluate(&mut self, args: &[Complex<wide::f64x4>], out: &mut [Complex<wide::f64x4>]) {
+        unsafe {
+            (self.library.borrow_dependent().eval)(
+                args.as_ptr(),
+                self.buffer.as_mut_ptr(),
+                out.as_mut_ptr(),
+            )
+        }
+    }
+}
+
+unsafe impl Send for CompiledSimdComplexEvaluator {}
+
+impl std::fmt::Debug for CompiledSimdComplexEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompiledSimdComplexEvaluator({})", self.fn_name)
+    }
+}
+
+impl Clone for CompiledSimdComplexEvaluator {
+    fn clone(&self) -> Self {
+        self.load_new_function(&self.fn_name).unwrap()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledSimdComplexEvaluator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.path, &self.fn_name).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledSimdComplexEvaluator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (file, fn_name) = <(PathBuf, String)>::deserialize(deserializer)?;
+        CompiledSimdComplexEvaluator::load(&file, &fn_name).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl bincode::Encode for CompiledSimdComplexEvaluator {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.path, encoder)?;
+        bincode::Encode::encode(&self.fn_name, encoder)
+    }
+}
+
+#[cfg(feature = "bincode")]
+bincode::impl_borrow_decode!(CompiledSimdComplexEvaluator);
+#[cfg(feature = "bincode")]
+impl<Context> bincode::Decode<Context> for CompiledSimdComplexEvaluator {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let file: PathBuf = bincode::Decode::decode(decoder)?;
+        let fn_name: String = bincode::Decode::decode(decoder)?;
+        CompiledSimdComplexEvaluator::load(&file, &fn_name)
+            .map_err(|e| bincode::error::DecodeError::OtherString(e))
+    }
+}
+
+/// CUDA real number type.
+pub struct CudaRealf64 {}
+
+impl CompiledNumber for CudaRealf64 {
+    type Evaluator = CompiledCudaRealEvaluator;
+    type Settings = CudaLoadSettings;
+    const SUFFIX: &'static str = "cuda_realf64";
+
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        if !eval.stack.iter().all(|x| x.is_real()) {
+            return Err(
+                "Cannot create real evaluator with complex coefficients. Use Complex<f64>".into(),
+            );
+        }
+
+        Ok(eval.export_cuda_str(function_name, settings, NumberClass::RealF64))
+    }
+
+    fn get_default_compile_options() -> CompileOptions {
+        CompileOptions::cuda()
+    }
+}
+
+/// CUDA complex number type.
+pub struct CudaComplexf64 {}
+
+impl CompiledNumber for CudaComplexf64 {
+    type Evaluator = CompiledCudaComplexEvaluator;
+    type Settings = CudaLoadSettings;
+    const SUFFIX: &'static str = "cuda_complexf64";
+
+    fn export_cpp<T: ExportNumber + SingleFloat>(
+        eval: &ExpressionEvaluator<T>,
+        function_name: &str,
+        settings: ExportSettings,
+    ) -> Result<String, String> {
+        Ok(eval.export_cuda_str(function_name, settings, NumberClass::ComplexF64))
+    }
+
+    fn get_default_compile_options() -> CompileOptions {
+        CompileOptions::cuda()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledCudaRealEvaluator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.path, &self.fn_name, &self.settings).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledCudaRealEvaluator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (file, fn_name, settings) =
+            <(PathBuf, String, CudaLoadSettings)>::deserialize(deserializer)?;
+        CompiledCudaRealEvaluator::load_with_settings(&file, &fn_name, settings)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl bincode::Encode for CompiledCudaRealEvaluator {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.path, encoder)?;
+        bincode::Encode::encode(&self.fn_name, encoder)?;
+        bincode::Encode::encode(&self.settings, encoder)
+    }
+}
+
+#[cfg(feature = "bincode")]
+bincode::impl_borrow_decode!(CompiledCudaRealEvaluator);
+#[cfg(feature = "bincode")]
+impl<Context> bincode::Decode<Context> for CompiledCudaRealEvaluator {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let file: PathBuf = bincode::Decode::decode(decoder)?;
+        let fn_name: String = bincode::Decode::decode(decoder)?;
+        let settings: CudaLoadSettings = bincode::Decode::decode(decoder)?;
+        CompiledCudaRealEvaluator::load(&file, &fn_name, settings)
+            .map_err(|e| bincode::error::DecodeError::OtherString(e))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for CompiledCudaComplexEvaluator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (&self.path, &self.fn_name).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for CompiledCudaComplexEvaluator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (file, fn_name, settings) =
+            <(PathBuf, String, CudaLoadSettings)>::deserialize(deserializer)?;
+        CompiledCudaComplexEvaluator::load(&file, &fn_name, settings)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "bincode")]
+impl bincode::Encode for CompiledCudaComplexEvaluator {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.path, encoder)?;
+        bincode::Encode::encode(&self.fn_name, encoder)?;
+        bincode::Encode::encode(&self.settings, encoder)
+    }
+}
+
+#[cfg(feature = "bincode")]
+bincode::impl_borrow_decode!(CompiledCudaComplexEvaluator);
+#[cfg(feature = "bincode")]
+impl<Context> bincode::Decode<Context> for CompiledCudaComplexEvaluator {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let file: PathBuf = bincode::Decode::decode(decoder)?;
+        let fn_name: String = bincode::Decode::decode(decoder)?;
+        let settings: CudaLoadSettings = bincode::Decode::decode(decoder)?;
+        CompiledCudaComplexEvaluator::load(&file, &fn_name, settings)
+            .map_err(|e| bincode::error::DecodeError::OtherString(e))
+    }
+}
+
+/// Efficient evaluator using CUDA for compiled real-valued functions.
+pub struct CompiledCudaRealEvaluator {
+    path: PathBuf,
+    fn_name: String,
+    library: LibraryCudaRealf64,
+    settings: CudaLoadSettings,
+    data: *const CudaEvaluationData,
+}
+
+impl EvaluatorLoader<CudaRealf64> for CompiledCudaRealEvaluator {
+    fn load(path: impl AsRef<Path>, function_name: &str) -> Result<Self, String> {
+        CompiledCudaRealEvaluator::load_with_settings(
+            path,
+            function_name,
+            CudaLoadSettings::default(),
+        )
+    }
+
+    fn load_with_settings(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        settings: CudaLoadSettings,
+    ) -> Result<Self, String> {
+        CompiledCudaRealEvaluator::load(path, function_name, settings)
+    }
+}
+
+impl BatchEvaluator<f64> for CompiledCudaRealEvaluator {
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        if self.settings.number_of_evaluations != batch_size {
+            return Err(format!(
+                "Number of CUDA evaluations {} does not equal batch size {}",
+                self.settings.number_of_evaluations, batch_size
+            ));
+        }
+
+        self.evaluate(params, out)
+    }
+}
+
+impl CompiledCudaRealEvaluator {
+    pub fn load_new_function(
+        &self,
+        function_name: &str,
+    ) -> Result<CompiledCudaRealEvaluator, String> {
+        let library = LibraryCudaRealf64::try_new(self.library.borrow_owner().clone(), |lib| {
+            EvaluatorFunctionsCudaRealf64::new(lib, function_name)
+        })?;
+        let data = unsafe {
+            let data = (library.borrow_dependent().init_data)(
+                self.settings.number_of_evaluations,
+                self.settings.block_size,
+            );
+            (*data).check_for_error()?;
+            data
+        };
+
+        Ok(CompiledCudaRealEvaluator {
+            path: self.path.clone(),
+            fn_name: function_name.to_string(),
+            library,
+            settings: self.settings.clone(),
+            data,
+        })
+    }
+
+    pub fn load(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        settings: CudaLoadSettings,
+    ) -> Result<CompiledCudaRealEvaluator, String> {
+        unsafe {
+            let lib = match libloading::Library::new(path.as_ref()) {
+                Ok(lib) => lib,
+                Err(_) => libloading::Library::new(PathBuf::new().join("./").join(&path))
+                    .map_err(|e| e.to_string())?,
+            };
+            let library = LibraryCudaRealf64::try_new(std::sync::Arc::new(lib), |lib| {
+                EvaluatorFunctionsCudaRealf64::new(lib, function_name)
+            })?;
+
+            let data = (library.borrow_dependent().init_data)(
+                settings.number_of_evaluations,
+                settings.block_size,
+            );
+            (*data).check_for_error()?;
+
+            Ok(CompiledCudaRealEvaluator {
+                path: path.as_ref().to_path_buf(),
+                fn_name: function_name.to_string(),
+                library,
+                settings,
+                data,
+            })
+        }
+    }
+
+    /// Evaluate the compiled code with double-precision floating point numbers.
+    /// The `args` must be of length `number_of_evaluations * input`, where `input` is the number of inputs to the function.
+    /// The `out` must be of length `number_of_evaluations * output`,
+    /// where `output` is the number of outputs of the function.
+    #[inline(always)]
+    pub fn evaluate(&mut self, args: &[f64], out: &mut [f64]) -> Result<(), String> {
+        unsafe {
+            if args.len() != (*self.data).in_dimension * (*self.data).n {
+                return Err(format!(
+                    "CUDA args length (={}) does not match the expected input dimension (={}*{}).",
+                    args.len(),
+                    (*self.data).in_dimension,
+                    (*self.data).n
+                ));
+            }
+            if out.len() != (*self.data).out_dimension * (*self.data).n {
+                return Err(format!(
+                    "CUDA out length (={}) does not match the expected output dimension (={}*{}).",
+                    out.len(),
+                    (*self.data).out_dimension,
+                    (*self.data).n
+                ));
+            }
+            (self.library.borrow_dependent().eval)(args.as_ptr(), out.as_mut_ptr(), self.data);
+            (*self.data).check_for_error()?;
+        }
+        Ok(())
+    }
+}
+
+/// Efficient evaluator using CUDA for compiled complex-valued functions.
+pub struct CompiledCudaComplexEvaluator {
+    path: PathBuf,
+    fn_name: String,
+    library: LibraryCudaComplexf64,
+    settings: CudaLoadSettings,
+    data: *const CudaEvaluationData,
+}
+
+impl EvaluatorLoader<CudaComplexf64> for CompiledCudaComplexEvaluator {
+    fn load(path: impl AsRef<Path>, function_name: &str) -> Result<Self, String> {
+        CompiledCudaComplexEvaluator::load_with_settings(
+            path,
+            function_name,
+            CudaLoadSettings::default(),
+        )
+    }
+
+    fn load_with_settings(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        settings: CudaLoadSettings,
+    ) -> Result<Self, String> {
+        CompiledCudaComplexEvaluator::load(path, function_name, settings)
+    }
+}
+
+impl BatchEvaluator<Complex<f64>> for CompiledCudaComplexEvaluator {
+    fn evaluate_batch(
+        &mut self,
+        batch_size: usize,
+        params: &[Complex<f64>],
+        out: &mut [Complex<f64>],
+    ) -> Result<(), String> {
+        if self.settings.number_of_evaluations != batch_size {
+            return Err(format!(
+                "Number of CUDA evaluations {} does not equal batch size {}",
+                self.settings.number_of_evaluations, batch_size
+            ));
+        }
+
+        self.evaluate(params, out)
+    }
+}
+
+impl CompiledCudaComplexEvaluator {
+    pub fn load_new_function(
+        &self,
+        function_name: &str,
+    ) -> Result<CompiledCudaComplexEvaluator, String> {
+        let library = LibraryCudaComplexf64::try_new(self.library.borrow_owner().clone(), |lib| {
+            EvaluatorFunctionsCudaComplexf64::new(lib, function_name)
+        })?;
+
+        let data = unsafe {
+            let data = (library.borrow_dependent().init_data)(
+                self.settings.number_of_evaluations,
+                self.settings.block_size,
+            );
+            (*data).check_for_error()?;
+            data
+        };
+        Ok(CompiledCudaComplexEvaluator {
+            path: self.path.clone(),
+            fn_name: function_name.to_string(),
+            library,
+            settings: self.settings.clone(),
+            data,
+        })
+    }
+
+    pub fn load(
+        path: impl AsRef<Path>,
+        function_name: &str,
+        settings: CudaLoadSettings,
+    ) -> Result<CompiledCudaComplexEvaluator, String> {
+        unsafe {
+            let lib = match libloading::Library::new(path.as_ref()) {
+                Ok(lib) => lib,
+                Err(_) => libloading::Library::new(PathBuf::new().join("./").join(&path))
+                    .map_err(|e| e.to_string())?,
+            };
+            let library = LibraryCudaComplexf64::try_new(std::sync::Arc::new(lib), |lib| {
+                EvaluatorFunctionsCudaComplexf64::new(lib, function_name)
+            })?;
+
+            let data = (library.borrow_dependent().init_data)(
+                settings.number_of_evaluations,
+                settings.block_size,
+            );
+            (*data).check_for_error()?;
+
+            Ok(CompiledCudaComplexEvaluator {
+                path: path.as_ref().to_path_buf(),
+                fn_name: function_name.to_string(),
+                library,
+                settings,
+                data,
+            })
+        }
+    }
+
+    /// Evaluate the compiled code with complex numbers.
+    /// The `args` must be of length `number_of_evaluations * input`, where `input` is the number of inputs to the function.
+    /// The `out` must be of length `number_of_evaluations * output`,
+    /// where `output` is the number of outputs of the function.
+    #[inline(always)]
+    pub fn evaluate(
+        &mut self,
+        args: &[Complex<f64>],
+        out: &mut [Complex<f64>],
+    ) -> Result<(), String> {
+        unsafe {
+            if args.len() != (*self.data).in_dimension * (*self.data).n {
+                return Err(format!(
+                    "CUDA args length (={}) does not match the expected input dimension (={}*{}).",
+                    args.len(),
+                    (*self.data).in_dimension,
+                    (*self.data).n
+                ));
+            }
+            if out.len() != (*self.data).out_dimension * (*self.data).n {
+                return Err(format!(
+                    "CUDA out length (={}) does not match the expected output dimension (={}*{}).",
+                    out.len(),
+                    (*self.data).out_dimension,
+                    (*self.data).n
+                ));
+            }
+            (self.library.borrow_dependent().eval)(args.as_ptr(), out.as_mut_ptr(), self.data);
+            (*self.data).check_for_error()?;
+        }
+        Ok(())
+    }
+}
+
+unsafe impl Send for CompiledCudaRealEvaluator {}
+unsafe impl Send for CompiledCudaComplexEvaluator {}
+unsafe impl Sync for CompiledCudaRealEvaluator {}
+unsafe impl Sync for CompiledCudaComplexEvaluator {}
+
+impl std::fmt::Debug for CompiledCudaRealEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompiledCudaRealEvaluator({})", self.fn_name)
+    }
+}
+
+impl Drop for CompiledCudaRealEvaluator {
+    fn drop(&mut self) {
+        unsafe {
+            let result = (self.library.borrow_dependent().destroy_data)(self.data);
+            if result != 0 {
+                error!("Warning: failed to free CUDA memory: {}", result);
+            }
+        }
+    }
+}
+
+impl Clone for CompiledCudaRealEvaluator {
+    fn clone(&self) -> Self {
+        self.load_new_function(&self.fn_name).unwrap()
+    }
+}
+
+impl std::fmt::Debug for CompiledCudaComplexEvaluator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompiledCudaComplexEvaluator({})", self.fn_name)
+    }
+}
+
+impl Drop for CompiledCudaComplexEvaluator {
+    fn drop(&mut self) {
+        unsafe {
+            let result = (self.library.borrow_dependent().destroy_data)(self.data);
+            if result != 0 {
+                error!("Warning: failed to free CUDA memory: {}", result);
+            }
+        }
+    }
+}
+
+impl Clone for CompiledCudaComplexEvaluator {
+    fn clone(&self) -> Self {
+        self.load_new_function(&self.fn_name).unwrap()
+    }
+}
+
 /// Options for compiling exported code.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "bincode", derive(bincode::Encode, bincode::Decode))]
 #[derive(Clone)]
 pub struct CompileOptions {
     pub optimization_level: usize,
     pub fast_math: bool,
     pub unsafe_math: bool,
+    /// Compile for the native architecture.
+    pub native: bool,
     pub compiler: String,
-    pub custom: Vec<String>,
+    /// Arguments for the compiler call. Arguments with spaces
+    /// must be split into a separate strings.
+    ///
+    /// For CUDA, the argument `-x cu` is required.
+    pub args: Vec<String>,
 }
 
 impl Default for CompileOptions {
-    /// Default compile options: `g++ -O3 -ffast-math -funsafe-math-optimizations`.
+    /// Default compile options.
     fn default() -> Self {
         CompileOptions {
             optimization_level: 3,
             fast_math: true,
             unsafe_math: true,
+            native: true,
             compiler: "g++".to_string(),
-            custom: vec![],
+            args: vec![],
         }
     }
 }
 
-impl ExportedCode {
+impl CompileOptions {
+    /// Set the compiler to `nvcc`.
+    pub fn cuda() -> Self {
+        CompileOptions {
+            optimization_level: 3,
+            fast_math: false,
+            unsafe_math: false,
+            native: false,
+            compiler: "nvcc".to_string(),
+            args: vec![],
+        }
+    }
+}
+
+impl ToString for CompileOptions {
+    /// Convert the compilation options to the string that would be used
+    /// in the compiler call.
+    fn to_string(&self) -> String {
+        let mut s = self.compiler.clone();
+
+        s += &format!(" -shared -O{}", self.optimization_level);
+
+        let nvcc = self.compiler.contains("nvcc");
+
+        if !nvcc {
+            s += " -fPIC";
+        } else {
+            // order is important here for nvcc
+            s += " -Xcompiler -fPIC -x cu";
+        }
+
+        if self.fast_math && !nvcc {
+            s += " -ffast-math";
+        }
+        if self.unsafe_math && !nvcc {
+            s += " -funsafe-math-optimizations";
+        }
+        if self.native && !nvcc {
+            s += " -march=native";
+        }
+        for arg in &self.args {
+            s += " ";
+            s += arg;
+        }
+        s
+    }
+}
+
+impl<T: CompiledNumber> ExportedCode<T> {
     /// Create a new exported code object from a source file and function name.
-    pub fn new(source_filename: String, function_name: String) -> Self {
+    pub fn new(source_path: impl AsRef<Path>, function_name: String) -> Self {
         ExportedCode {
-            source_filename,
+            path: source_path.as_ref().to_path_buf(),
             function_name,
+            _phantom: std::marker::PhantomData,
         }
     }
 
     /// Compile the code to a shared library.
+    ///
+    /// For CUDA, you may have to specify `-code=sm_XY` for your architecture `XY` in the compiler flags to prevent a potentially long
+    /// JIT compilation upon the first evaluation.
     pub fn compile(
         &self,
-        out: &str,
+        out: impl AsRef<Path>,
         options: CompileOptions,
-    ) -> Result<CompiledCode, std::io::Error> {
+    ) -> Result<CompiledCode<T>, std::io::Error> {
         let mut builder = std::process::Command::new(&options.compiler);
         builder
             .arg("-shared")
-            .arg("-fPIC")
             .arg(format!("-O{}", options.optimization_level));
-        if options.fast_math {
+
+        if !options.compiler.contains("nvcc") {
+            builder.arg("-fPIC");
+        } else {
+            // order is important here for nvcc
+            builder.arg("-Xcompiler");
+            builder.arg("-fPIC");
+            builder.arg("-x");
+            builder.arg("cu");
+        }
+        if options.fast_math && !options.compiler.contains("nvcc") {
             builder.arg("-ffast-math");
         }
-        if options.unsafe_math {
+        if options.unsafe_math && !options.compiler.contains("nvcc") {
             builder.arg("-funsafe-math-optimizations");
         }
 
-        for c in &options.custom {
+        if options.native && !options.compiler.contains("nvcc") {
+            builder.arg("-march=native");
+        }
+
+        for c in &options.args {
             builder.arg(c);
         }
 
         let r = builder
             .arg("-o")
-            .arg(out)
-            .arg(&self.source_filename)
+            .arg(out.as_ref())
+            .arg(&self.path)
             .output()?;
 
         if !r.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Could not compile code: {}",
-                    String::from_utf8_lossy(&r.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Could not compile code: {} {}\n{}",
+                builder.get_program().to_string_lossy(),
+                builder
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                String::from_utf8_lossy(&r.stderr)
+            )));
         }
 
         Ok(CompiledCode {
-            library_filename: out.to_string(),
+            path: out.as_ref().to_path_buf(),
             function_name: self.function_name.clone(),
+            _phantom: std::marker::PhantomData,
         })
     }
 }
@@ -4586,10 +8927,12 @@ impl ExportedCode {
 /// The inline assembly mode used to generate fast
 /// assembly instructions for mathematical operations.
 /// Set to `None` to disable inline assembly.
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum InlineASM {
     /// Use instructions suitable for x86_64 machines.
     X64,
+    /// Use instructions suitable for x86_64 machines with AVX2 support.
+    AVX2,
     /// Use instructions suitable for ARM64 machines.
     AArch64,
     /// Do not generate inline assembly.
@@ -4610,7 +8953,7 @@ impl Default for InlineASM {
     }
 }
 
-impl<T: NumericalFloatLike> EvalTree<T> {
+impl<T: FloatLike> EvalTree<T> {
     /// Export the evaluation tree to C++ code. For much improved performance,
     /// optimize the tree instead.
     pub fn export_cpp_str(&self, function_name: &str, include_header: bool) -> String {
@@ -4642,13 +8985,10 @@ impl<T: NumericalFloatLike> EvalTree<T> {
             }
 
             let ret = self.export_cpp_impl(&body.tree[0], arg_names);
-            res += &format!("\treturn {};\n}}\n", ret);
+            res += &format!("\treturn {ret};\n}}\n");
         }
 
-        res += &format!(
-            "\ntemplate<typename T>\nvoid {}(T* params, T* out) {{\n",
-            function_name
-        );
+        res += &format!("\ntemplate<typename T>\nvoid {function_name}(T* params, T* out) {{\n");
 
         for (i, s) in self.expressions.subexpressions.iter().enumerate() {
             res += &format!("\tT Z{}_ = {};\n", i, self.export_cpp_impl(s, &[]));
@@ -4661,12 +9001,10 @@ impl<T: NumericalFloatLike> EvalTree<T> {
         res += "\treturn;\n}\n";
 
         res += &format!(
-            "\nextern \"C\" {{\n\tvoid {0}_double(double* params, double* out) {{\n\t\t{0}(params, out);\n\t\treturn;\n\t}}\n}}\n",
-            function_name
+            "\nextern \"C\" {{\n\tvoid {function_name}_double(double* params, double* out) {{\n\t\t{function_name}(params, out);\n\t\treturn;\n\t}}\n}}\n"
         );
         res += &format!(
-            "\nextern \"C\" {{\n\tvoid {0}_complex(std::complex<double>* params, std::complex<double>* out) {{\n\t\t{0}(params, out);\n\t\treturn;\n\t}}\n}}\n",
-            function_name
+            "\nextern \"C\" {{\n\tvoid {function_name}_complex(std::complex<double>* params, std::complex<double>* out) {{\n\t\t{function_name}(params, out);\n\t\treturn;\n\t}}\n}}\n"
         );
 
         res
@@ -4675,10 +9013,10 @@ impl<T: NumericalFloatLike> EvalTree<T> {
     fn export_cpp_impl(&self, expr: &Expression<T>, args: &[Symbol]) -> String {
         match expr {
             Expression::Const(c) => {
-                format!("T({})", c)
+                format!("T({c})")
             }
             Expression::Parameter(p) => {
-                format!("params[{}]", p)
+                format!("params[{p}]")
             }
             Expression::Eval(id, e_args) => {
                 let mut r = format!("{}(params", self.functions[*id].0);
@@ -4728,32 +9066,38 @@ impl<T: NumericalFloatLike> EvalTree<T> {
             }
             Expression::ReadArg(s) => args[*s].to_string(),
             Expression::BuiltinFun(s, a) => match s.0 {
-                Atom::EXP => {
+                Symbol::EXP => {
                     let mut r = "exp(".to_string();
                     r += &self.export_cpp_impl(a, args);
                     r.push(')');
                     r
                 }
-                Atom::LOG => {
+                Symbol::LOG => {
                     let mut r = "log(".to_string();
                     r += &self.export_cpp_impl(a, args);
                     r.push(')');
                     r
                 }
-                Atom::SIN => {
+                Symbol::SIN => {
                     let mut r = "sin(".to_string();
                     r += &self.export_cpp_impl(a, args);
                     r.push(')');
                     r
                 }
-                Atom::COS => {
+                Symbol::COS => {
                     let mut r = "cos(".to_string();
                     r += &self.export_cpp_impl(a, args);
                     r.push(')');
                     r
                 }
-                Atom::SQRT => {
+                Symbol::SQRT => {
                     let mut r = "sqrt(".to_string();
+                    r += &self.export_cpp_impl(a, args);
+                    r.push(')');
+                    r
+                }
+                Symbol::CONJ => {
+                    let mut r = "conj(".to_string();
                     r += &self.export_cpp_impl(a, args);
                     r.push(')');
                     r
@@ -4761,7 +9105,28 @@ impl<T: NumericalFloatLike> EvalTree<T> {
                 _ => unreachable!(),
             },
             Expression::SubExpression(id) => {
-                format!("Z{}_", id)
+                format!("Z{id}_")
+            }
+            Expression::ExternalFun(name, a) => {
+                let mut r = name.to_string();
+                r.push('(');
+                r += &a
+                    .iter()
+                    .map(|x| self.export_cpp_impl(x, args))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                r.push(')');
+                r
+            }
+            Expression::IfElse(b) => {
+                let mut r = "(".to_string();
+                r += &self.export_cpp_impl(&b.0, args);
+                r.push_str(" ? (");
+                r += &self.export_cpp_impl(&b.1, args);
+                r.push_str(") : (");
+                r += &self.export_cpp_impl(&b.2, args);
+                r.push_str("))");
+                r
             }
         }
     }
@@ -4792,12 +9157,26 @@ impl<'a> AtomView<'a> {
             })
             .collect::<Result<_, _>>()?;
 
+        let mut external_fns: Vec<_> = fn_map
+            .external_fn
+            .values()
+            .map(|x| {
+                let ConstOrExpr::External(e, name) = x else {
+                    panic!("Expected external function");
+                };
+
+                (*e, name.clone())
+            })
+            .collect();
+        external_fns.sort_by_key(|x| x.0);
+
         Ok(EvalTree {
             expressions: SplitExpression {
                 tree,
                 subexpressions: vec![],
             },
             functions: funcs,
+            external_functions: external_fns.into_iter().map(|x| x.1).collect(),
             param_count: params.len(),
         })
     }
@@ -4833,6 +9212,12 @@ impl<'a> AtomView<'a> {
                         i.to_float().to_rational(),
                     )))
                 }
+                CoefficientView::Indeterminate => {
+                    panic!("Cannot convert indeterminate")
+                }
+                CoefficientView::Infinity(_) => {
+                    panic!("Cannot convert infinity")
+                }
                 CoefficientView::FiniteField(_, _) => {
                     Err("Finite field not yet supported for evaluation".to_string())
                 }
@@ -4847,11 +9232,20 @@ impl<'a> AtomView<'a> {
                     return Ok(Expression::ReadArg(p));
                 }
 
-                Err(format!("Variable {} not in constant map", name))
+                Err(format!("Variable {} not in constant map", name.get_name()))
             }
             AtomView::Fun(f) => {
                 let name = f.get_symbol();
-                if [Atom::EXP, Atom::LOG, Atom::SIN, Atom::COS, Atom::SQRT].contains(&name) {
+                if [
+                    Symbol::EXP,
+                    Symbol::LOG,
+                    Symbol::SIN,
+                    Symbol::COS,
+                    Symbol::SQRT,
+                    Symbol::CONJ,
+                ]
+                .contains(&name)
+                {
                     assert!(f.get_nargs() == 1);
                     let arg = f.iter().next().unwrap();
                     let arg_eval = arg.to_eval_tree_impl(fn_map, params, args, funcs)?;
@@ -4863,11 +9257,18 @@ impl<'a> AtomView<'a> {
                 }
 
                 let Some(fun) = fn_map.get(*self) else {
-                    return Err(format!("Undefined function {}", self));
+                    return Err(format!("Undefined function {}", self.to_plain_string()));
                 };
 
                 match fun {
                     ConstOrExpr::Const(t) => Ok(Expression::Const(t.clone())),
+                    ConstOrExpr::External(e, _name) => {
+                        let eval_args = f
+                            .iter()
+                            .map(|arg| arg.to_eval_tree_impl(fn_map, params, args, funcs))
+                            .collect::<Result<_, _>>()?;
+                        Ok(Expression::ExternalFun(*e, eval_args))
+                    }
                     ConstOrExpr::Expr(Expr {
                         name,
                         tag_len,
@@ -4877,7 +9278,7 @@ impl<'a> AtomView<'a> {
                         if f.get_nargs() != arg_spec.len() + *tag_len {
                             return Err(format!(
                                 "Function {} called with wrong number of arguments: {} vs {}",
-                                f.get_symbol(),
+                                f.get_symbol().get_name(),
                                 f.get_nargs(),
                                 arg_spec.len() + *tag_len
                             ));
@@ -4906,28 +9307,43 @@ impl<'a> AtomView<'a> {
                             Ok(Expression::Eval(funcs.len() - 1, eval_args))
                         }
                     }
+                    ConstOrExpr::Condition => {
+                        if f.get_nargs() != 3 {
+                            return Err(format!(
+                                "Condition function called with wrong number of arguments: {} vs 3",
+                                f.get_nargs(),
+                            ));
+                        }
+
+                        let mut arg_iter = f.iter();
+
+                        let cond_eval = arg_iter
+                            .next()
+                            .unwrap()
+                            .to_eval_tree_impl(fn_map, params, args, funcs)?;
+                        let t_eval = arg_iter
+                            .next()
+                            .unwrap()
+                            .to_eval_tree_impl(fn_map, params, args, funcs)?;
+                        let f_eval = arg_iter
+                            .next()
+                            .unwrap()
+                            .to_eval_tree_impl(fn_map, params, args, funcs)?;
+
+                        Ok(Expression::IfElse(Box::new((cond_eval, t_eval, f_eval))))
+                    }
                 }
             }
             AtomView::Pow(p) => {
                 let (b, e) = p.get_base_exp();
                 let b_eval = b.to_eval_tree_impl(fn_map, params, args, funcs)?;
 
-                if let AtomView::Num(n) = e {
-                    if let CoefficientView::Natural(num, den, num_i, _den_i) = n.get_coeff_view() {
-                        if den == 1 && num_i == 0 {
-                            if num > 1 {
-                                return Ok(Expression::Mul(vec![b_eval.clone(); num as usize]));
-                            } else {
-                                return Ok(Expression::Pow(Box::new((
-                                    Expression::Mul(vec![
-                                        b_eval.clone();
-                                        num.unsigned_abs() as usize
-                                    ]),
-                                    -1,
-                                ))));
-                            }
-                        }
-                    }
+                if let AtomView::Num(n) = e
+                    && let CoefficientView::Natural(num, den, num_i, _den_i) = n.get_coeff_view()
+                    && den == 1
+                    && num_i == 0
+                {
+                    return Ok(Expression::Pow(Box::new((b_eval.clone(), num))));
                 }
 
                 let e_eval = e.to_eval_tree_impl(fn_map, params, args, funcs)?;
@@ -4991,10 +9407,10 @@ impl<'a> AtomView<'a> {
             AtomView::Num(n) => match n.get_coeff_view() {
                 CoefficientView::Natural(n, d, ni, di) => {
                     if ni == 0 {
-                        Ok(coeff_map(&Rational::from_unchecked(n, d)))
+                        Ok(coeff_map(&Rational::from_int_unchecked(n, d)))
                     } else {
-                        let num = coeff_map(&Rational::from_unchecked(n, d));
-                        Ok(coeff_map(&Rational::from_unchecked(ni, di))
+                        let num = coeff_map(&Rational::from_int_unchecked(n, d));
+                        Ok(coeff_map(&Rational::from_int_unchecked(ni, di))
                             * num.i().ok_or_else(|| {
                                 "Numerical type does not support imaginary unit".to_string()
                             })?
@@ -5026,6 +9442,8 @@ impl<'a> AtomView<'a> {
                             + rm)
                     }
                 }
+                CoefficientView::Indeterminate => Err("Cannot evaluate indeterminate".to_string()),
+                CoefficientView::Infinity(_) => Err("Cannot evaluate infinity".to_string()),
                 CoefficientView::FiniteField(_, _) => {
                     Err("Finite field not yet supported for evaluation".to_string())
                 }
@@ -5034,23 +9452,48 @@ impl<'a> AtomView<'a> {
                 ),
             },
             AtomView::Var(v) => match v.get_symbol() {
-                Atom::E => Ok(coeff_map(&1.into()).e()),
-                Atom::PI => Ok(coeff_map(&1.into()).pi()),
-                _ => Err(format!("Variable {} not in constant map", v.get_symbol())),
+                Symbol::E => Ok(coeff_map(&1.into()).e()),
+                Symbol::PI => Ok(coeff_map(&1.into()).pi()),
+                s => {
+                    if let Some(fun) = function_map.get(&s) {
+                        if let Some(eval) = cache.get(self) {
+                            return Ok(eval.clone());
+                        }
+
+                        let eval = fun.get()(&[], const_map, function_map, cache);
+                        cache.insert(*self, eval.clone());
+                        Ok(eval)
+                    } else {
+                        Err(format!(
+                            "Variable {} not in constant map or function map",
+                            v.get_symbol().get_name()
+                        ))
+                    }
+                }
             },
             AtomView::Fun(f) => {
                 let name = f.get_symbol();
-                if [Atom::EXP, Atom::LOG, Atom::SIN, Atom::COS, Atom::SQRT].contains(&name) {
+                if [
+                    Symbol::EXP,
+                    Symbol::LOG,
+                    Symbol::SIN,
+                    Symbol::COS,
+                    Symbol::SQRT,
+                    Symbol::CONJ,
+                ]
+                .contains(&name)
+                {
                     assert!(f.get_nargs() == 1);
                     let arg = f.iter().next().unwrap();
                     let arg_eval = arg.evaluate_impl(coeff_map, const_map, function_map, cache)?;
 
                     return Ok(match f.get_symbol() {
-                        Atom::EXP => arg_eval.exp(),
-                        Atom::LOG => arg_eval.log(),
-                        Atom::SIN => arg_eval.sin(),
-                        Atom::COS => arg_eval.cos(),
-                        Atom::SQRT => arg_eval.sqrt(),
+                        Symbol::EXP => arg_eval.exp(),
+                        Symbol::LOG => arg_eval.log(),
+                        Symbol::SIN => arg_eval.sin(),
+                        Symbol::COS => arg_eval.cos(),
+                        Symbol::SQRT => arg_eval.sqrt(),
+                        Symbol::CONJ => arg_eval.conj(),
                         _ => unreachable!(),
                     });
                 }
@@ -5065,7 +9508,7 @@ impl<'a> AtomView<'a> {
                 }
 
                 let Some(fun) = function_map.get(&f.get_symbol()) else {
-                    Err(format!("Missing function {}", f.get_symbol()))?
+                    Err(format!("Missing function {}", f.get_symbol().get_name()))?
                 };
                 let eval = fun.get()(&args, const_map, function_map, cache);
 
@@ -5076,15 +9519,15 @@ impl<'a> AtomView<'a> {
                 let (b, e) = p.get_base_exp();
                 let b_eval = b.evaluate_impl(coeff_map, const_map, function_map, cache)?;
 
-                if let AtomView::Num(n) = e {
-                    if let CoefficientView::Natural(num, den, ni, _di) = n.get_coeff_view() {
-                        if den == 1 && ni == 0 {
-                            if num >= 0 {
-                                return Ok(b_eval.pow(num as u64));
-                            } else {
-                                return Ok(b_eval.pow(num.unsigned_abs()).inv());
-                            }
-                        }
+                if let AtomView::Num(n) = e
+                    && let CoefficientView::Natural(num, den, ni, _di) = n.get_coeff_view()
+                    && den == 1
+                    && ni == 0
+                {
+                    if num >= 0 {
+                        return Ok(b_eval.pow(num as u64));
+                    } else {
+                        return Ok(b_eval.pow(num.unsigned_abs()).inv());
                     }
                 }
 
@@ -5153,13 +9596,13 @@ impl<'a> AtomView<'a> {
 
         let mut rng = MonteCarloRng::new(0, 0);
 
-        if self.has_complex_coefficients() {
+        if self.has_complex_coefficients() || self.has_roots() {
             let mut vars: HashMap<_, _> = self
                 .get_all_indeterminates(true)
                 .into_iter()
                 .filter_map(|x| {
                     let s = x.get_symbol().unwrap();
-                    if !State::is_builtin(s) || s == Atom::DERIVATIVE {
+                    if !State::is_builtin(s) || s == Symbol::DERIVATIVE {
                         Some((x, Complex::new(0f64.into(), 0f64.into())))
                     } else {
                         None
@@ -5215,7 +9658,7 @@ impl<'a> AtomView<'a> {
                 .into_iter()
                 .filter_map(|x| {
                     let s = x.get_symbol().unwrap();
-                    if !State::is_builtin(s) || s == Atom::DERIVATIVE {
+                    if !State::is_builtin(s) || s == Symbol::DERIVATIVE {
                         Some((x, 0f64.into()))
                     } else {
                         None
@@ -5268,8 +9711,9 @@ mod test {
 
     use crate::{
         atom::{Atom, AtomCore},
+        create_hyperdual_from_components,
         domains::{
-            float::{Complex, Float},
+            float::{Complex, Float, FloatLike},
             rational::Rational,
         },
         evaluate::{EvaluationFn, FunctionMap, OptimizationSettings},
@@ -5334,7 +9778,7 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            format!("{}", r),
+            format!("{r}"),
             "6.00000000998400625211945786243908951675582851493871969158108"
         );
     }
@@ -5386,8 +9830,9 @@ mod test {
                 .unwrap();
 
         let mut e_f64 = evaluator.map_coeff(&|x| x.clone().to_real().unwrap().into());
-        let r = e_f64.evaluate_single(&[1.1]);
-        assert!((r - 1622709.2254269677).abs() / 1622709.2254269677 < 1e-10);
+        let mut res = [0., 0.];
+        e_f64.evaluate(&[1.1], &mut res);
+        assert!((res[0] - 1622709.2254269677).abs() / 1622709.2254269677 < 1e-10);
     }
 
     #[test]
@@ -5399,5 +9844,75 @@ mod test {
 
         let e = parse!("x + (1+x)^2 + (x+2)*5");
         assert_eq!(e.zero_test(10, f64::EPSILON), ConditionResult::False);
+    }
+
+    #[test]
+    fn branching() {
+        let mut f = FunctionMap::new();
+        f.add_conditional(symbol!("if")).unwrap();
+
+        let tests = vec![
+            ("if(y, x*x + z*z + x*z*z, x * x + 3)", 25., 12.),
+            ("if(y+1, x*x + z*z + x*z*z, x * x + 3)", 12., 25.),
+            ("if(y, x*x + z*z + x*z*z, 3)", 25., 3.),
+            ("if(x + z, if(y, 1 + x, 1+x+y), 0)", 4., 4.),
+            ("if(y, x * z, 0) + x * z", 12., 6.),
+        ];
+
+        for (input, true_res, false_res) in tests {
+            let mut eval = parse!(input)
+                .evaluator(
+                    &f,
+                    &vec![crate::parse!("x"), crate::parse!("y"), crate::parse!("z")],
+                    Default::default(),
+                )
+                .unwrap()
+                .map_coeff(&|x| x.re.to_f64());
+
+            let res = eval.evaluate_single(&[3., -1., 2.]);
+            assert_eq!(res, true_res);
+            let res = eval.evaluate_single(&[3., 0., 2.]);
+            assert_eq!(res, false_res);
+        }
+    }
+
+    #[test]
+    fn vectorize_dual() {
+        create_hyperdual_from_components!(
+            Dual,
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [1, 1, 0],
+                [1, 0, 1],
+                [0, 1, 1],
+                [1, 1, 1],
+                [2, 0, 0]
+            ]
+        );
+
+        let ev = parse!("sin(x+y)^2+cos(x+y)^2 - 1")
+            .evaluator(
+                &FunctionMap::new(),
+                &[parse!("x"), parse!("y")],
+                OptimizationSettings::default(),
+            )
+            .unwrap();
+
+        let dual = Dual::<Complex<Rational>>::new_zero();
+        let vec_ev = ev.vectorize(&dual);
+
+        let mut vec_f = vec_ev.map_coeff(&|x| x.re.to_f64());
+        let mut dest = vec![0.; 9];
+        vec_f.evaluate(
+            &[
+                2.0, 1.0, 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17.,
+            ],
+            &mut dest,
+        );
+
+        assert!(dest.iter().all(|x| x.abs() < 1e-10));
     }
 }

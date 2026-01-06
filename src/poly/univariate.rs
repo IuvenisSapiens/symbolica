@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     domains::{
-        EuclideanDomain, Field, InternalOrdering, Ring, SelfRing,
-        float::{Complex, FloatField, NumericalFloatLike, Real, SingleFloat},
+        EuclideanDomain, Field, InternalOrdering, Ring, RingOps, SelfRing, Set,
+        float::{Complex, FloatField, FloatLike, Real, SingleFloat},
         integer::{Integer, IntegerRing, Z},
         rational::{Q, Rational, RationalField},
     },
@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    PositiveExponent, Variable,
+    PolyVariable, PositiveExponent,
     factor::Factorize,
     polynomial::{MultivariatePolynomial, PolynomialRing},
 };
@@ -26,11 +26,11 @@ use super::{
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct UnivariatePolynomialRing<R: Ring> {
     ring: R,
-    variable: Arc<Variable>,
+    variable: Arc<PolyVariable>,
 }
 
 impl<R: Ring> UnivariatePolynomialRing<R> {
-    pub fn new(coeff_ring: R, var_map: Arc<Variable>) -> UnivariatePolynomialRing<R> {
+    pub fn new(coeff_ring: R, var_map: Arc<PolyVariable>) -> UnivariatePolynomialRing<R> {
         UnivariatePolynomialRing {
             ring: coeff_ring,
             variable: var_map,
@@ -51,9 +51,53 @@ impl<R: Ring> std::fmt::Display for UnivariatePolynomialRing<R> {
     }
 }
 
-impl<R: Ring> Ring for UnivariatePolynomialRing<R> {
+impl<R: Ring> Set for UnivariatePolynomialRing<R> {
     type Element = UnivariatePolynomial<R>;
 
+    fn size(&self) -> Option<Integer> {
+        None
+    }
+}
+
+impl<R: Ring> RingOps<UnivariatePolynomial<R>> for UnivariatePolynomialRing<R> {
+    fn add(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        a + b
+    }
+
+    fn sub(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        a - b
+    }
+
+    fn mul(&self, a: Self::Element, b: Self::Element) -> Self::Element {
+        a * &b
+    }
+
+    fn add_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) + b;
+    }
+
+    fn sub_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) - b;
+    }
+
+    fn mul_assign(&self, a: &mut Self::Element, b: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) * &b;
+    }
+
+    fn add_mul_assign(&self, a: &mut Self::Element, b: Self::Element, c: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) + b * &c
+    }
+
+    fn sub_mul_assign(&self, a: &mut Self::Element, b: Self::Element, c: Self::Element) {
+        *a = std::mem::replace(a, b.zero()) - b * &c
+    }
+
+    fn neg(&self, a: Self::Element) -> Self::Element {
+        a.neg()
+    }
+}
+
+impl<R: Ring> RingOps<&UnivariatePolynomial<R>> for UnivariatePolynomialRing<R> {
     fn add(&self, a: &Self::Element, b: &Self::Element) -> Self::Element {
         a + b
     }
@@ -89,7 +133,9 @@ impl<R: Ring> Ring for UnivariatePolynomialRing<R> {
     fn neg(&self, a: &Self::Element) -> Self::Element {
         a.clone().neg()
     }
+}
 
+impl<R: Ring> Ring for UnivariatePolynomialRing<R> {
     fn zero(&self) -> Self::Element {
         UnivariatePolynomial::new(&self.ring, None, self.variable.clone())
     }
@@ -122,8 +168,13 @@ impl<R: Ring> Ring for UnivariatePolynomialRing<R> {
         self.ring.characteristic()
     }
 
-    fn size(&self) -> Integer {
-        0.into()
+    fn try_inv(&self, a: &Self::Element) -> Option<Self::Element> {
+        if a.is_constant() {
+            let inv = self.ring.try_inv(&a.get_constant())?;
+            Some(a.constant(inv))
+        } else {
+            None
+        }
     }
 
     fn try_div(&self, a: &Self::Element, b: &Self::Element) -> Option<Self::Element> {
@@ -142,6 +193,10 @@ impl<R: Ring> Ring for UnivariatePolynomialRing<R> {
         f: &mut W,
     ) -> Result<bool, std::fmt::Error> {
         element.format(opts, state, f)
+    }
+
+    fn has_independent_elements(&self) -> bool {
+        self.ring.has_independent_elements()
     }
 }
 
@@ -163,7 +218,7 @@ impl<R: EuclideanDomain> EuclideanDomain for UnivariatePolynomialRing<R> {
 #[derive(Clone)]
 pub struct UnivariatePolynomial<F: Ring> {
     pub coefficients: Vec<F::Element>,
-    pub variable: Arc<Variable>,
+    pub variable: Arc<PolyVariable>,
     pub ring: F,
 }
 
@@ -187,7 +242,7 @@ impl<F: Ring + std::fmt::Debug> std::fmt::Debug for UnivariatePolynomial<F> {
             } else {
                 write!(f, ", ")?;
             }
-            write!(f, "{{ {:?} }}", c)?;
+            write!(f, "{{ {c:?} }}")?;
         }
         write!(f, " ]")
     }
@@ -205,7 +260,7 @@ impl<F: Ring> UnivariatePolynomial<F> {
     /// prefer to create new polynomials from existing ones, so that the
     /// variable map and field are inherited.
     #[inline]
-    pub fn new(field: &F, cap: Option<usize>, variable: Arc<Variable>) -> Self {
+    pub fn new(field: &F, cap: Option<usize>, variable: Arc<PolyVariable>) -> Self {
         Self {
             coefficients: Vec::with_capacity(cap.unwrap_or(0)),
             ring: field.clone(),
@@ -303,12 +358,12 @@ impl<F: Ring> UnivariatePolynomial<F> {
     }
 
     /// Get a copy of the variable/
-    pub fn get_vars(&self) -> Arc<Variable> {
+    pub fn get_vars(&self) -> Arc<PolyVariable> {
         self.variable.clone()
     }
 
     /// Get a reference to the variables
-    pub fn get_vars_ref(&self) -> &Variable {
+    pub fn get_vars_ref(&self) -> &PolyVariable {
         self.variable.as_ref()
     }
 
@@ -685,9 +740,9 @@ impl<F: Ring> SelfRing for UnivariatePolynomial<F> {
             }
 
             if e == 1 {
-                write!(f, "{}", v)?;
+                write!(f, "{v}")?;
             } else if e > 1 {
-                write!(f, "{}^{}", v, e)?;
+                write!(f, "{v}^{e}")?;
             }
 
             state.in_sum = true;
@@ -840,7 +895,12 @@ impl UnivariatePolynomial<RationalField> {
             .to_multivariate::<u16>()
             .square_free_factorization()
         {
-            let f = f.to_univariate_from_univariate(0);
+            if f.is_constant() {
+                continue;
+            }
+
+            // make monic to prevent casting large integers that may overflow the float
+            let f = f.to_univariate_from_univariate(0).make_monic();
 
             match f
                 .map_coeff(
@@ -994,7 +1054,7 @@ impl UnivariatePolynomial<IntegerRing> {
                 let tmp: f64 = (-2f64.powf(t as f64) * self.coefficients[i].to_rational().to_f64()
                     / self.coefficients[j].to_rational().to_f64())
                 .powf(1. / (j - i) as f64);
-                let tmp = Rational::from(tmp);
+                let tmp = Rational::try_from(tmp).unwrap();
                 if tmp > bound {
                     bound = tmp;
                 }
@@ -1398,7 +1458,7 @@ impl<F: Ring> Neg for UnivariatePolynomial<F> {
     fn neg(mut self) -> Self::Output {
         // Negate coefficients of all terms.
         for c in &mut self.coefficients {
-            *c = self.ring.neg(c);
+            *c = self.ring.neg(&*c);
         }
         self
     }
@@ -1473,7 +1533,7 @@ impl<'a, F: EuclideanDomain> Div<&'a UnivariatePolynomial<F>> for &UnivariatePol
 
     fn div(self, other: &'a UnivariatePolynomial<F>) -> Self::Output {
         self.try_div(other)
-            .unwrap_or_else(|| panic!("No exact division of {} by {}", self, other))
+            .unwrap_or_else(|| panic!("No exact division of {self} by {other}"))
     }
 }
 
@@ -1600,7 +1660,7 @@ impl<F: Field> UnivariatePolynomial<F> {
         let mut x = self.rem(m);
         let mut y = self.one();
         while !n.is_one() {
-            if (&n % &Integer::Natural(2)).is_one() {
+            if (&n % &Integer::Single(2)).is_one() {
                 y = (&y * &x).quot_rem(m).1;
                 n -= &Integer::one();
             }

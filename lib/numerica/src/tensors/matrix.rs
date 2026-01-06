@@ -5,8 +5,8 @@
 //! Solve an underdetermined linear system:
 //!
 //! ```
-//! use symbolica::domains::rational::Q;
-//! use symbolica::tensors::matrix::Matrix;
+//! use numerica::domains::rational::Q;
+//! use numerica::tensors::matrix::Matrix;
 //! let m = vec![
 //!     vec![1.into(), 1.into(), 1.into()],
 //!     vec![1.into(), 1.into(), 2.into()],
@@ -15,7 +15,7 @@
 //!
 //! let mat = Matrix::from_nested_vec(m, Q).unwrap();
 //! let r = mat.solve_any(&rhs).unwrap();
-//! assert_eq!(r.into_vec(), [4.into(), 0.into(), (-1).into()]);
+//! assert_eq!(r.into_vec(), [4, 0, -1]);
 //! ```
 
 use std::{
@@ -32,7 +32,6 @@ use crate::{
         integer::Z,
         rational::{Q, Rational},
     },
-    poly::Variable,
     printer::{PrintOptions, PrintState},
 };
 
@@ -41,8 +40,8 @@ use crate::{
 /// # Examples
 ///
 /// ```
-/// use symbolica::domains::rational::Q;
-/// use symbolica::tensors::matrix::Vector;
+/// use numerica::domains::rational::Q;
+/// use numerica::tensors::matrix::Vector;
 /// let v1 = Vector::new(vec![(3,1).into(), (1,1).into()], Q);
 /// let v2 = Vector::new(vec![(2,1).into(), (2,1).into()], Q);
 /// let b = Vector::orthogonalize(&[v1, v2]);
@@ -218,12 +217,12 @@ impl<F: Ring> InternalOrdering for Vector<F> {
 
 impl<F: Derivable> Vector<F> {
     /// Compute the derivative in the variable `x`.
-    pub fn derivative(&self, x: &Variable) -> Vector<F> {
+    pub fn derivative(&self, x: &F::Variable) -> Vector<F> {
         self.map(|e| self.field.derivative(e, x), self.field.clone())
     }
 
     /// Compute the gradient in the variables `x`.
-    pub fn grad(&self, x: &[Variable]) -> Vector<F> {
+    pub fn grad(&self, x: &[F::Variable]) -> Vector<F> {
         if self.len() != x.len() {
             panic!(
                 "The number of variables ({}) does not match the number of entries ({})",
@@ -243,7 +242,7 @@ impl<F: Derivable> Vector<F> {
     }
 
     /// Compute the curl of the vector in the variables `x`.
-    pub fn curl(&self, x: &[Variable]) -> Vector<F> {
+    pub fn curl(&self, x: &[F::Variable]) -> Vector<F> {
         if self.len() != 3 || x.len() != 3 {
             panic!("Vector and variable list must be three-dimensional");
         }
@@ -268,7 +267,7 @@ impl<F: Derivable> Vector<F> {
     }
 
     /// Compute the Jacobian matrix of the vector of functions in the variables `x`.
-    pub fn jacobian(&self, x: &[Variable]) -> Matrix<F> {
+    pub fn jacobian(&self, x: &[F::Variable]) -> Matrix<F> {
         let mut jacobian = Vec::with_capacity(self.data.len());
 
         for e in &self.data {
@@ -288,7 +287,7 @@ impl<F: Derivable> Vector<F> {
 
 impl<F: Derivable> Matrix<F> {
     /// Compute the derivative in the variable `x`.
-    pub fn derivative(&self, x: &Variable) -> Matrix<F> {
+    pub fn derivative(&self, x: &F::Variable) -> Matrix<F> {
         self.map(|e| self.field.derivative(e, x), self.field.clone())
     }
 }
@@ -323,10 +322,7 @@ impl<F: EuclideanDomain> Matrix<F> {
                 for k in i + 1..self.nrows {
                     if !self.field.is_zero(&self[(k, j)]) {
                         // Swap i-th row and k-th row.
-                        for l in j..self.ncols {
-                            self.data
-                                .swap((self.ncols * i + l) as usize, (self.ncols * k + l) as usize);
-                        }
+                        self.swap_rows(i, k, j);
                         break;
                     }
                 }
@@ -529,7 +525,7 @@ impl Vector<Z> {
         let mut k = 1;
         while k < system.len() {
             for j in (0..k).rev() {
-                if mus[k * system.len() + j].abs() < (1, 2).into() {
+                if mus[k * system.len() + j].abs() < (1, 2) {
                     continue;
                 }
 
@@ -580,6 +576,24 @@ impl<F: Ring> IndexMut<u32> for Vector<F> {
     #[inline]
     fn index_mut(&mut self, index: u32) -> &mut F::Element {
         &mut self.data[index as usize]
+    }
+}
+
+impl<F: Ring> Index<usize> for Vector<F> {
+    type Output = F::Element;
+
+    /// Get the `i`th entry of the vector.
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.data[index]
+    }
+}
+
+impl<F: Ring> IndexMut<usize> for Vector<F> {
+    /// Get the `i`th entry of the vector.
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut F::Element {
+        &mut self.data[index]
     }
 }
 
@@ -673,7 +687,7 @@ impl<F: Ring> Neg for Vector<F> {
     /// Negate each entry of the vector.
     fn neg(mut self) -> Self::Output {
         for e in &mut self.data {
-            *e = self.field.neg(e);
+            *e = self.field.neg(&*e);
         }
 
         self
@@ -686,8 +700,8 @@ impl<F: Ring> Neg for Vector<F> {
 /// # Examples
 ///
 /// ```    
-/// use symbolica::domains::rational::Q;
-/// use symbolica::tensors::matrix::Matrix;    
+/// # use numerica::domains::rational::Q;
+/// # use numerica::tensors::matrix::Matrix;    
 /// let a = Matrix::from_linear(vec![3.into(), 2.into(), 15.into(), 4.into()], 2, 2, Q).unwrap();
 /// let inv = a.inv().unwrap();
 /// assert_eq!(&a * &inv, Matrix::identity(2, Q));
@@ -868,16 +882,28 @@ impl<F: Ring> Matrix<F> {
         }
     }
 
-    // Swap the i-th row with the j-th row.
-    pub fn swap_rows(&mut self, i: u32, j: u32) {
-        for k in 0..self.ncols {
-            self.data
-                .swap((i * self.ncols + k) as usize, (j * self.ncols + k) as usize);
+    // Swap the i-th row with the j-th row, starting at column `start`.
+    pub fn swap_rows(&mut self, mut i: u32, mut j: u32, start: u32) {
+        if i == j {
+            return;
         }
+
+        if i > j {
+            (i, j) = (j, i);
+        }
+
+        let (a, b) = self.data.split_at_mut((j * self.ncols) as usize);
+
+        a[(i * self.ncols + start) as usize..((i + 1) * self.ncols) as usize]
+            .swap_with_slice(&mut b[start as usize..self.ncols as usize]);
     }
 
     // Swap the i-th column with the j-th column.
     pub fn swap_cols(&mut self, i: u32, j: u32) {
+        if i == j {
+            return;
+        }
+
         for k in 0..self.nrows {
             self.data
                 .swap((k * self.ncols + i) as usize, (k * self.ncols + j) as usize);
@@ -892,6 +918,11 @@ impl<F: Ring> Matrix<F> {
             ncols: self.ncols,
             field: self.field.clone(),
         }
+    }
+
+    /// Return a row-first iterator over the entries of the matrix.
+    pub fn iter(&self) -> std::slice::Iter<'_, F::Element> {
+        self.data.iter()
     }
 
     /// Apply a function `f` to each entry of the matrix.
@@ -967,6 +998,93 @@ impl<F: Ring> Matrix<F> {
         }
 
         Ok((m1, m2))
+    }
+
+    /// Compute the determinant of the matrix.
+    pub fn det(&self) -> Result<F::Element, MatrixError<F>> {
+        if self.nrows != self.ncols {
+            Err(MatrixError::NotSquare)?;
+        }
+
+        let f = &self.field;
+        match self.nrows {
+            0 => Err(MatrixError::Singular),
+            1 => Ok(self.data[0].clone()),
+            2 => Ok(f.sub(
+                &f.mul(&self.data[0], &self.data[3]),
+                &f.mul(&self.data[1], &self.data[2]),
+            )),
+            3 => {
+                let m0 = f.mul(
+                    &self.data[0],
+                    &f.sub(
+                        &f.mul(&self.data[4], &self.data[8]),
+                        &f.mul(&self.data[5], &self.data[7]),
+                    ),
+                );
+                let m1 = f.mul(
+                    &self.data[1],
+                    &f.sub(
+                        &f.mul(&self.data[5], &self.data[6]),
+                        &f.mul(&self.data[3], &self.data[8]),
+                    ),
+                );
+                let m2 = f.mul(
+                    &self.data[2],
+                    &f.sub(
+                        &f.mul(&self.data[3], &self.data[7]),
+                        &f.mul(&self.data[4], &self.data[6]),
+                    ),
+                );
+
+                Ok(f.add(&f.add(&m0, &m1), &m2))
+            }
+            _ => {
+                // Bareiss fraction-free determinant algorithm
+                let mut m = self.clone();
+                let mut flip_sign = false;
+
+                for k in 0..self.nrows - 1 {
+                    if self.field.is_zero(&m[(k, k)]) {
+                        let mut pivot_row = k;
+                        while pivot_row < self.nrows && self.field.is_zero(&m[(pivot_row, k)]) {
+                            pivot_row += 1;
+                        }
+
+                        if pivot_row == self.nrows {
+                            return Ok(self.field.zero());
+                        }
+
+                        m.swap_rows(k, pivot_row, k);
+                        flip_sign = !flip_sign;
+                    }
+
+                    for i in k + 1..self.nrows {
+                        for j in k + 1..self.ncols {
+                            let val = f.sub(
+                                &f.mul(&m[(i, j)], &m[(k, k)]),
+                                &f.mul(&m[(i, k)], &m[(k, j)]),
+                            );
+
+                            if k > 0 {
+                                m[(i, j)] =
+                                    f.try_div(&val, &m[(k - 1, k - 1)]).unwrap_or_else(|| {
+                                        panic!(
+                                            "Inexact division in determinant calculation of {}",
+                                            self
+                                        )
+                                    });
+                            } else {
+                                m[(i, j)] = val;
+                            }
+                        }
+                    }
+                }
+
+                let det = m[(self.nrows - 1, self.nrows - 1)].clone();
+                if flip_sign { Ok(f.neg(&det)) } else { Ok(det) }
+            }
+        }
     }
 }
 
@@ -1214,7 +1332,7 @@ impl<F: Ring> Neg for Matrix<F> {
     /// Negate each entry of the matrix.
     fn neg(mut self) -> Self::Output {
         for e in &mut self.data {
-            *e = self.field.neg(e);
+            *e = self.field.neg(&*e);
         }
 
         self
@@ -1253,11 +1371,10 @@ impl<F: Ring> std::fmt::Display for MatrixError<F> {
                 rank,
                 row_reduced_augmented_matrix,
             } => {
-                writeln!(f, "The system is underdetermined with rank {}", rank)?;
+                writeln!(f, "The system is underdetermined with rank {rank}")?;
                 writeln!(
                     f,
-                    "\nRow reduced augmented matrix:\n{}",
-                    row_reduced_augmented_matrix
+                    "\nRow reduced augmented matrix:\n{row_reduced_augmented_matrix}"
                 )
             }
             MatrixError::Inconsistent => write!(f, "The system is inconsistent"),
@@ -1393,7 +1510,7 @@ impl<F: Field> Matrix<F> {
 
             let d_inv = self.field.inv(&d);
             for e in &mut m.data {
-                *e = f.mul(e, &d_inv);
+                *e = f.mul(&*e, &d_inv);
             }
             return Ok(m);
         }
@@ -1429,49 +1546,6 @@ impl<F: Field> Matrix<F> {
         Ok(m)
     }
 
-    /// Compute the determinant of the matrix.
-    pub fn det(&self) -> Result<F::Element, MatrixError<F>> {
-        if self.nrows != self.ncols {
-            Err(MatrixError::NotSquare)?;
-        }
-
-        let f = &self.field;
-        match self.nrows {
-            0 => Err(MatrixError::Singular),
-            1 => Ok(self.data[0].clone()),
-            2 => Ok(f.sub(
-                &f.mul(&self.data[0], &self.data[3]),
-                &f.mul(&self.data[1], &self.data[2]),
-            )),
-            3 => {
-                let m0 = f.mul(
-                    &self.data[0],
-                    &f.sub(
-                        &f.mul(&self.data[4], &self.data[8]),
-                        &f.mul(&self.data[5], &self.data[7]),
-                    ),
-                );
-                let m1 = f.mul(
-                    &self.data[1],
-                    &f.sub(
-                        &f.mul(&self.data[5], &self.data[6]),
-                        &f.mul(&self.data[3], &self.data[8]),
-                    ),
-                );
-                let m2 = f.mul(
-                    &self.data[2],
-                    &f.sub(
-                        &f.mul(&self.data[3], &self.data[7]),
-                        &f.mul(&self.data[4], &self.data[6]),
-                    ),
-                );
-
-                Ok(f.add(&f.add(&m0, &m1), &m2))
-            }
-            _ => self.clone().det_in_place(),
-        }
-    }
-
     /// Compute the determinant of the matrix in-place.
     pub fn det_in_place(&mut self) -> Result<F::Element, MatrixError<F>> {
         if self.nrows != self.ncols {
@@ -1502,11 +1576,7 @@ impl<F: Field> Matrix<F> {
                 // Select a non-zero pivot.
                 for k in i + 1..self.nrows {
                     if !self.field.is_zero(&self[(k, j)]) {
-                        // Swap i-th row and k-th row.
-                        for l in j..self.ncols {
-                            self.data
-                                .swap((self.ncols * i + l) as usize, (self.ncols * k + l) as usize);
-                        }
+                        self.swap_rows(i, k, j);
                         break;
                     }
                 }
@@ -1650,9 +1720,7 @@ impl<F: Field> Matrix<F> {
 #[cfg(test)]
 mod test {
     use crate::{
-        atom::Atom,
-        domains::{atom::AtomField, integer::Z, rational::Q},
-        parse, symbol,
+        domains::{integer::Z, rational::Q},
         tensors::matrix::{Matrix, Vector},
     };
 
@@ -1722,23 +1790,23 @@ mod test {
         assert_eq!(
             a.inv().unwrap().data,
             vec![
-                (-83, 60).into(),
-                (1, 10).into(),
-                (17, 60).into(),
-                (19, 15).into(),
-                (-1, 5).into(),
-                (-1, 15).into(),
-                (-1, 20).into(),
-                (1, 10).into(),
-                (-1, 20).into()
+                (-83, 60),
+                (1, 10),
+                (17, 60),
+                (19, 15),
+                (-1, 5),
+                (-1, 15),
+                (-1, 20),
+                (1, 10),
+                (-1, 20)
             ]
         );
-        assert_eq!(a.det().unwrap(), 60.into());
+        assert_eq!(a.det().unwrap(), 60);
 
         let b = Matrix::from_linear(vec![1.into(), 2.into(), 3.into()], 3, 1, Q).unwrap();
 
         let r = a.solve(&b).unwrap();
-        assert_eq!(r.data, vec![(-1, 3).into(), (2, 3).into(), 0.into()]);
+        assert_eq!(r.data, vec![(-1, 3), (2, 3), (0, 1)]);
     }
 
     #[test]
@@ -1751,7 +1819,7 @@ mod test {
 
         let mat = Matrix::from_nested_vec(m, Q).unwrap();
         let r = mat.solve_any(&rhs).unwrap();
-        assert_eq!(r.data, vec![4.into(), 0.into(), (-1).into()]);
+        assert_eq!(r.data, vec![4, 0, -1]);
     }
 
     #[test]
@@ -1776,20 +1844,7 @@ mod test {
 
         assert_eq!(a.row_reduce(a.ncols() as u32), 2);
 
-        assert_eq!(
-            a.data,
-            vec![
-                1.into(),
-                0.into(),
-                (-1).into(),
-                0.into(),
-                1.into(),
-                2.into(),
-                0.into(),
-                0.into(),
-                0.into()
-            ]
-        );
+        assert_eq!(a.data, vec![1, 0, (-1), 0, 1, 2, 0, 0, 0]);
     }
 
     #[test]
@@ -1804,7 +1859,7 @@ mod test {
         for x in &res {
             for y in &res {
                 if x != y {
-                    assert_eq!(x.dot(y), (0, 1).into());
+                    assert_eq!(x.dot(y), (0, 1));
                 }
             }
         }
@@ -1878,34 +1933,6 @@ mod test {
 
         // 32.0177 = 5 * pi + 6 * e
         assert_eq!(basis[0].data, &[5, 6, 1, 1]);
-    }
-
-    #[test]
-    fn jacobian() {
-        let a = Vector::new(
-            vec![parse!("x^2+y+z"), parse!("y+z"), parse!("z+x")],
-            AtomField::new(),
-        );
-
-        let b = a.jacobian(&[
-            symbol!("x").into(),
-            symbol!("y").into(),
-            symbol!("z").into(),
-        ]);
-        assert_eq!(
-            b.data,
-            [
-                parse!("2*x"),
-                Atom::num(1),
-                Atom::num(1),
-                Atom::num(0),
-                Atom::num(1),
-                Atom::num(1),
-                Atom::num(1),
-                Atom::num(0),
-                Atom::num(1)
-            ]
-        );
     }
 
     #[test]

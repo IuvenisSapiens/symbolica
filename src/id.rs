@@ -23,14 +23,14 @@ use dyn_clone::DynClone;
 
 use crate::{
     atom::{
-        Atom, AtomCore, AtomType, AtomView, Num, SliceType, Symbol,
+        Atom, AtomCore, AtomType, AtomView, Indeterminate, Num, SliceType, Symbol,
         representation::{InlineVar, ListSlice},
     },
-    coefficient::CoefficientView,
-    domains::{float::Complex, rational::Rational},
+    coefficient::{Coefficient, CoefficientView},
+    domains::rational::Rational,
     state::{RecycledAtom, Workspace},
     transformer::{Transformer, TransformerError},
-    utils::BorrowedOrOwned,
+    utils::{BorrowedOrOwned, Settable},
 };
 
 /// A general expression that can contain pattern-matching wildcards
@@ -75,6 +75,15 @@ impl From<Atom> for Pattern {
     }
 }
 
+impl From<Indeterminate> for Pattern {
+    fn from(atom: Indeterminate) -> Self {
+        match atom {
+            Indeterminate::Symbol(s, _) => Pattern::from(s),
+            Indeterminate::Function(_, a) => Pattern::from(a),
+        }
+    }
+}
+
 impl std::fmt::Display for Pattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Ok(a) = self.to_atom() {
@@ -98,8 +107,20 @@ pub enum ReplaceWith<'a> {
     Map(Box<dyn MatchMap>),
 }
 
+impl<T: Into<Coefficient>> From<T> for ReplaceWith<'_> {
+    fn from(val: T) -> Self {
+        ReplaceWith::Pattern(BorrowedOrOwned::Owned(Atom::num(val.into()).into()))
+    }
+}
+
 impl From<Atom> for ReplaceWith<'_> {
     fn from(val: Atom) -> Self {
+        ReplaceWith::Pattern(BorrowedOrOwned::Owned(val.into()))
+    }
+}
+
+impl From<Indeterminate> for ReplaceWith<'_> {
+    fn from(val: Indeterminate) -> Self {
         ReplaceWith::Pattern(BorrowedOrOwned::Owned(val.into()))
     }
 }
@@ -119,7 +140,7 @@ impl From<Pattern> for ReplaceWith<'_> {
 impl std::fmt::Debug for ReplaceWith<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReplaceWith::Pattern(p) => write!(f, "{:?}", p),
+            ReplaceWith::Pattern(p) => write!(f, "{p:?}"),
             ReplaceWith::Map(_) => write!(f, "Map"),
         }
     }
@@ -138,10 +159,10 @@ impl std::fmt::Display for ReplaceWith<'_> {
 /// with optional conditions and settings.
 #[derive(Debug, Clone)]
 pub struct Replacement {
-    pat: Pattern,
-    rhs: ReplaceWith<'static>,
-    conditions: Option<Condition<PatternRestriction>>,
-    settings: Option<MatchSettings>,
+    pub pat: Pattern,
+    pub rhs: ReplaceWith<'static>,
+    pub conditions: Option<Condition<PatternRestriction>>,
+    pub settings: Option<MatchSettings>,
 }
 
 impl std::fmt::Display for Replacement {
@@ -149,7 +170,7 @@ impl std::fmt::Display for Replacement {
         write!(f, "{} -> {}", self.pat, self.rhs)?;
 
         if let Some(c) = &self.conditions {
-            write!(f, "; {}", c)?;
+            write!(f, "; {c}")?;
         }
 
         Ok(())
@@ -187,11 +208,11 @@ pub struct BorrowedReplacement<'a> {
 }
 
 pub trait BorrowReplacement {
-    fn borrow(&self) -> BorrowedReplacement;
+    fn borrow(&self) -> BorrowedReplacement<'_>;
 }
 
 impl BorrowReplacement for Replacement {
-    fn borrow(&self) -> BorrowedReplacement {
+    fn borrow(&self) -> BorrowedReplacement<'_> {
         BorrowedReplacement {
             pattern: &self.pat,
             rhs: &self.rhs,
@@ -202,7 +223,7 @@ impl BorrowReplacement for Replacement {
 }
 
 impl BorrowReplacement for &Replacement {
-    fn borrow(&self) -> BorrowedReplacement {
+    fn borrow(&self) -> BorrowedReplacement<'_> {
         BorrowedReplacement {
             pattern: &self.pat,
             rhs: &self.rhs,
@@ -213,7 +234,7 @@ impl BorrowReplacement for &Replacement {
 }
 
 impl BorrowReplacement for BorrowedReplacement<'_> {
-    fn borrow(&self) -> BorrowedReplacement {
+    fn borrow(&self) -> BorrowedReplacement<'_> {
         *self
     }
 }
@@ -433,6 +454,26 @@ impl<'a, 'b> ReplaceBuilder<'a, 'b> {
             Some(&self.settings),
         )
     }
+
+    /// Return an iterator over all matches of the pattern in the target, without performing any replacements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use symbolica::{atom::AtomCore, parse, symbol};
+    ///
+    /// for x in parse!("f(x,y)").replace(parse!("x_")).match_iter() {
+    ///     println!("{}", x[&symbol!("x_")]);
+    /// }
+    /// ```
+    pub fn match_iter(&self) -> PatternAtomTreeIterator<'_, '_> {
+        PatternAtomTreeIterator::new(
+            &self.pattern,
+            self.target,
+            self.conditions.as_ref().map(|x| x.borrow()),
+            Some(&self.settings),
+        )
+    }
 }
 
 impl From<Atom> for BorrowedOrOwned<'_, Pattern> {
@@ -441,9 +482,21 @@ impl From<Atom> for BorrowedOrOwned<'_, Pattern> {
     }
 }
 
+impl From<Indeterminate> for BorrowedOrOwned<'_, Pattern> {
+    fn from(atom: Indeterminate) -> Self {
+        Pattern::from(atom).into()
+    }
+}
+
 impl From<Symbol> for BorrowedOrOwned<'_, Pattern> {
     fn from(atom: Symbol) -> Self {
         Pattern::from(atom).into()
+    }
+}
+
+impl<T: Into<Coefficient>> From<T> for BorrowedOrOwned<'_, Pattern> {
+    fn from(val: T) -> Self {
+        Atom::num(val.into()).to_pattern().into()
     }
 }
 
@@ -461,6 +514,149 @@ pub struct Context {
 impl<'a> AtomView<'a> {
     pub(crate) fn to_pattern(self) -> Pattern {
         Pattern::from_view(self, true)
+    }
+
+    /// Returns true iff an expression where all indeterminates have the attribute `Scalar`.
+    pub(crate) fn is_scalar(&self) -> bool {
+        match self {
+            AtomView::Num(_) => true,
+            AtomView::Var(v) => v.get_symbol().is_scalar(),
+            AtomView::Fun(f) => f.get_symbol().is_scalar(),
+            AtomView::Pow(p) => {
+                let (base, exp) = p.get_base_exp();
+                base.is_scalar() && exp.is_scalar()
+            }
+            AtomView::Mul(m) => m.iter().all(|child| child.is_scalar()),
+            AtomView::Add(a) => a.iter().all(|child| child.is_scalar()),
+        }
+    }
+
+    /// Returns true iff an expression only consists of integer numbers and symbols with the `Integer` attribute.
+    pub(crate) fn is_integer(&self) -> bool {
+        match self {
+            AtomView::Num(n) => n.get_coeff_view().is_integer(),
+            AtomView::Var(v) => v.get_symbol().is_integer(),
+            AtomView::Fun(f) => f.get_symbol().is_integer(),
+            AtomView::Pow(p) => {
+                let (base, exp) = p.get_base_exp();
+                base.is_integer() && exp.is_integer()
+            }
+            AtomView::Mul(m) => m.iter().all(|child| child.is_integer()),
+            AtomView::Add(a) => a.iter().all(|child| child.is_integer()),
+        }
+    }
+
+    /// Returns true iff an expression only consists of real numbers and symbols with the `Real` attribute.
+    pub(crate) fn is_real(&self) -> bool {
+        match self {
+            AtomView::Num(n) => n.get_coeff_view().is_real(),
+            AtomView::Var(v) => v.get_symbol().is_real(),
+            AtomView::Fun(f) => match f.get_symbol() {
+                Symbol::EXP => f.iter().next().is_some_and(|arg| arg.is_real()),
+                Symbol::SQRT => f.iter().next().is_some_and(|arg| arg.is_positive()),
+                x => x.is_real(),
+            },
+            AtomView::Pow(p) => {
+                let (base, exp) = p.get_base_exp();
+                base.is_real() && (exp.is_integer() || base.is_positive() && exp.is_real())
+            }
+            AtomView::Mul(m) => m.iter().all(|child| child.is_real()),
+            AtomView::Add(a) => a.iter().all(|child| child.is_real()),
+        }
+    }
+
+    /// Test if the attributes and tags of `s` are shared by `self`.
+    pub fn has_attributes_of(&self, s: Symbol) -> bool {
+        if let Some(ss) = self.get_symbol() {
+            return ss.has_attributes_of(s);
+        }
+
+        !s.is_antisymmetric()
+            && !s.is_symmetric()
+            && !s.is_cyclesymmetric()
+            && !s.is_linear()
+            && s.get_tags().is_empty()
+            && (!s.is_positive() || self.is_positive())
+            && (!s.is_integer() || self.is_integer())
+            && (!s.is_real() || self.is_real())
+            && (!s.is_scalar() || self.is_scalar())
+    }
+
+    /// Returns true iff an expression only consists of real numbers and symbols with the `Real` attribute.
+    pub(crate) fn is_positive(&self) -> bool {
+        match self {
+            AtomView::Num(_) => {
+                if let Ok(k) = Rational::try_from(*self) {
+                    !k.is_negative()
+                } else {
+                    false
+                }
+            }
+            AtomView::Var(v) => v.get_symbol().is_positive(),
+            AtomView::Fun(f) => match f.get_symbol() {
+                Symbol::EXP => f.iter().next().is_some_and(|arg| arg.is_real()),
+                Symbol::SQRT => f.iter().next().is_some_and(|arg| arg.is_positive()),
+                x => x.is_positive(),
+            },
+            AtomView::Pow(p) => {
+                let (base, exp) = p.get_base_exp();
+
+                // base negative is also possible if exp is an even integer
+                if let AtomView::Num(_) = exp
+                    && let Ok(k) = Rational::try_from(exp)
+                        && k.is_integer() && k.numerator_ref() % 2 == 0 {
+                            return base.is_real();
+                        }
+
+                base.is_positive()
+            }
+            AtomView::Mul(m) => m.iter().all(|child| child.is_positive()),
+            AtomView::Add(a) => a.iter().all(|child| child.is_positive()),
+        }
+    }
+
+    /// Returns true iff an expression only consists of finite numbers.
+    pub(crate) fn is_finite(&self) -> bool {
+        match self {
+            AtomView::Num(n) => !matches!(
+                n.get_coeff_view(),
+                CoefficientView::Infinity(_) | CoefficientView::Indeterminate
+            ),
+            AtomView::Var(_) => true,
+            AtomView::Fun(f) => f.iter().all(|arg| arg.is_finite()),
+            AtomView::Pow(p) => {
+                let (base, exp) = p.get_base_exp();
+                base.is_finite() && exp.is_finite()
+            }
+            AtomView::Mul(m) => m.iter().all(|child| child.is_finite()),
+            AtomView::Add(a) => a.iter().all(|child| child.is_finite()),
+        }
+    }
+
+    /// Returns true iff an expression is explicitly constant. It can contain no user-defined variables or functions.
+    pub(crate) fn is_constant(&self) -> bool {
+        match self {
+            AtomView::Num(n) => match n.get_coeff_view() {
+                CoefficientView::RationalPolynomial(r) => r.deserialize().is_constant(),
+                _ => true,
+            },
+            AtomView::Var(v) => match v.get_symbol() {
+                Symbol::PI | Symbol::E => true,
+                _ => false,
+            },
+            AtomView::Fun(f) => match f.get_symbol() {
+                Symbol::EXP | Symbol::LOG | Symbol::SQRT | Symbol::SIN | Symbol::COS => {
+                    f.get_nargs() == 1 && f.iter().next().is_some_and(|arg| arg.is_constant())
+                }
+                _ => false,
+            },
+            AtomView::Pow(p) => {
+                let (base, exp) = p.get_base_exp();
+                base.is_constant() && exp.is_constant()
+            }
+            AtomView::Mul(m) => m.iter().all(|child| child.is_constant()),
+            AtomView::Add(a) => a.iter().all(|child| child.is_constant()),
+        }
     }
 
     /// Get all symbols in the expression, optionally including function symbols.
@@ -588,6 +784,16 @@ impl<'a> AtomView<'a> {
         false
     }
 
+    /// Returns true iff `self` contains the variable `s`.
+    /// Note: if the variable is `x^-1`, the function will return false
+    /// if `self` only contains `x^-n` with `n > 1`.
+    pub(crate) fn contains_indeterminate(&self, s: &Indeterminate) -> bool {
+        match s {
+            Indeterminate::Symbol(sym, _) => self.contains_symbol(*sym),
+            Indeterminate::Function(_, atom) => self.contains(atom.as_view()),
+        }
+    }
+
     /// Returns true iff `self` contains the symbol `s`.
     pub(crate) fn contains_symbol(&self, s: Symbol) -> bool {
         let mut stack = Vec::with_capacity(20);
@@ -677,15 +883,34 @@ impl<'a> AtomView<'a> {
     pub fn has_complex_coefficients(&self) -> bool {
         let mut has_complex_coefficient = false;
         self.visitor(&mut |a| {
-            if let AtomView::Num(n) = a {
-                if !n.get_coeff_view().is_real() {
+            if let AtomView::Num(n) = a
+                && !n.get_coeff_view().is_real() {
                     has_complex_coefficient = true;
                 }
-            }
             !has_complex_coefficient
         });
 
         has_complex_coefficient
+    }
+
+    /// Check if the expression has any non-integer exponents.
+    pub fn has_roots(&self) -> bool {
+        let mut has_roots = false;
+        self.visitor(&mut |a| {
+            if let AtomView::Pow(p) = a {
+                let (_, exp) = p.get_base_exp();
+                if let AtomView::Num(n) = exp {
+                    if !n.get_coeff_view().is_integer() {
+                        has_roots = true;
+                    }
+                } else {
+                    has_roots = true;
+                }
+            }
+            !has_roots
+        });
+
+        has_roots
     }
 
     /// Check if the expression can be considered a polynomial in some variables, including
@@ -794,8 +1019,8 @@ impl<'a> AtomView<'a> {
             }
             AtomView::Mul(mul_view) => {
                 for child in mul_view {
-                    if !allow_not_expanded {
-                        if let AtomView::Add(_) = child {
+                    if !allow_not_expanded
+                        && let AtomView::Add(_) = child {
                             if variables.get(&child) == Some(&true) {
                                 continue;
                             }
@@ -803,7 +1028,6 @@ impl<'a> AtomView<'a> {
                             block_check!(&child);
                             continue;
                         }
-                    }
 
                     if !child.is_polynomial_impl(
                         allow_not_expanded,
@@ -832,70 +1056,39 @@ impl<'a> AtomView<'a> {
         }
     }
 
-    /// Complex conjugate all complex numbers in the expression.
-    pub(crate) fn conjugate(&self) -> Atom {
-        self.replace_map(|x, _c, out| match x {
-            AtomView::Num(n) => match n.get_coeff_view() {
-                CoefficientView::Natural(n, d, ni, di) => {
-                    out.to_num(
-                        Complex::<Rational>::new((n, d).into(), (ni, di).into())
-                            .conj()
-                            .into(),
-                    );
-                    true
-                }
-                CoefficientView::Large(r, i) => {
-                    out.to_num(Complex::new(r.to_rat().into(), i.to_rat()).conj().into());
-                    true
-                }
-                CoefficientView::Float(r, i) => {
-                    out.to_num(Complex::new(r.to_float(), i.to_float()).conj().into());
-                    true
-                }
-                _ => false,
-            },
-            _ => false,
-        })
-    }
-
     /// Replace part of an expression by calling the map `m` on each subexpression.
     /// The function `m`  must return `true` if the expression was replaced and must write the new expression to `out`.
     /// A [Context] object is passed to the function, which contains information about the current position in the expression.
-    pub(crate) fn replace_map<F: FnMut(AtomView, &Context, &mut Atom) -> bool>(
+    pub(crate) fn replace_map<F: FnMut(AtomView, &Context, &mut Settable<'_, Atom>)>(
         &self,
         mut m: F,
     ) -> Atom {
         let mut out = Atom::new();
-        self.replace_map_into(&mut m, &mut out);
-        out
-    }
 
-    /// Replace part of an expression by calling the map `m` on each subexpression.
-    /// The function `m`  must return `true` if the expression was replaced and must write the new expression to `out`.
-    /// A [Context] object is passed to the function, which contains information about the current position in the expression.
-    pub(crate) fn replace_map_into<F: FnMut(AtomView, &Context, &mut Atom) -> bool>(
-        &self,
-        mut m: F,
-        out: &mut Atom,
-    ) {
         let context = Context {
             function_level: 0,
             parent_type: None,
             index: 0,
         };
+
         Workspace::get_local().with(|ws| {
-            self.replace_map_impl(ws, &mut m, context, out);
+            self.replace_map_impl(ws, &mut m, context, &mut out);
         });
+
+        out
     }
 
-    fn replace_map_impl<F: FnMut(AtomView, &Context, &mut Atom) -> bool>(
+    fn replace_map_impl<F: FnMut(AtomView, &Context, &mut Settable<'_, Atom>)>(
         &self,
         ws: &Workspace,
         m: &mut F,
         mut context: Context,
         out: &mut Atom,
     ) -> bool {
-        if m(*self, &context, out) {
+        let mut settable = Settable::from(&mut *out);
+        m(*self, &context, &mut settable);
+
+        if settable.is_set() {
             return true;
         }
 
@@ -1066,13 +1259,12 @@ impl<'a> AtomView<'a> {
             let conditions = r.conditions.unwrap_or(&def_c);
             let settings = r.settings.unwrap_or(&def_s);
 
-            if let Some(max_level) = settings.level_range.1 {
-                if settings.level_is_tree_depth && tree_level > max_level
-                    || !settings.level_is_tree_depth && fn_level > max_level
+            if let Some(max_level) = settings.level_range.1
+                && (settings.level_is_tree_depth && tree_level > max_level
+                    || !settings.level_is_tree_depth && fn_level > max_level)
                 {
                     continue;
                 }
-            }
 
             beyond_max_level = false;
 
@@ -1178,7 +1370,7 @@ impl<'a> AtomView<'a> {
         }
 
         // no match found at this level, so check the children
-        let submatch = match self {
+        match self {
             AtomView::Fun(f) => {
                 let out = out.to_fun(f.get_symbol());
 
@@ -1273,9 +1465,7 @@ impl<'a> AtomView<'a> {
                 out.set_from_view(self); // no children
                 false
             }
-        };
-
-        submatch
+        }
     }
 
     /// Replace all occurrences of the pattern in the target, returning `true` iff a match was found.
@@ -1393,8 +1583,8 @@ impl Pattern {
     }
 
     pub fn add(&self, rhs: &Self, workspace: &Workspace) -> Self {
-        if let Pattern::Literal(l1) = self {
-            if let Pattern::Literal(l2) = rhs {
+        if let Pattern::Literal(l1) = self
+            && let Pattern::Literal(l2) = rhs {
                 // create new literal
                 let mut e = workspace.new_atom();
                 let a = e.to_add();
@@ -1407,7 +1597,6 @@ impl Pattern {
 
                 return Pattern::Literal(b);
             }
-        }
 
         let mut new_args = vec![];
         if let Pattern::Add(l1) = self {
@@ -1426,8 +1615,8 @@ impl Pattern {
     }
 
     pub fn mul(&self, rhs: &Self, workspace: &Workspace) -> Self {
-        if let Pattern::Literal(l1) = self {
-            if let Pattern::Literal(l2) = rhs {
+        if let Pattern::Literal(l1) = self
+            && let Pattern::Literal(l2) = rhs {
                 let mut e = workspace.new_atom();
                 let a = e.to_mul();
 
@@ -1439,7 +1628,6 @@ impl Pattern {
 
                 return Pattern::Literal(b);
             }
-        }
 
         let mut new_args = vec![];
         if let Pattern::Mul(l1) = self {
@@ -1507,8 +1695,8 @@ impl Pattern {
     }
 
     pub fn pow(&self, rhs: &Self, workspace: &Workspace) -> Self {
-        if let Pattern::Literal(l1) = self {
-            if let Pattern::Literal(l2) = rhs {
+        if let Pattern::Literal(l1) = self
+            && let Pattern::Literal(l2) = rhs {
                 let mut e = workspace.new_atom();
                 e.to_pow(l1.as_view(), l2.as_view());
 
@@ -1517,7 +1705,6 @@ impl Pattern {
 
                 return Pattern::Literal(b);
             }
-        }
 
         Pattern::Pow(Box::new([self.clone(), rhs.clone()]))
     }
@@ -1552,11 +1739,12 @@ impl Pattern {
     fn could_match(&self, target: AtomView) -> bool {
         match (self, target) {
             (Pattern::Fn(f1, _), AtomView::Fun(f2)) => {
-                f1.get_wildcard_level() > 0 || *f1 == f2.get_symbol()
+                f1.get_wildcard_level() > 0 && target.has_attributes_of(*f1)
+                    || *f1 == f2.get_symbol()
             }
             (Pattern::Mul(_), AtomView::Mul(_)) => true,
             (Pattern::Add(_), AtomView::Add(_)) => true,
-            (Pattern::Wildcard(_), _) => true,
+            (Pattern::Wildcard(w), x) => x.has_attributes_of(*w),
             (Pattern::Pow(_), AtomView::Pow(_)) => true,
             (Pattern::Literal(p), _) => p.as_view() == target,
             (Pattern::Transformer(_), _) => panic!("Pattern is a transformer"),
@@ -1794,8 +1982,7 @@ impl Pattern {
                     out.to_var(*name);
                 } else {
                     Err(TransformerError::ValueError(format!(
-                        "Unsubstituted wildcard {}",
-                        name
+                        "Unsubstituted wildcard {name:?}",
                     )))?;
                 }
             }
@@ -1821,8 +2008,7 @@ impl Pattern {
                         }
                     } else if !allow_new_wildcards_on_rhs {
                         Err(TransformerError::ValueError(format!(
-                            "Unsubstituted wildcard {}",
-                            name
+                            "Unsubstituted wildcard {name:?}",
                         )))?;
                     }
                 }
@@ -1855,8 +2041,7 @@ impl Pattern {
                             func.add_arg(workspace.new_var(*w).as_view())
                         } else {
                             Err(TransformerError::ValueError(format!(
-                                "Unsubstituted wildcard {}",
-                                w
+                                "Unsubstituted wildcard {w:?}",
                             )))?;
                         }
 
@@ -1899,8 +2084,7 @@ impl Pattern {
                             out.set_from_view(&workspace.new_var(*w).as_view());
                         } else {
                             Err(TransformerError::ValueError(format!(
-                                "Unsubstituted wildcard {}",
-                                w
+                                "Unsubstituted wildcard {w:?}",
                             )))?;
                         }
 
@@ -1949,8 +2133,7 @@ impl Pattern {
                             mul.extend(workspace.new_var(*w).as_view());
                         } else {
                             Err(TransformerError::ValueError(format!(
-                                "Unsubstituted wildcard {}",
-                                w
+                                "Unsubstituted wildcard {w:?}"
                             )))?;
                         }
 
@@ -1996,8 +2179,7 @@ impl Pattern {
                             add.extend(workspace.new_var(*w).as_view());
                         } else {
                             Err(TransformerError::ValueError(format!(
-                                "Unsubstituted wildcard {}",
-                                w
+                                "Unsubstituted wildcard {w:?}"
                             )))?;
                         }
 
@@ -2089,6 +2271,7 @@ impl<T: Clone + Send + Sync + Fn(&MatchStack) -> ConditionResult> MatchStackFn f
 pub enum WildcardRestriction {
     Length(usize, Option<usize>), // min-max range
     IsAtomType(AtomType),
+    HasTag(String),
     IsLiteralWildcard(Symbol),
     Filter(Box<dyn FilterFn>),
     Cmp(Symbol, Box<dyn CmpFn>),
@@ -2117,13 +2300,14 @@ impl WildcardRestriction {
 impl std::fmt::Display for WildcardRestriction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WildcardRestriction::Length(min, Some(max)) => write!(f, "length={}-{}", min, max),
-            WildcardRestriction::Length(min, None) => write!(f, "length > {}", min),
-            WildcardRestriction::IsAtomType(t) => write!(f, "type = {}", t),
-            WildcardRestriction::IsLiteralWildcard(s) => write!(f, "= {}", s),
+            WildcardRestriction::Length(min, Some(max)) => write!(f, "length={min}-{max}"),
+            WildcardRestriction::Length(min, None) => write!(f, "length > {min}"),
+            WildcardRestriction::IsAtomType(t) => write!(f, "type = {t}"),
+            WildcardRestriction::IsLiteralWildcard(s) => write!(f, "= {s}"),
             WildcardRestriction::Filter(_) => write!(f, "filter"),
-            WildcardRestriction::Cmp(s, _) => write!(f, "cmp with {}", s),
+            WildcardRestriction::Cmp(s, _) => write!(f, "cmp with {s}"),
             WildcardRestriction::NotGreedy => write!(f, "not greedy"),
+            WildcardRestriction::HasTag(tag) => write!(f, "has tag {tag}"),
         }
     }
 }
@@ -2151,12 +2335,12 @@ impl Condition<PatternRestriction> {
     /// let out = expr
     ///     .replace(parse!("f(x_,y_,z_)"))
     ///     .when(Condition::match_stack(|m| {
-    ///         if let Some(x) = m.get(symbol!("x")) {
-    ///             if let Some(y) = m.get(symbol!("y")) {
+    ///         if let Some(x) = m.get(symbol!("x_")) {
+    ///             if let Some(y) = m.get(symbol!("y_")) {
     ///                 if x.to_atom() > y.to_atom() {
     ///                     return ConditionResult::False;
     ///                 }
-    ///                 if let Some(z) = m.get(symbol!("z")) {
+    ///                 if let Some(z) = m.get(symbol!("z_")) {
     ///                     if y.to_atom() > z.to_atom() {
     ///                         return ConditionResult::False;
     ///                     }
@@ -2176,7 +2360,7 @@ impl Condition<PatternRestriction> {
 impl std::fmt::Display for PatternRestriction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PatternRestriction::Wildcard((s, r)) => write!(f, "{}: {}", s, r),
+            PatternRestriction::Wildcard((s, r)) => write!(f, "{s}: {r}"),
             PatternRestriction::MatchStack(_) => write!(f, "match_function"),
         }
     }
@@ -2224,9 +2408,25 @@ impl Symbol {
         Condition::from((*self, restriction))
     }
 
+    /// Restrict a wildcard match to be a symbol or function with
+    /// a given namespaced tag.
+    ///
+    /// # Examples
+    /// ```
+    /// use symbolica::{id::WildcardRestriction, symbol};
+    /// symbol!("x_").filter_tag("symbolica::real".into());
+    /// ```
+    pub fn filter_tag(&self, tag: String) -> Condition<PatternRestriction> {
+        if tag.contains("::") {
+            self.restrict(WildcardRestriction::HasTag(tag))
+        } else {
+            panic!("Tag {} must contain namespace", tag);
+        }
+    }
+
     /// Restrict a wildcard symbol with a filter function `f`.
     ///
-    /// # Example
+    /// # Examples
     /// Restrict the wildcard `x_` to be greater than 1:
     /// ```
     /// use symbolica::{id::WildcardRestriction, symbol};
@@ -2268,10 +2468,10 @@ impl<T: std::fmt::Display> std::fmt::Display for Condition<T> {
         match self {
             Condition::And(a) => write!(f, "({}) & ({})", a.0, a.1),
             Condition::Or(o) => write!(f, "{} | {}", o.0, o.1),
-            Condition::Not(n) => write!(f, "!({})", n),
+            Condition::Not(n) => write!(f, "!({n})"),
             Condition::True => write!(f, "True"),
             Condition::False => write!(f, "False"),
-            Condition::Yield(t) => write!(f, "{}", t),
+            Condition::Yield(t) => write!(f, "{t}"),
         }
     }
 }
@@ -2422,15 +2622,15 @@ pub enum Relation {
 impl std::fmt::Display for Relation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Relation::Eq(a, b) => write!(f, "{} == {}", a, b),
-            Relation::Ne(a, b) => write!(f, "{} != {}", a, b),
-            Relation::Gt(a, b) => write!(f, "{} > {}", a, b),
-            Relation::Ge(a, b) => write!(f, "{} >= {}", a, b),
-            Relation::Lt(a, b) => write!(f, "{} < {}", a, b),
-            Relation::Le(a, b) => write!(f, "{} <= {}", a, b),
-            Relation::Contains(a, b) => write!(f, "{} contains {}", a, b),
-            Relation::IsType(a, b) => write!(f, "{} is type {:?}", a, b),
-            Relation::Matches(a, b, _, _) => write!(f, "{} matches {}", a, b),
+            Relation::Eq(a, b) => write!(f, "{a} == {b}"),
+            Relation::Ne(a, b) => write!(f, "{a} != {b}"),
+            Relation::Gt(a, b) => write!(f, "{a} > {b}"),
+            Relation::Ge(a, b) => write!(f, "{a} >= {b}"),
+            Relation::Lt(a, b) => write!(f, "{a} < {b}"),
+            Relation::Le(a, b) => write!(f, "{a} <= {b}"),
+            Relation::Contains(a, b) => write!(f, "{a} contains {b}"),
+            Relation::IsType(a, b) => write!(f, "{a} is type {b:?}"),
+            Relation::Matches(a, b, _, _) => write!(f, "{a} matches {b}"),
         }
     }
 }
@@ -2535,6 +2735,7 @@ impl Evaluate for Condition<PatternRestriction> {
                             },
                             WildcardRestriction::IsLiteralWildcard(wc) => match value {
                                 Match::Single(AtomView::Var(v)) => wc == &v.get_symbol(),
+                                Match::FunctionName(s) => wc == s,
                                 _ => false,
                             },
                             WildcardRestriction::Length(min, max) => match value {
@@ -2556,6 +2757,12 @@ impl Evaluate for Condition<PatternRestriction> {
                                 }
                             }
                             WildcardRestriction::NotGreedy => true,
+                            WildcardRestriction::HasTag(tag) => match value {
+                                Match::Single(AtomView::Var(v)) => v.get_symbol().has_tag(tag),
+                                Match::Single(AtomView::Fun(f)) => f.get_symbol().has_tag(tag),
+                                Match::FunctionName(s) => s.has_tag(tag),
+                                _ => false,
+                            },
                         }
                         .into()
                     } else {
@@ -2625,13 +2832,11 @@ impl Condition<PatternRestriction> {
 
                         (is_type == matches!(r, WildcardRestriction::IsAtomType(_))).into()
                     }
-                    WildcardRestriction::IsLiteralWildcard(wc) => {
-                        if let Match::Single(AtomView::Var(v)) = value {
-                            (wc == &v.get_symbol()).into()
-                        } else {
-                            false.into()
-                        }
-                    }
+                    WildcardRestriction::IsLiteralWildcard(wc) => match value {
+                        Match::Single(AtomView::Var(v)) => (wc == &v.get_symbol()).into(),
+                        Match::FunctionName(s) => (wc == s).into(),
+                        _ => false.into(),
+                    },
                     WildcardRestriction::Length(min, max) => match &value {
                         Match::Single(_) | Match::FunctionName(_) => {
                             (*min <= 1 && max.map(|m| m >= 1).unwrap_or(true)).into()
@@ -2656,6 +2861,12 @@ impl Condition<PatternRestriction> {
                         }
                     }
                     WildcardRestriction::NotGreedy => true.into(),
+                    WildcardRestriction::HasTag(tag) => match value {
+                        Match::Single(AtomView::Var(v)) => v.get_symbol().has_tag(tag).into(),
+                        Match::Single(AtomView::Fun(f)) => f.get_symbol().has_tag(tag).into(),
+                        Match::FunctionName(s) => s.has_tag(tag).into(),
+                        _ => false.into(),
+                    },
                 }
             }
         }
@@ -2740,6 +2951,7 @@ impl Clone for WildcardRestriction {
             Self::Filter(f) => Self::Filter(dyn_clone::clone_box(f)),
             Self::Cmp(i, f) => Self::Cmp(*i, dyn_clone::clone_box(f)),
             Self::NotGreedy => Self::NotGreedy,
+            Self::HasTag(tag) => Self::HasTag(tag.clone()),
         }
     }
 }
@@ -2748,13 +2960,14 @@ impl std::fmt::Debug for WildcardRestriction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Length(arg0, arg1) => f.debug_tuple("Length").field(arg0).field(arg1).finish(),
-            Self::IsAtomType(t) => write!(f, "Is{:?}", t),
+            Self::IsAtomType(t) => write!(f, "Is{t:?}"),
             Self::IsLiteralWildcard(arg0) => {
                 f.debug_tuple("IsLiteralWildcard").field(arg0).finish()
             }
             Self::Filter(_) => f.debug_tuple("Filter").finish(),
             Self::Cmp(arg0, _) => f.debug_tuple("Cmp").field(arg0).finish(),
             Self::NotGreedy => write!(f, "NotGreedy"),
+            Self::HasTag(tag) => f.debug_tuple("HasTag").field(tag).finish(),
         }
     }
 }
@@ -2861,7 +3074,7 @@ impl Match<'_> {
                     // to update the coefficient flag
                 }
                 SliceType::Arg => {
-                    let fun = out.to_fun(Atom::ARG);
+                    let fun = out.to_fun(Symbol::ARG);
                     for arg in wargs {
                         fun.add_arg(*arg);
                     }
@@ -2876,7 +3089,7 @@ impl Match<'_> {
                     out.set_from_view(&wargs[0]);
                 }
                 SliceType::Empty => {
-                    let f = out.to_fun(Atom::ARG);
+                    let f = out.to_fun(Symbol::ARG);
                     f.set_normalized(true);
                 }
             },
@@ -2960,8 +3173,17 @@ impl<'a> MatchStack<'a> {
         MatchStack { stack: Vec::new() }
     }
 
-    /// Get a match.
+    /// Get a match for the wildcard `key`.
+    ///
+    /// Panics if `key` is not a wildcard symbol.
     pub fn get(&self, key: Symbol) -> Option<&Match<'a>> {
+        if key.get_wildcard_level() == 0 {
+            panic!(
+                "Cannot get match for a non-wildcard symbol: {}",
+                key.get_name()
+            );
+        }
+
         for (rk, rv) in self.stack.iter() {
             if rk == &key {
                 return Some(rv);
@@ -2997,7 +3219,7 @@ impl std::fmt::Display for MatchStack<'_> {
             if i > 0 {
                 f.write_str(", ")?;
             }
-            f.write_fmt(format_args!("{}: {}", k, v))?;
+            f.write_fmt(format_args!("{k}: {v}"))?;
         }
 
         f.write_str("]")
@@ -3049,6 +3271,27 @@ impl<'a, 'b> WrappedMatchStack<'a, 'b> {
                 if rv == &value {
                     return Some(self.stack.stack.len());
                 } else {
+                    return None;
+                }
+            }
+        }
+
+        // check if all attributes of the wildcard are shared by the matched value
+        match &value {
+            Match::Single(s) => {
+                if !s.has_attributes_of(key) {
+                    return None;
+                }
+            }
+            Match::Multiple(_, list) => {
+                for s in list {
+                    if !s.has_attributes_of(key) {
+                        return None;
+                    }
+                }
+            }
+            Match::FunctionName(n) => {
+                if !n.has_attributes_of(key) {
                     return None;
                 }
             }
@@ -3197,11 +3440,10 @@ impl<'a, 'b> AtomMatchIterator<'a, 'b> {
                         return Some((new_stack_len, &[]));
                     }
                 }
-            } else if let Pattern::Literal(w) = self.pattern {
-                if w.as_view() == self.target {
+            } else if let Pattern::Literal(w) = self.pattern
+                && w.as_view() == self.target {
                     return Some((match_stack.len(), &[]));
                 }
-            }
             // TODO: also do type matches, Fn Fn, etc?
         }
 
@@ -3940,11 +4182,10 @@ impl<'a> Iterator for AtomTreeIterator<'a> {
     /// Return the next position and atom in the tree.
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((ind, level, atom)) = self.stack.pop() {
-            if let Some(max_level) = self.settings.level_range.1 {
-                if level > max_level {
+            if let Some(max_level) = self.settings.level_range.1
+                && level > max_level {
                     continue;
                 }
-            }
 
             if let Some(ind) = ind {
                 let slice = match atom {
@@ -4356,11 +4597,12 @@ mod test {
     fn replace_map() {
         let a = parse!("v1 + f1(1,2, f1((1+v1)^2), (v1+v2)^2)");
 
-        let r = a.replace_map(|arg, context, out| {
+        let mut tmp = Atom::new();
+        let r = a.replace_map(move |arg, context, out| {
             if context.function_level > 0 {
-                arg.expand_into(None, out)
-            } else {
-                false
+                if arg.expand_into(None, &mut tmp) {
+                    out.set_from_view(&tmp.as_view());
+                }
             }
         });
 
@@ -4500,30 +4742,30 @@ mod test {
         let expr = parse!("fc1(1,2,3)");
         let p = parse!("fc1(v1__,v1_,1)");
         let expr = expr.replace(p).with(&rhs);
-        assert_eq!(expr, Atom::num(1));
+        assert_eq!(expr, 1);
 
         // multiple wildcard wrap
         let expr = parse!("fc1(1,2,3)");
         let p = parse!("fc1(v1__,2)");
         let expr = expr.replace(p).with(&rhs);
-        assert_eq!(expr, Atom::num(1));
+        assert_eq!(expr, 1);
 
         // wildcard wrap
         let expr = parse!("fc1(1,2,3)");
         let p = parse!("fc1(v1__,v1_,2)");
         let expr = expr.replace(p).with(&rhs);
-        assert_eq!(expr, Atom::num(1));
+        assert_eq!(expr, 1);
 
         let expr = parse!("fc1(v1,4,3,5,4)");
         let p = parse!("fc1(v1__,v1_,v2_,v1_)");
         let expr = expr.replace(p).with(&rhs);
-        assert_eq!(expr, Atom::num(1));
+        assert_eq!(expr, 1);
 
         // function shift
         let expr = parse!("fc1(f1(1),f1(2),f1(3))");
         let p = parse!("fc1(f1(v1_),f1(2),f1(3))");
         let expr = expr.replace(p).with(&rhs);
-        assert_eq!(expr, Atom::num(1));
+        assert_eq!(expr, 1);
     }
 
     #[test]
@@ -4535,5 +4777,28 @@ mod test {
         let e = parse!("(1+v5)^(3/2) / v6 + (1+v3)*(1+v4)^v7 + (v1+v2)^3");
         let vars = e.as_view().is_polynomial(false, false).unwrap();
         assert_eq!(vars.len(), 5);
+    }
+
+    #[test]
+    fn symbol_attribute_filter() {
+        let _ = symbol!("symbolica::symbol_attribute_filter::fsym"; Symmetric);
+        let _ = symbol!("symbolica::symbol_attribute_filter::fsym_"; Symmetric);
+        let _ = symbol!("symbolica::symbol_attribute_filter::xscal"; Scalar);
+        let _ = symbol!("symbolica::symbol_attribute_filter::xscal__"; Scalar);
+
+        let r = parse!("f(1)")
+            .replace(parse!("symbolica::symbol_attribute_filter::fsym_(x_)"))
+            .with(1);
+        assert_ne!(r, 1);
+
+        let r = parse!("symbolica::symbol_attribute_filter::fsym(1,symbolica::symbol_attribute_filter::xscal^2 + 2,3)")
+            .replace(parse!("symbolica::symbol_attribute_filter::fsym_(symbolica::symbol_attribute_filter::xscal__)"))
+            .with(1);
+        assert_eq!(r, 1);
+
+        let r = parse!("f(1,x,2)")
+            .replace(parse!("f(symbolica::symbol_attribute_filter::xscal__)"))
+            .with(1);
+        assert_eq!(r, parse!("f(1,x,2)"));
     }
 }

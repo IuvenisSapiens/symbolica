@@ -10,16 +10,16 @@ use tracing::debug;
 use crate::{
     combinatorics::CombinationIterator,
     domains::{
-        EuclideanDomain, Field, InternalOrdering, Ring,
-        algebraic_number::AlgebraicExtension,
+        EuclideanDomain, Field, InternalOrdering, Ring, RingOps, Set,
+        algebraic_number::{AlgebraicExtension, GaloisField},
         finite_field::{
-            FiniteField, FiniteFieldCore, FiniteFieldWorkspace, GaloisField, PrimeIteratorU64,
-            ToFiniteField, Zp, Zp64,
+            FiniteField, FiniteFieldCore, FiniteFieldWorkspace, PrimeIteratorU64, ToFiniteField,
+            Zp, Zp64,
         },
         integer::{Integer, IntegerRing, Z, gcd_unsigned},
         rational::{Q, RationalField},
     },
-    poly::Variable,
+    poly::PolyVariable,
 };
 
 use super::{LexOrder, PositiveExponent, gcd::PolynomialGCD, polynomial::MultivariatePolynomial};
@@ -251,7 +251,7 @@ impl<R: EuclideanDomain, E: PositiveExponent> MultivariatePolynomial<R, E, LexOr
                     if i < self.nvars() {
                         vm[i].clone()
                     } else {
-                        Variable::Temporary(i)
+                        PolyVariable::Temporary(i)
                     }
                 })
                 .collect(),
@@ -753,10 +753,12 @@ impl<E: PositiveExponent> Factorize
     fn factor(&self) -> Vec<(Self, usize)> {
         let sf = self.square_free_factorization();
 
+        let mut constant = self.ring.one();
         let mut full_factors = vec![];
         for (f, p) in &sf {
             if f.is_constant() {
-                full_factors.push((f.clone(), *p));
+                self.ring
+                    .mul_assign(&mut constant, self.ring.pow(&f.get_constant(), *p as u64));
                 continue;
             }
 
@@ -765,7 +767,8 @@ impl<E: PositiveExponent> Factorize
             let factors = n.factor();
 
             if factors.len() == 1 {
-                return vec![(f.clone(), 1)];
+                full_factors.push((f.clone(), *p));
+                continue;
             }
 
             let mut g_f = g.to_number_field(&self.ring);
@@ -783,9 +786,19 @@ impl<E: PositiveExponent> Factorize
                 g_f = g_f / &gcd;
 
                 let g = MultivariatePolynomial::from_number_field(&gcd)
-                    .replace_with_poly(v, &alpha_poly);
-                full_factors.push((g.to_number_field(&self.ring), b * p));
+                    .replace_with_poly(v, &alpha_poly)
+                    .to_number_field(&self.ring);
+
+                let lc = g.lcoeff();
+                self.ring
+                    .mul_assign(&mut constant, &self.ring.pow(&lc, (b * p) as u64));
+
+                full_factors.push((g.mul_coeff(self.ring.inv(&lc)), b * p));
             }
+        }
+
+        if !self.ring.is_one(&constant) || full_factors.is_empty() {
+            full_factors.push((self.constant(constant), 1));
         }
 
         full_factors
@@ -804,7 +817,7 @@ impl<
 > Factorize for MultivariatePolynomial<F, E, LexOrder>
 where
     FiniteField<UField>: Field + FiniteFieldCore<UField> + PolynomialGCD<u16>,
-    <FiniteField<UField> as Ring>::Element: Copy,
+    <FiniteField<UField> as Set>::Element: Copy,
     AlgebraicExtension<<F as GaloisField>::Base>: PolynomialGCD<E>,
 {
     fn square_free_factorization(&self) -> Vec<(Self, usize)> {
@@ -959,7 +972,7 @@ impl<
 > MultivariatePolynomial<F, E, LexOrder>
 where
     FiniteField<UField>: Field + FiniteFieldCore<UField> + PolynomialGCD<u16>,
-    <FiniteField<UField> as Ring>::Element: Copy,
+    <FiniteField<UField> as Set>::Element: Copy,
     AlgebraicExtension<<F as GaloisField>::Base>: PolynomialGCD<E>,
 {
     /// Bernardin's algorithm for square free factorization.
@@ -1084,7 +1097,7 @@ where
         while !f.is_one() {
             i += 1;
 
-            h = h.exp_mod_univariate(self.ring.size(), &mut f);
+            h = h.exp_mod_univariate(self.ring.size().unwrap(), &mut f);
 
             let mut g = f.gcd(&(&h - &x));
 
@@ -1108,13 +1121,13 @@ where
     /// Perform Cantor-Zassenhaus's probabilistic algorithm for
     /// finding irreducible factors of degree `d`.
     pub fn equal_degree_factorization(&self, d: usize) -> Vec<Self> {
-        let mut s = self.clone().make_monic();
+        let s = self.clone().make_monic();
 
         let Some(var) = self.last_exponents().iter().position(|x| *x > E::zero()) else {
             if d == 1 {
                 return vec![s];
             } else {
-                panic!("Degree mismatch for {}: {}", self, d);
+                panic!("Degree mismatch for {self}: {d}");
             }
         };
 
@@ -1128,34 +1141,31 @@ where
         let mut random_poly = self.zero_with_capacity(d);
         let mut exp = vec![E::zero(); self.nvars()];
 
-        let mut try_counter = 0;
         let characteristic = self.ring.characteristic();
+
+        // compute inverse
+        let mut s_rev = s.clone();
+        s_rev.reverse();
+        let s_inv = s_rev.inverse_univariate(var, E::from_u32(n as u32 + 1));
 
         let factor = loop {
             // generate a random non-constant polynomial
             random_poly.clear();
 
-            if d == 1 && (characteristic.is_zero() || try_counter < characteristic) {
-                exp[var] = E::zero();
-                random_poly.append_monomial(self.ring.nth(try_counter.into()), &exp);
-                exp[var] = E::one();
-                random_poly.append_monomial(self.ring.one(), &exp);
-                try_counter += 1;
-            } else {
-                for i in 0..2 * d {
-                    let r = self
-                        .ring
-                        .sample(&mut rng, (0, characteristic.to_i64().unwrap_or(i64::MAX)));
-                    if !self.ring.is_zero(&r) {
-                        exp[var] = E::from_u32(i as u32);
-                        random_poly.append_monomial(r, &exp);
-                    }
-                }
-
-                if random_poly.degree(var) == E::zero() {
-                    continue;
+            for i in 0..n {
+                let r = self
+                    .ring
+                    .sample(&mut rng, (0, characteristic.to_i64().unwrap_or(i64::MAX)));
+                if !self.ring.is_zero(&r) {
+                    exp[var] = E::from_u32(i as u32);
+                    random_poly.append_monomial(r, &exp);
                 }
             }
+
+            if random_poly.degree(var) == E::zero() {
+                continue;
+            }
+            *random_poly.coefficients.last_mut().unwrap() = self.ring.one();
 
             let g = random_poly.gcd(&s);
 
@@ -1177,11 +1187,18 @@ where
                 b
             } else {
                 // TODO: use Frobenius map and modular composition to prevent computing large exponent poly^(p^d)
-                let p = self.ring.size();
-                random_poly
-                    .exp_mod_univariate(&(&p.pow(d as u64) - &1i64.into()) / &2i64.into(), &mut s)
-                    - self.one()
+                let p = self.ring.size().unwrap();
+                random_poly.exp_mod_univariate_fast(
+                    var,
+                    &(&p.pow(d as u64) - &1i64.into()) / &2i64.into(),
+                    &s,
+                    &s_inv,
+                ) - self.one()
             };
+
+            if b.is_constant() {
+                continue;
+            }
 
             let g = b.gcd(&s);
 
@@ -1328,7 +1345,7 @@ where
         let mut i = 0;
         let mut rng = rng();
         loop {
-            if self.ring.size() == i {
+            if self.ring.size() == Some(i.into()) {
                 let field = self
                     .ring
                     .upgrade(self.ring.get_extension_degree().to_u64().unwrap() as usize + 1);
@@ -1460,8 +1477,8 @@ where
     fn canonical_sort(
         biv_polys: &[Self],
         replace_var: usize,
-        sample_points: &[(usize, <F as Ring>::Element)],
-    ) -> Vec<(Self, <F as Ring>::Element, Self)> {
+        sample_points: &[(usize, <F as Set>::Element)],
+    ) -> Vec<(Self, <F as Set>::Element, Self)> {
         let mut univariate_factors = biv_polys
             .iter()
             .map(|f| {
@@ -1489,7 +1506,7 @@ where
     fn lcoeff_precomputation(
         &self,
         bivariate_factors: &[Self],
-        sample_points: &[(usize, <F as Ring>::Element)],
+        sample_points: &[(usize, <F as Set>::Element)],
         order: &[usize],
     ) -> Result<(Vec<Self>, Vec<Self>), usize> {
         let lcoeff = self.univariate_lcoeff(order[0]);
@@ -1642,8 +1659,7 @@ where
 
         if !lcoeff_left.is_one() {
             panic!(
-                "Could not reconstruct leading coefficient of {}: order={:?}, samples={:?} Rest = {}",
-                self, order, sample_points, lcoeff_left
+                "Could not reconstruct leading coefficient of {self}: order={order:?}, samples={sample_points:?} Rest = {lcoeff_left}"
             );
         }
 
@@ -1653,7 +1669,7 @@ where
     fn multivariate_hensel_lift_with_auto_lcoeff_fixing(
         &self,
         factors: &[Self],
-        sample_points: &[(usize, <F as Ring>::Element)],
+        sample_points: &[(usize, <F as Set>::Element)],
         order: &[usize],
     ) -> Vec<Self> {
         let lcoeff = self.univariate_lcoeff(order[0]);
@@ -1717,7 +1733,7 @@ where
     fn univariate_diophantine_field(
         factors: &[Self],
         order: &[usize],
-        sample_points: &[(usize, <F as Ring>::Element)],
+        sample_points: &[(usize, <F as Set>::Element)],
     ) -> (Vec<Self>, Vec<Self>) {
         // produce univariate factors and univariate delta
         let mut univariate_factors = factors.to_vec();
@@ -1744,10 +1760,10 @@ where
         mut coefficient_upper_bound: u64,
         max_bivariate_factors: Option<usize>,
     ) -> Vec<Self> {
-        if let Some(m) = max_bivariate_factors {
-            if m == 1 {
-                return vec![self.clone()];
-            }
+        if let Some(m) = max_bivariate_factors
+            && m == 1
+        {
+            return vec![self.clone()];
         }
 
         // check for problems arising from canceling terms in the derivative
@@ -1789,7 +1805,7 @@ where
         'new_sample: loop {
             sample_fail += &1.into();
 
-            if &sample_fail * &2.into() > self.ring.size() {
+            if &sample_fail * &2.into() > self.ring.size().unwrap() {
                 // the field is too small, upgrade
                 let field = self
                     .ring
@@ -1887,14 +1903,14 @@ where
             return vec![self.clone()];
         }
 
-        if let Some(max) = max_bivariate_factors {
-            if bivariate_factors.len() > max {
-                return self.multivariate_factorization(
-                    order,
-                    coefficient_upper_bound,
-                    max_bivariate_factors,
-                );
-            }
+        if let Some(max) = max_bivariate_factors
+            && bivariate_factors.len() > max
+        {
+            return self.multivariate_factorization(
+                order,
+                coefficient_upper_bound,
+                max_bivariate_factors,
+            );
         }
 
         let (sorted_biv_factors, true_lcoeffs) =
@@ -2459,11 +2475,11 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
         loop {
             let p = pi.next().unwrap();
             if p > u32::MAX as u64 {
-                panic!("Ran out of primes during factorization of {}", self);
+                panic!("Ran out of primes during factorization of {self}");
             }
             let p = p as u32;
 
-            if (&self.lcoeff() % &Integer::Natural(p as i64)).is_zero() {
+            if (&self.lcoeff() % &Integer::Single(p as i64)).is_zero() {
                 continue;
             }
 
@@ -2499,7 +2515,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
                 .map_coeff(|c| c.to_finite_field(&field), field.clone())
                 .make_monic();
             if &hh_p != h_p {
-                panic!("Mismatch of lifted factor: {} vs {} in {}", hh_p, h_p, self);
+                panic!("Mismatch of lifted factor: {hh_p} vs {h_p} in {self}");
             }
         }
 
@@ -2721,11 +2737,11 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
 
             let p = pi.next().unwrap();
             if p > u32::MAX as u64 {
-                panic!("Ran out of primes during factorization of {}", self);
+                panic!("Ran out of primes during factorization of {self}");
             }
             let p = p as u32;
 
-            if (&uni_f.lcoeff() % &Integer::Natural(p as i64)).is_zero() {
+            if (&uni_f.lcoeff() % &Integer::Single(p as i64)).is_zero() {
                 continue;
             }
 
@@ -2940,10 +2956,10 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
 
         // move the 2^n into the sqrt to prevent precision loss when converting the sqrt
         // to an integer
-        bound = &bound * &Integer::Natural(2).pow((total_degree * 2).saturating_sub(non_zero_vars));
+        bound = &bound * &Integer::Single(2).pow((total_degree * 2).saturating_sub(non_zero_vars));
 
         bound = &match bound {
-            Integer::Natural(b) => Integer::Natural((b as f64).sqrt() as i64),
+            Integer::Single(b) => Integer::Single((b as f64).sqrt() as i64),
             Integer::Double(b) => Integer::from(rug::Integer::from(b).sqrt()),
             Integer::Large(b) => Integer::from(b.sqrt()),
         } + &1i64.into();
@@ -3155,8 +3171,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
                 let (q, r) = lcoeff_left.quot_rem(&new, true);
                 if !r.is_zero() {
                     panic!(
-                        "Problem with bivariate factor scaling in factorization of {}: order={:?}, samples={:?}",
-                        self, order, sample_points
+                        "Problem with bivariate factor scaling in factorization of {self}: order={order:?}, samples={sample_points:?}"
                     );
                 }
 
@@ -3166,8 +3181,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
 
         if !lcoeff_left.is_constant() {
             panic!(
-                "Could not reconstruct leading coefficient of {}: order={:?}, samples={:?} Rest = {}",
-                self, order, sample_points, lcoeff_left
+                "Could not reconstruct leading coefficient of {self}: order={order:?}, samples={sample_points:?} Rest = {lcoeff_left}"
             );
         }
 
@@ -3189,10 +3203,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
             let (q, r) = Z.quot_rem(&b_lc, &f_lc);
             assert!(
                 r.is_zero(),
-                "Problem with bivariate factor scaling in factorization of {}: order={:?}, samples={:?}",
-                self,
-                order,
-                sample_points
+                "Problem with bivariate factor scaling in factorization of {self}: order={order:?}, samples={sample_points:?}"
             );
 
             lcoeff_left = lcoeff_left.div_coeff(&q);
@@ -3201,8 +3212,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
 
         if !lcoeff_left.is_one() {
             panic!(
-                "Could not distribute content of {}: order={:?}, samples={:?} Rest = {}",
-                self, order, sample_points, lcoeff_left
+                "Could not distribute content of {self}: order={order:?}, samples={sample_points:?} Rest = {lcoeff_left}"
             );
         }
 
@@ -3320,7 +3330,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
         let mut content_fail_count = 0;
         'new_sample: loop {
             for s in &mut cur_sample_points {
-                s.1 = Integer::Natural(rng.random_range(0..=coefficient_upper_bound));
+                s.1 = Integer::Single(rng.random_range(0..=coefficient_upper_bound));
                 debug!("Sample x{} {}", s.0, s.1);
             }
 
@@ -3424,10 +3434,10 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
         mut coefficient_upper_bound: i64,
         mut max_bivariate_factors: Option<usize>,
     ) -> Vec<Self> {
-        if let Some(m) = max_bivariate_factors {
-            if m == 1 {
-                return vec![self.clone()];
-            }
+        if let Some(m) = max_bivariate_factors
+            && m == 1
+        {
+            return vec![self.clone()];
         }
 
         let mut sparse_fail = 0;
@@ -3465,14 +3475,14 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
             }
         };
 
-        if let Some(max) = max_bivariate_factors {
-            if bivariate_factors.len() > max {
-                return self.multivariate_factorization(
-                    order,
-                    coefficient_upper_bound,
-                    max_bivariate_factors,
-                );
-            }
+        if let Some(max) = max_bivariate_factors
+            && bivariate_factors.len() > max
+        {
+            return self.multivariate_factorization(
+                order,
+                coefficient_upper_bound,
+                max_bivariate_factors,
+            );
         }
 
         for (v, s) in &sample_points {
@@ -3490,7 +3500,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
             p = prime_iter.next().unwrap();
 
             if p > u32::MAX as u64 {
-                panic!("Ran out of primes during factorization of {}", self);
+                panic!("Ran out of primes during factorization of {self}");
             }
 
             if (&uni_f.lcoeff() % &p.into()).is_zero() {
@@ -3582,7 +3592,7 @@ impl<E: PositiveExponent> MultivariatePolynomial<IntegerRing, E, LexOrder> {
         // perform the Hensel lifting in a performance-optimized finite field if possible
         let factorization = if max_p < u64::MAX {
             let prime = match max_p {
-                Integer::Natural(b) => b as u64,
+                Integer::Single(b) => b as u64,
                 Integer::Double(b) => b as u64,
                 Integer::Large(b) => b.to_u64().unwrap(),
             };
@@ -3751,8 +3761,7 @@ mod test {
     #[test]
     fn factor_ff_square_free() {
         let field = Zp::new(3);
-        let poly = parse!("(1+v1)*(1+v1^2)^2*(v1^4+1)^3")
-            .to_polynomial::<_, u8>(&field, None);
+        let poly = parse!("(1+v1)*(1+v1^2)^2*(v1^4+1)^3").to_polynomial::<_, u8>(&field, None);
 
         let res = [("1+v1^4", 3), ("1+v1^2", 2), ("1+v1", 1)];
 
@@ -3802,8 +3811,8 @@ mod test {
 
     #[test]
     fn factor_square_free() {
-        let poly = parse!("3*(2*v1^2+v2)(v1^3+v2)^2(1+4*v2)^2(1+v1)")
-            .to_polynomial::<_, u8>(&Z, None);
+        let poly =
+            parse!("3*(2*v1^2+v2)(v1^3+v2)^2(1+4*v2)^2(1+v1)").to_polynomial::<_, u8>(&Z, None);
 
         let res = [
             ("3", 1),
@@ -3817,9 +3826,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -3848,9 +3855,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -3885,9 +3890,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -3915,9 +3918,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -3944,9 +3945,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -3960,15 +3959,14 @@ mod test {
 
     #[test]
     fn factor_overall_minus() {
-        let poly = parse!("-v1*v3^2-v1*v2*v3^2")
-            .to_polynomial::<_, u8>(
-                &Z,
-                Some(Arc::new(vec![
-                    symbol!("v1").into(),
-                    symbol!("v2").into(),
-                    symbol!("v3").into(),
-                ])),
-            );
+        let poly = parse!("-v1*v3^2-v1*v2*v3^2").to_polynomial::<_, u8>(
+            &Z,
+            Some(Arc::new(vec![
+                symbol!("v1").into(),
+                symbol!("v2").into(),
+                symbol!("v3").into(),
+            ])),
+        );
 
         let res = [("-1", 1), ("v3", 2), ("1+v2", 1), ("v1", 1)];
 
@@ -3976,9 +3974,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -4008,9 +4004,7 @@ mod test {
             .iter()
             .map(|(f, p)| {
                 (
-                    parse!(f)
-                        .expand()
-                        .to_polynomial(&Z, poly.variables.clone()),
+                    parse!(f).expand().to_polynomial(&Z, poly.variables.clone()),
                     *p,
                 )
             })
@@ -4033,8 +4027,7 @@ mod test {
 
     #[test]
     fn algebraic_extension() {
-        let a = parse!("z^4+z^3+(2+a-a^2)z^2+(1+a^2-2a^3)z-2")
-            .to_polynomial::<_, u8>(&Q, None);
+        let a = parse!("z^4+z^3+(2+a-a^2)z^2+(1+a^2-2a^3)z-2").to_polynomial::<_, u8>(&Q, None);
         let f = parse!("a^4-3").to_polynomial::<_, u16>(&Q, None);
         let f = AlgebraicExtension::new(f);
 

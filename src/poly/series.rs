@@ -21,7 +21,7 @@ use std::{
 };
 
 use crate::{
-    atom::{Atom, AtomCore, AtomView, FunctionBuilder},
+    atom::{Atom, AtomCore, AtomView, FunctionBuilder, Symbol},
     coefficient::CoefficientView,
     domains::{
         EuclideanDomain, InternalOrdering, Ring, SelfRing,
@@ -32,7 +32,7 @@ use crate::{
     printer::{PrintOptions, PrintState},
 };
 
-use super::Variable;
+use super::PolyVariable;
 
 /// A Puiseux series. The truncation order is
 /// relative to the lowest degree: i.e., a series in `x` with depth `d` is viewed as
@@ -56,7 +56,7 @@ use super::Variable;
 #[derive(Clone)]
 pub struct Series<F: Ring> {
     coefficients: Vec<F::Element>,
-    variable: Arc<Variable>,
+    variable: Arc<PolyVariable>,
     expansion_point: F::Element,
     field: F,
     shift: isize, // a shift in units of the ramification that indicates the starting power of the series
@@ -77,7 +77,7 @@ impl<F: Ring + std::fmt::Debug> std::fmt::Debug for Series<F> {
             } else {
                 write!(f, ", ")?;
             }
-            write!(f, "{{ {:?} }}", c)?;
+            write!(f, "{{ {c:?} }}")?;
         }
         write!(f, " ]")
     }
@@ -98,7 +98,7 @@ impl<F: Ring> Series<F> {
     pub fn new(
         field: &F,
         cap: Option<usize>,
-        variable: Arc<Variable>,
+        variable: Arc<PolyVariable>,
         expansion_point: F::Element,
         order: Rational,
     ) -> Self {
@@ -396,12 +396,12 @@ impl<F: Ring> Series<F> {
     }
 
     /// Get a copy of the variable/
-    pub fn get_variable(&self) -> Arc<Variable> {
+    pub fn get_variable(&self) -> Arc<PolyVariable> {
         self.variable.clone()
     }
 
     /// Get a reference to the variables
-    pub fn get_vars_ref(&self) -> &Variable {
+    pub fn get_vars_ref(&self) -> &PolyVariable {
         self.variable.as_ref()
     }
 
@@ -525,6 +525,22 @@ impl<F: Ring> Series<F> {
             .enumerate()
             .map(|(i, c)| (self.get_exponent(i), c))
     }
+
+    /// Map the coefficients of the series using a function `f`.
+    pub fn map_coeff<M: Fn(&F::Element) -> F::Element>(&self, f: M) -> Series<F> {
+        let mut s = Series {
+            coefficients: self.coefficients.iter().map(f).collect(),
+            variable: self.variable.clone(),
+            expansion_point: self.expansion_point.clone(),
+            shift: self.shift,
+            ramification: self.ramification,
+            field: self.field.clone(),
+            order: self.order,
+        };
+
+        s.truncate();
+        s
+    }
 }
 
 impl<F: Ring> SelfRing for Series<F> {
@@ -553,9 +569,9 @@ impl<F: Ring> SelfRing for Series<F> {
         if self.coefficients.is_empty() {
             let o = self.absolute_order();
             if opts.mode.is_latex() {
-                write!(f, "\\mathcal{{O}}\\left({}^{{{}}}\\right)", v, o)?;
+                write!(f, "\\mathcal{{O}}\\left({v}^{{{o}}}\\right)")?;
             } else {
-                write!(f, "𝒪({}^", v)?;
+                write!(f, "𝒪({v}^")?;
                 Q.format(&o, opts, state.step(false, false, true, false), f)?;
                 f.write_char(')')?;
             }
@@ -597,9 +613,9 @@ impl<F: Ring> SelfRing for Series<F> {
             }
 
             if e.is_one() {
-                write!(f, "{}", v)?;
+                write!(f, "{v}")?;
             } else if !e.is_zero() {
-                write!(f, "{}^", v)?;
+                write!(f, "{v}^")?;
                 state.suppress_one = false;
 
                 if opts.mode.is_latex() {
@@ -619,9 +635,9 @@ impl<F: Ring> SelfRing for Series<F> {
         let o = self.absolute_order();
 
         if opts.mode.is_latex() {
-            write!(f, "+\\mathcal{{O}}\\left({}^{{{}}}\\right)", v, o)?;
+            write!(f, "+\\mathcal{{O}}\\left({v}^{{{o}}}\\right)")?;
         } else {
-            write!(f, "+𝒪({}^", v)?;
+            write!(f, "+𝒪({v}^")?;
             Q.format(&o, opts, state.step(false, false, true, false), f)?;
             f.write_char(')')?;
         }
@@ -803,7 +819,7 @@ impl<F: Ring> Neg for Series<F> {
     fn neg(mut self) -> Self::Output {
         // Negate coefficients of all terms.
         for c in &mut self.coefficients {
-            *c = self.field.neg(c);
+            *c = self.field.neg(&*c);
         }
         self
     }
@@ -925,7 +941,7 @@ impl<F: EuclideanDomain> Series<F> {
 impl Series<AtomField> {
     /// Extract powers of `x` from an expression that comes from simplifying an exponential with logs
     /// i.e.: `exp(c + 3 log(x^5)) = exp(c)*x^15`.
-    fn extract_exp_log(&self, e: AtomView, s: AtomView) -> Result<Self, &'static str> {
+    fn extract_exp_log(&self, e: AtomView, s: AtomView) -> Result<Self, String> {
         if !e.contains(s) {
             return Ok(self.constant(e.to_owned()));
         }
@@ -940,16 +956,16 @@ impl Series<AtomField> {
                             if ni == 0 {
                                 Ok(self.monomial(self.field.one(), (n, d).into()))
                             } else {
-                                Err("Cannot series expand with complex exponent")
+                                Err("Cannot series expand with complex exponent".to_owned())
                             }
                         } else {
-                            Err("Cannot series expand with large exponents yet")
+                            Err("Cannot series expand with large exponents yet".to_owned())
                         }
                     } else {
-                        Err("Power of variable must be rational")
+                        Err("Power of variable must be rational".to_owned())
                     }
                 } else {
-                    Err("Unexpected term in exp-log simplification")
+                    Err("Unexpected term in exp-log simplification".to_owned())
                 }
             }
             AtomView::Var(_) => Ok(self.monomial(self.field.one(), (1, 1).into())),
@@ -961,13 +977,13 @@ impl Series<AtomField> {
 
                 Ok(shift_series)
             }
-            _ => Err("Unexpected term in exp-log simplification"),
+            _ => Err("Unexpected term in exp-log simplification".to_owned()),
         }
     }
 
-    pub fn exp(&self) -> Result<Self, &'static str> {
+    pub fn exp(&self) -> Result<Self, String> {
         if self.shift < 0 {
-            return Err("Cannot compute the exponential of a series with poles");
+            return Err("Cannot compute the exponential of a series with poles".to_owned());
         }
 
         if self.order == 0 {
@@ -988,7 +1004,7 @@ impl Series<AtomField> {
         };
 
         // construct the constant term, log(x) in the argument will be turned into x
-        let e = FunctionBuilder::new(Atom::EXP).add_arg(&c).finish();
+        let e = FunctionBuilder::new(Symbol::EXP).add_arg(&c).finish();
 
         // split the true constant part and the x-dependent part
         let var = self.variable.to_atom() - &self.expansion_point;
@@ -1011,9 +1027,9 @@ impl Series<AtomField> {
         Ok(r * &shift_series)
     }
 
-    pub fn log(&self) -> Result<Self, &'static str> {
+    pub fn log(&self) -> Result<Self, String> {
         if self.order == 0 {
-            return Err("Log argument needs to have a coefficient");
+            return Err("Log argument needs to have a coefficient".to_owned());
         }
 
         // construct the log argument, which may contain x
@@ -1026,7 +1042,7 @@ impl Series<AtomField> {
             .mul_exp_units(-self.shift)
             - self.one();
 
-        let mut e = self.constant(FunctionBuilder::new(Atom::LOG).add_arg(&c).finish());
+        let mut e = self.constant(FunctionBuilder::new(Symbol::LOG).add_arg(&c).finish());
         let mut sp = p.clone();
         for i in 1..=self.order {
             let s = sp.clone().div_coeff(&Atom::num(i as i64));
@@ -1043,9 +1059,9 @@ impl Series<AtomField> {
         Ok(e)
     }
 
-    pub fn sin(&self) -> Result<Self, &'static str> {
+    pub fn sin(&self) -> Result<Self, String> {
         if self.shift < 0 {
-            return Err("Cannot compute the sine of a series with poles");
+            return Err("Cannot compute the sine of a series with poles".to_owned());
         }
 
         if self.order == 0 {
@@ -1066,19 +1082,20 @@ impl Series<AtomField> {
 
         if c.contains(self.variable.to_atom()) {
             return Err(
-                "Cannot compute the sine of a series with a constant term that depends on x",
+                "Cannot compute the sine of a series with a constant term that depends on x"
+                    .to_owned(),
             );
         }
 
         let p = self.clone().remove_constant();
 
-        let mut e = self.constant(FunctionBuilder::new(Atom::SIN).add_arg(&c).finish());
+        let mut e = self.constant(FunctionBuilder::new(Symbol::SIN).add_arg(&c).finish());
         let mut sp = p.clone();
         for i in 1..=self.order {
             let mut b = if i % 2 == 1 {
-                FunctionBuilder::new(Atom::COS).add_arg(&c).finish()
+                FunctionBuilder::new(Symbol::COS).add_arg(&c).finish()
             } else {
-                FunctionBuilder::new(Atom::SIN).add_arg(&c).finish()
+                FunctionBuilder::new(Symbol::SIN).add_arg(&c).finish()
             };
 
             if i % 4 >= 2 {
@@ -1098,9 +1115,9 @@ impl Series<AtomField> {
         Ok(e)
     }
 
-    pub fn cos(&self) -> Result<Self, &'static str> {
+    pub fn cos(&self) -> Result<Self, String> {
         if self.shift < 0 {
-            return Err("Cannot compute the sine of a series with poles");
+            return Err("Cannot compute the sine of a series with poles".to_owned());
         }
 
         if self.order == 0 {
@@ -1122,19 +1139,20 @@ impl Series<AtomField> {
 
         if c.contains(self.variable.to_atom()) {
             return Err(
-                "Cannot compute the cosine of a series with a constant term that depends on x",
+                "Cannot compute the cosine of a series with a constant term that depends on x"
+                    .to_owned(),
             );
         }
 
         let p = self.clone().remove_constant();
 
-        let mut e = self.constant(FunctionBuilder::new(Atom::COS).add_arg(&c).finish());
+        let mut e = self.constant(FunctionBuilder::new(Symbol::COS).add_arg(&c).finish());
         let mut sp = p.clone();
         for i in 1..=self.order {
             let mut b = if i % 2 == 1 {
-                FunctionBuilder::new(Atom::SIN).add_arg(&c).finish()
+                FunctionBuilder::new(Symbol::SIN).add_arg(&c).finish()
             } else {
-                -FunctionBuilder::new(Atom::COS).add_arg(&c).finish()
+                -FunctionBuilder::new(Symbol::COS).add_arg(&c).finish()
             };
 
             if i % 4 < 2 {
@@ -1155,12 +1173,12 @@ impl Series<AtomField> {
     }
 
     /// Take the series to the power of another series.
-    pub fn pow(&self, pow: &Self) -> Result<Self, &'static str> {
+    pub fn pow(&self, pow: &Self) -> Result<Self, String> {
         (self.log()? * pow).exp()
     }
 
     /// Take the series to the power of a rational number.
-    pub fn rpow(&self, pow: Rational) -> Result<Self, &'static str> {
+    pub fn rpow(&self, pow: Rational) -> Result<Self, String> {
         if pow.is_zero() {
             Err(
                 "Cannot raise series to the power of zero, as this generates infinite precision 1",
@@ -1231,5 +1249,24 @@ impl Series<AtomField> {
                 *out = &*out + &(v.npow(p) * c);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        atom::{Atom, AtomCore},
+        parse, symbol,
+    };
+
+    #[test]
+    fn map_coeff() {
+        let a = parse!("((v1+1)^2 - (v1^2 + 2v1 + 1))/v2")
+            .series(symbol!("v2"), Atom::Zero, 0.into(), true)
+            .unwrap();
+        assert_eq!(a.get_trailing_exponent(), -1);
+
+        let b = a.map_coeff(|x| x.expand());
+        assert_eq!(b.get_trailing_exponent(), 1);
     }
 }
